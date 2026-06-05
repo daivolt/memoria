@@ -1,90 +1,94 @@
 """
-memoria — CLI for opencode session memory and context compression.
+memoria — CLI for opencode session memory + AgentOS orchestration.
 
-Usage:
-  memoria init                  Start daemon + create MEMORY.md
+Memory:
+  memoria init                  Verify server connectivity
   memoria add <text>            Save durable fact to MEMORY.md
   memoria list                  Show all facts
   memoria replace <old> <new>   Replace matching entry
   memoria recall <query>        Search past sessions via FTS5
   memoria review [N]            Summarize last N sessions
   memoria learnings             Show accumulated project knowledge
-  memoria compress              Compress tool outputs to 1-liners (stdin)
-  memoria status                Check daemon health
-  memoria stop                  Stop daemon
+  memoria compress              Compress tool outputs (stdin) via REST
+  memoria status                Server health + project memory
+  memoria topics                List cross-project topics
+  memoria topic <name> [text]   Show topic facts or add one
+  memoria propose <topic> <txt> Propose cross-project fact
+  memoria proposals             List pending proposals
+  memoria accept <id>           Accept proposal
+  memoria reject <id>           Reject proposal
+
+Orchestration:
+  memoria task <project> <title>    Create task on board
+  memoria claim <task-id>           Claim a pending task
+  memoria done <task-id> [result]   Mark task complete
+  memoria fail <task-id> [error]    Mark task failed
+  memoria tasks [project]           List tasks
+  memoria agents [project]          List active agents
+  memoria snap <project> [msg]      Create git snapshot
+  memoria rollback <project> [id]   Rollback to snapshot
 """
 
 import json
 import os
-import re
-import sqlite3
-import subprocess
 import sys
-import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
-WORKDIR = Path("/var/tmp/memoria")
-MEMORY_LIMIT = 5000
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+SERVER = os.environ.get("MEMORIA_SERVER", "http://100.121.245.69:19998")
 
 
 def project_name() -> str:
     return os.environ.get("MEMORIA_PROJECT") or Path.cwd().name
 
 
-def wd() -> Path:
-    p = WORKDIR / project_name()
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def _memory_path() -> Path:
-    return wd() / "MEMORY.md"
-
-
-def _parse_memory() -> list[str]:
-    p = _memory_path()
-    if not p.exists():
-        return []
-    raw = p.read_text().strip()
-    if not raw:
-        return []
-    return [e.strip() for e in raw.split("§") if e.strip()]
-
-
-def _write_memory(entries: list[str]):
-    p = _memory_path()
-    content = "\n§\n".join(entries)
-    fd, tmp = tempfile.mkstemp(dir=str(p.parent))
+def _req(method: str, path: str, data: dict | None = None) -> dict:
+    url = f"{SERVER}{path}"
+    body = json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Content-Type", "application/json")
     try:
-        with os.fdopen(fd, "w") as f:
-            f.write(content + "\n")
-        os.replace(tmp, p)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err = e.read().decode()
+        try:
+            return json.loads(err)
+        except json.JSONDecodeError:
+            return {"error": f"HTTP {e.code}: {err}"}
+    except urllib.error.URLError as e:
+        return {"error": f"server unreachable: {e.reason}"}
+
+
+def cmd_init():
+    h = _req("GET", "/health")
+    if "error" in h:
+        print(h["error"], file=sys.stderr)
+        sys.exit(1)
+    s = h.get("sessions_indexed", 0)
+    t = ", ".join(h.get("topics", []))
+    print(f"memoria v{h.get('memoria_version', '?')} — {s} sessions indexed")
+    if t:
+        print(f"topics: {t}")
 
 
 def cmd_add(text: str):
-    entries = _parse_memory()
-    total_chars = sum(len(e) for e in entries)
-    if total_chars + len(text) > MEMORY_LIMIT:
-        print(
-            f"Memory at {total_chars}/{MEMORY_LIMIT} chars. Cannot add.",
-            file=sys.stderr,
-        )
+    r = _req("POST", f"/memory/{project_name()}", {"text": text})
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
         sys.exit(1)
-    entries.append(text)
-    _write_memory(entries)
-    print(
-        f"added ({len(entries)} entries, {total_chars + len(text)}/{MEMORY_LIMIT} chars)"
-    )
+    print(f"added ({r['entries']} entries, {r['chars']} chars)")
 
 
 def cmd_list():
-    entries = _parse_memory()
+    r = _req("GET", f"/memory/{project_name()}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    entries = r.get("entries", [])
     if not entries:
         print("MEMORY.md is empty")
         return
@@ -93,147 +97,39 @@ def cmd_list():
 
 
 def cmd_replace(old: str, new: str):
-    entries = _parse_memory()
-    found = False
-    for i, e in enumerate(entries):
-        if old in e:
-            entries[i] = new
-            found = True
-    if not found:
-        print(f"No entry containing: {old}", file=sys.stderr)
+    r = _req("PUT", f"/memory/{project_name()}", {"old": old, "new": new})
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
         sys.exit(1)
-    _write_memory(entries)
-    print(f"replaced ({len(entries)} entries)")
-
-
-def daemon_pid() -> int | None:
-    p = wd() / "daemon.pid"
-    if not p.exists():
-        return None
-    pid = int(p.read_text().strip())
-    try:
-        os.kill(pid, 0)
-        return pid
-    except OSError:
-        return None
-
-
-def cmd_init():
-    pid = daemon_pid()
-    if pid:
-        print(f"daemon already running (pid {pid})")
-        return
-    if not _memory_path().exists():
-        _memory_path().write_text("")
-        print(f"created {_memory_path()}")
-    script = str(Path(__file__).resolve().parent / "memoriad.py")
-    env = os.environ.copy()
-    env["MEMORIA_PROJECT"] = project_name()
-    subprocess.Popen(
-        [sys.executable, script],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=env,
-        start_new_session=True,
-    )
-    for _ in range(10):
-        time.sleep(0.3)
-        pid = daemon_pid()
-        if pid:
-            print(f"daemon started (pid {pid})")
-            _maybe_import_hermes()
-            return
-    print("daemon start timed out", file=sys.stderr)
-    sys.exit(1)
-
-
-def cmd_stop():
-    pid = daemon_pid()
-    if not pid:
-        print("daemon not running")
-        return
-    os.kill(pid, 15)
-    for _ in range(10):
-        time.sleep(0.3)
-        if not daemon_pid():
-            print(f"daemon (pid {pid}) stopped")
-            return
-    os.kill(pid, 9)
-    print("forced kill")
-
-
-def cmd_status():
-    pid = daemon_pid()
-    entries = _parse_memory()
-    index_path = wd() / "index.db"
-    sess_path = wd() / "sessions.jsonl"
-    print(f"project:    {project_name()}")
-    print(f"daemon:     {'running (pid ' + str(pid) + ')' if pid else 'stopped'}")
-    print(
-        f"memory:     {len(entries)} entries, {sum(len(e) for e in entries)}/{MEMORY_LIMIT} chars"
-    )
-    print(f"index.db:   {'exists' if index_path.exists() else 'missing'}")
-    sess_count = sum(1 for _ in sess_path.open()) if sess_path.exists() else 0
-    print(f"sessions:   {sess_count} indexed")
-    print(f"workdir:    {wd()}")
-
-
-def _open_index() -> sqlite3.Connection:
-    path = wd() / "index.db"
-    db = sqlite3.connect(str(path))
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA synchronous=OFF")
-    db.execute(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts "
-        "USING fts5(id UNINDEXED, title, summary, tokenize='porter unicode61')"
-    )
-    return db
+    print(f"replaced ({r['entries']} entries)")
 
 
 def cmd_recall(query: str, limit: int = 5):
-    db = _open_index()
-    count = db.execute("SELECT count(*) FROM sessions_fts").fetchone()[0]
-    if count == 0:
-        print("No indexed sessions yet. Run 'memoria review' or wait for daemon.")
-        db.close()
-        return
-    q = " OR ".join(query.split())
-    try:
-        rows = db.execute(
-            "SELECT id, title, summary, rank "
-            "FROM sessions_fts "
-            "WHERE sessions_fts MATCH ? "
-            "ORDER BY rank LIMIT ?",
-            (q, limit),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        print(f"No matches for: {query}")
-        db.close()
-        return
-    db.close()
-    if not rows:
+    r = _req("GET", f"/recall?q={urllib.parse.quote(query)}&limit={limit}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    results = r.get("results", [])
+    if not results:
         print(f"No matches for: {query}")
         return
-    print(f"Found {len(rows)} relevant sessions:\n")
-    for r in rows:
-        summary = (r["summary"] or "")[:300]
-        print(f"  [{r['id'][:12]}...]")
-        print(f"  title: {r['title']}")
-        print(f"  summary: {summary}\n")
+    print(f"Found {len(results)} relevant sessions:\n")
+    for s in results:
+        print(f"  [{s['id'][:12]}...]")
+        print(f"  title: {s['title']}")
+        print(f"  summary: {s['summary']}\n")
 
 
 def cmd_review(n: int = 3):
-    p = wd() / "sessions.jsonl"
-    if not p.exists():
+    r = _req("GET", f"/review?n={n}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    sessions = r.get("sessions", [])
+    if not sessions:
         print("No sessions data yet.")
         return
-    lines = p.read_text().strip().splitlines()
-    for line in lines[-n:]:
-        try:
-            s = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for s in sessions:
         ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(s.get("created", 0) / 1000))
         print(f"[{s.get('id', '?')[:12]}...]  {ts}")
         print(f"  title: {s.get('title', 'untitled')}")
@@ -247,16 +143,15 @@ def cmd_review(n: int = 3):
 
 
 def cmd_learnings():
-    p = wd() / "sessions.jsonl"
-    if not p.exists():
+    r = _req("GET", "/review?n=20")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    sessions = r.get("sessions", [])
+    if not sessions:
         print("No sessions data yet.")
         return
-    parts = []
-    for line in p.read_text().strip().splitlines()[-20:]:
-        try:
-            parts.append(json.loads(line).get("summary", ""))
-        except json.JSONDecodeError:
-            continue
+    parts = [s.get("summary", "") for s in sessions if s.get("summary")]
     print("\n\n".join(p for p in parts if p))
 
 
@@ -265,93 +160,218 @@ def cmd_compress():
     if not text:
         print("No input (stdin is empty)")
         return
-    lines = text.splitlines(keepends=True)
-    result = []
-    buf = []
-    in_tool = False
-    for line in lines:
-        m = re.match(r"^\[(\w+)\]\s+(ran `[^`]+`|executed|returned)", line)
-        if m:
-            if buf:
-                result.extend(_compress_block(buf))
-            buf = [line]
-            in_tool = True
-            continue
-        if in_tool:
-            if re.match(r"^\[(\w+)\]", line):
-                result.extend(_compress_block(buf))
-                result.append(line)
-                buf = []
-                in_tool = False
-            elif line.strip() == "" and len(buf) > 30:
-                result.extend(_compress_block(buf))
-                result.append(line)
-                buf = []
-                in_tool = False
-            else:
-                buf.append(line)
-            continue
-        result.append(line)
-    if buf:
-        result.extend(_compress_block(buf))
-    sys.stdout.write("".join(result))
+    r = _req("POST", "/compress", {"text": text, "phase": 2})
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    sys.stdout.write(r.get("compressed", ""))
 
 
-_TOOL = re.compile(r"^\[(\w+)\]\s+(.+)")
-_EXIT = re.compile(r"exit (\d+)")
+def cmd_status():
+    h = _req("GET", "/health")
+    if "error" in h:
+        print(h["error"], file=sys.stderr)
+        sys.exit(1)
+    m = _req("GET", f"/memory/{project_name()}")
+    entries = m.get("entries", [])
+    char_total = sum(len(e) for e in entries)
+    print(f"project:    {project_name()}")
+    print(f"server:     {SERVER}")
+    print(f"daemon:     running (REST server)")
+    print(f"memory:     {len(entries)} entries, {char_total} chars")
+    print(f"sessions:   {h.get('sessions_indexed', 0)} indexed")
+    print(f"db:         {'present' if h.get('db_exists') else 'missing'}")
+    topics = h.get("topics", [])
+    if topics:
+        print(f"topics:     {', '.join(topics)}")
 
 
-def _compress_block(lines: list[str]) -> list[str]:
-    if not lines:
-        return []
-    first = lines[0].strip()
-    m = _TOOL.match(first)
-    if not m:
-        return lines
-    tool = m.group(1)
-    action = m.group(2)
-    code = "?"
-    count = len(lines) - 1
-    err = any("Error:" in l for l in lines)
-    for l in lines:
-        x = _EXIT.search(l)
-        if x:
-            code = x.group(1)
-    status = f"exit {code}{' (error)' if err else ''}"
-    for l in lines[1:6]:
-        f = re.search(r"Found (\d+) matches", l)
-        if f:
-            return [f"[{tool}] {action} → {status}, {f.group(1)} matches\n"]
-        c = re.search(r"(\d+) lines?", l)
-        if c:
-            return [f"[{tool}] {action} → {status}, {c.group(1)}\n"]
-    return [
-        f"[{tool}] {action} → {status}, {count} lines{' (errors)' if err else ''}\n"
-    ]
+def cmd_stop():
+    print("memoria server is persistent — no stop needed")
+    print(f"server: {SERVER}")
 
 
-def _maybe_import_hermes():
-    p = _memory_path()
-    if p.exists() and p.stat().st_size > 0:
+def cmd_topics():
+    r = _req("GET", "/topics?detail=true")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    topics = r.get("topics", {})
+    if not topics:
+        print("No topics yet. Use: memoria propose <topic> <text>")
         return
-    hm = HERMES_HOME / "memories" / "MEMORY.md"
-    hu = HERMES_HOME / "memories" / "USER.md"
-    entries = []
-    if hm.exists():
-        for e in hm.read_text().split("§"):
-            e = e.strip()
-            if e:
-                entries.append(f"[hermes] {e}")
-    if hu.exists():
-        for e in hu.read_text().split("§"):
-            e = e.strip()
-            if e:
-                entries.append(f"[hermes:user] {e}")
-    if entries:
-        _write_memory(entries[:20])
-        print(f"imported {len(entries[:20])} entries from Hermes")
-    else:
-        p.write_text("")
+    for name, facts in sorted(topics.items()):
+        print(f"\n## {name}")
+        for i, f in enumerate(facts, 1):
+            ws = " " * (len(name) + 4)
+            print(f"  {i}. {f}" if i == 1 else f"{ws}{i}. {f}")
+    print()
+
+
+def cmd_topic(name: str, text: str | None = None):
+    if text:
+        r = _req("POST", f"/topics/{name}", {"text": text})
+        if "error" in r:
+            print(r["error"], file=sys.stderr)
+            sys.exit(1)
+        print(f"added to topic '{name}' ({r['entries']} entries)")
+        return
+    r = _req("GET", f"/topics/{name}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    facts = r.get("facts", [])
+    if not facts:
+        print(f"Topic '{name}' is empty")
+        return
+    print(f"## {name}")
+    for i, f in enumerate(facts, 1):
+        print(f"  {i}. {f}")
+
+
+def cmd_propose(topic: str, text: str):
+    r = _req("POST", "/proposals", {"topic": topic, "text": text})
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"proposed as {r['id']}")
+
+
+def cmd_proposals():
+    r = _req("GET", "/proposals")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    props = r.get("proposals", [])
+    if not props:
+        print("No pending proposals")
+        return
+    for p in props:
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(p.get("proposed_at", 0)))
+        print(f"  {p['id']}  [{p['topic']}]  {ts}")
+        print(f"    {p['text'][:200]}")
+
+
+def cmd_accept(pid: str):
+    r = _req("POST", f"/proposals/{pid}/accept")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"accepted, moved to topic '{r['moved_to']}'")
+
+
+def cmd_reject(pid: str):
+    r = _req("DELETE", f"/proposals/{pid}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"rejected {pid}")
+
+
+def cmd_task(project: str, title: str, description: str = ""):
+    r = _req(
+        "POST",
+        "/tasks",
+        {"project": project, "title": title, "description": description},
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"task created: {r['task_id']}")
+
+
+def cmd_claim(task_id: str):
+    r = _req(
+        "PATCH",
+        f"/tasks/{task_id}",
+        {"status": "assigned", "assigned_to": project_name()},
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"claimed {task_id}")
+
+
+def cmd_done(task_id: str, result: str = ""):
+    r = _req("PATCH", f"/tasks/{task_id}", {"status": "completed", "result": result})
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"{task_id} completed")
+
+
+def cmd_fail(task_id: str, error: str = ""):
+    r = _req("PATCH", f"/tasks/{task_id}", {"error": error})
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"{task_id} failed: {error}")
+
+
+def cmd_tasks(project: str | None = None):
+    path = "/tasks"
+    if project:
+        path += f"?project={urllib.parse.quote(project)}"
+    r = _req("GET", path)
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    tasks = r.get("tasks", [])
+    if not tasks:
+        print("No tasks")
+        return
+    for t in tasks:
+        status = t.get("status", "?")
+        assigned = t.get("assigned_to", "") or "unassigned"
+        print(f"  {t['id'][:20]}  [{status}]  {assigned}")
+        print(f"    {t.get('title', '?')[:100]}")
+        if t.get("result"):
+            print(f"    result: {t['result'][:100]}")
+        if t.get("error"):
+            print(f"    error: {t['error'][:100]}")
+        print()
+
+
+def cmd_agents(project: str | None = None):
+    path = "/agents"
+    if project:
+        path += f"?project={urllib.parse.quote(project)}"
+    r = _req("GET", path)
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    agents = r.get("agents", [])
+    if not agents:
+        print("No active agents")
+        return
+    for a in agents:
+        status = a.get("status", "?")
+        print(f"  {a['id'][:20]}  [{status}]  {a.get('project', '?')}")
+        print(f"    task: {a.get('task', '?')[:100]}")
+        if a.get("files"):
+            print(f"    files: {', '.join(a['files'][:5])}")
+        if a.get("conflicts_warned"):
+            print(f"    ⚠ conflicts: {'; '.join(a['conflicts_warned'])}")
+        print()
+
+
+def cmd_snap(project: str, message: str = "agent-os snapshot"):
+    r = _req(
+        "POST", f"/safety/snapshot/{urllib.parse.quote(project)}", {"message": message}
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"snapshot {r['snapshot_id']} at {r['commit_hash'][:12]}")
+
+
+def cmd_rollback(project: str, snapshot_id: str | None = None):
+    body = {} if not snapshot_id else {"snapshot_id": snapshot_id}
+    r = _req("POST", f"/safety/rollback/{urllib.parse.quote(project)}", body)
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"rolled back to {r['rolled_back_to'][:12]} ({r.get('message', '?')})")
 
 
 def main():
@@ -389,6 +409,64 @@ def main():
         cmd_status()
     elif cmd == "stop":
         cmd_stop()
+    elif cmd == "topics":
+        cmd_topics()
+    elif cmd == "topic":
+        if len(args) < 2:
+            print("usage: memoria topic <name> [text]", file=sys.stderr)
+            sys.exit(1)
+        cmd_topic(args[1], " ".join(args[2:]) if len(args) > 2 else None)
+    elif cmd == "propose":
+        if len(args) < 3:
+            print("usage: memoria propose <topic> <text>", file=sys.stderr)
+            sys.exit(1)
+        cmd_propose(args[1], " ".join(args[2:]))
+    elif cmd == "proposals":
+        cmd_proposals()
+    elif cmd == "accept":
+        if len(args) < 2:
+            print("usage: memoria accept <id>", file=sys.stderr)
+            sys.exit(1)
+        cmd_accept(args[1])
+    elif cmd == "reject":
+        if len(args) < 2:
+            print("usage: memoria reject <id>", file=sys.stderr)
+            sys.exit(1)
+        cmd_reject(args[1])
+    elif cmd == "task":
+        if len(args) < 3:
+            print("usage: memoria task <project> <title>", file=sys.stderr)
+            sys.exit(1)
+        cmd_task(args[1], " ".join(args[2:]))
+    elif cmd == "claim":
+        if len(args) < 2:
+            print("usage: memoria claim <task-id>", file=sys.stderr)
+            sys.exit(1)
+        cmd_claim(args[1])
+    elif cmd == "done":
+        if len(args) < 2:
+            print("usage: memoria done <task-id> [result]", file=sys.stderr)
+            sys.exit(1)
+        cmd_done(args[1], " ".join(args[2:]))
+    elif cmd == "fail":
+        if len(args) < 2:
+            print("usage: memoria fail <task-id> [error]", file=sys.stderr)
+            sys.exit(1)
+        cmd_fail(args[1], " ".join(args[2:]))
+    elif cmd == "tasks":
+        cmd_tasks(args[1] if len(args) > 1 else None)
+    elif cmd == "agents":
+        cmd_agents(args[1] if len(args) > 1 else None)
+    elif cmd == "snap":
+        if len(args) < 2:
+            print("usage: memoria snap <project> [message]", file=sys.stderr)
+            sys.exit(1)
+        cmd_snap(args[1], " ".join(args[2:]) if len(args) > 2 else "agent-os snapshot")
+    elif cmd == "rollback":
+        if len(args) < 2:
+            print("usage: memoria rollback <project> [snapshot-id]", file=sys.stderr)
+            sys.exit(1)
+        cmd_rollback(args[1], args[2] if len(args) > 2 else None)
     else:
         print(f"unknown: {cmd}", file=sys.stderr)
         sys.exit(1)

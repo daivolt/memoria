@@ -1,101 +1,172 @@
-# memoria — OpenCode Session Memory & Pattern Learning
+# memoria v2 — Memory + AgentOS Orchestration
 
-Persistent memory system for opencode that learns from past sessions.
+Persistent memory + agent coordination for opencode.
+Runs as a REST server on the Tailscale mini server (`100.121.245.69:19998`).
 
-## Architecture
+## Architecture (6 Layers + Safety)
 
 ```
-┌─────────────┐     polls every 30s     ┌──────────────────┐
-│  opencode    │ ←────────────────────── │   memoriad.py    │
-│  SQLite DB   │                         │  (background daemon)│
-│  9.2GB       │ ──────────────────────→ │  extracts sessions│
-│  946 sess.   │                         │  builds FTS5 index│
-└─────────────┘                          └────────┬─────────┘
-                                                  │ writes
-                                                  ↓
-┌──────────────────────────────────────────────────┐
-│           /var/tmp/memoria-<PROJECT>/             │
-│  ┌────────────┐  ┌──────────┐  ┌──────────┐     │
-│  │ MEMORY.md  │  │session.  │  │index.db  │     │
-│  │ durable    │  │ jsonl    │  │ FTS5     │     │
-│  │ facts      │  │records   │  │ search   │     │
-│  └────────────┘  └──────────┘  └──────────┘     │
-└──────────────────────────────────────────────────┘
-         ↑ read/write via CLI      ↑ read via CLI
-         └──────── memoria.py ─────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Safety Layer — Git snapshots, rollback, commit tagging     │
+│  /var/tmp/memoria/safety/<project>/snapshots.jsonl          │
+│  Pre-work snapshot, rollback anytime, auto-commit tagging   │
+├─────────────────────────────────────────────────────────────┤
+│  Layer 5 — Agent Registry                                   │
+│  /var/tmp/memoria/agents/*.json                             │
+│  Tracks active sessions, file claims, PID heartbeat.        │
+│  Conflict detection prevents concurrent edits.              │
+├─────────────────────────────────────────────────────────────┤
+│  Layer 6 — Task Board                                       │
+│  /var/tmp/memoria/tasks/*.json                              │
+│  Cross-agent task delegation via chitchat notifications.    │
+│  Status: pending → assigned → completed/failed              │
+├─────────────────────────────────────────────────────────────┤
+│  Layer 1 — MEMORY.md (per-project durable facts)            │
+│  /var/tmp/memoria/<project>/MEMORY.md  (§-delimited)        │
+│  5KB limit. Saved via `!memoria add <fact>`.                │
+├─────────────────────────────────────────────────────────────┤
+│  Layer 2 — Global Topics (cross-project knowledge)          │
+│  /var/tmp/memoria/topics/<name>.md  (§-delimited)           │
+│  Proposed via `!memoria propose <topic> <text>`,            │
+│  accepted/rejected via `!memoria accept/reject <id>`.       │
+├─────────────────────────────────────────────────────────────┤
+│  Layer 3 — FTS5 Session Recall (all sessions)               │
+│  /var/tmp/memoria/index.db (SQLite FTS5)                    │
+│  Polls opencode.db every 30s, extracts structured records.  │
+│  Searchable via `!memoria recall <query>`.                  │
+├─────────────────────────────────────────────────────────────┤
+│  Layer 4 — Active Context (real-time task state)            │
+│  /var/tmp/memoria/<project>/context/state.json              │
+│  Task description, files in scope, file locks.              │
+│  PID-based staleness check (5min timeout).                  │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**Two processes:**
+## Components
 
-1. **`memoriad.py`** — Background daemon. Polls opencode's SQLite DB every 30s
-   for newly archived sessions. Extracts: user task → tools → outcome.
-   Writes structured records to `sessions.jsonl` + FTS5 index.
+### `memoriad_global.py` — REST Server (port 19998)
+FastAPI server with all endpoints. Runs on the mini server.
+Background task polls opencode.db every 30s for new sessions.
 
-2. **`memoria.py`** — CLI invoked by the LLM via bash. Commands:
-   - `memoria add`, `list`, `replace` — manage MEMORY.md durable facts
-   - `memoria recall <query>` — search past sessions via FTS5
-   - `memoria review [N]` — show last N session summaries
-   - `memoria learnings` — accumulated project knowledge
-   - `memoria compress` — strip verbose tool output to 1-liners (stdin)
-   - `memoria init | stop | status` — manage daemon lifecycle
+**Endpoints:**
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/health` | Server status, session count, topics |
+| GET | `/recall?q=<query>&limit=N` | FTS5 session search |
+| GET | `/review?n=N` | Recent session summaries |
+| GET/POST | `/memory/{project}` | Per-project durable facts |
+| PUT | `/memory/{project}` | Replace memory entry |
+| GET/POST | `/topics/{name}` | Cross-project topic facts |
+| GET/POST | `/proposals` | Propose new cross-project facts |
+| POST | `/proposals/{id}/accept` | Accept proposal → topic |
+| DELETE | `/proposals/{id}` | Reject proposal |
+| GET/POST/DELETE | `/context/{project}` | Active task state |
+| POST | `/context/{project}/claim/{file}` | File lock claim |
+| POST | `/compress` | Phase 1+2 context compression |
+| POST | `/agents` | Register agent session |
+| GET | `/agents` | List active agents |
+| PATCH | `/agents/{id}` | Agent heartbeat |
+| DELETE | `/agents/{id}` | Deregister agent |
+| POST | `/tasks` | Create task |
+| GET | `/tasks` | List tasks (filter by project/status) |
+| PATCH | `/tasks/{id}` | Update task (assign, complete, fail) |
+| DELETE | `/tasks/{id}` | Delete task |
+| POST | `/safety/snapshot/{project}` | Create git snapshot |
+| POST | `/safety/rollback/{project}` | Rollback to snapshot |
+| GET | `/safety/{project}/snapshots` | List snapshots |
+| GET | `/` | HTML dashboard |
 
-## Learning Mechanism (How It "Learns")
+### `memoria.py` — CLI (HTTP client)
+Proxies all commands to REST server:
 
-Memoria does NOT modify model weights. It uses 4 Hermes-inspired techniques:
+**Memory:**
+| Command | Action |
+|---------|--------|
+| `!memoria init` | Verify server connectivity |
+| `!memoria add <text>` | Save durable fact to MEMORY.md |
+| `!memoria list` | Show all facts |
+| `!memoria replace <old> <new>` | Update a matching fact |
+| `!memoria recall <query>` | Search past sessions via FTS5 |
+| `!memoria review [N]` | Show last N session summaries |
+| `!memoria learnings` | Show accumulated project knowledge |
+| `!memoria compress` | Read stdin, compress via REST |
+| `!memoria status` | Server health + project memory |
+| `!memoria topics` | List cross-project topics |
+| `!memoria topic <name> [text]` | Show topic facts or add one |
+| `!memoria propose <topic> <text>` | Propose cross-project fact |
+| `!memoria proposals` | List pending proposals |
+| `!memoria accept <id>` | Accept proposal → topic |
+| `!memoria reject <id>` | Reject proposal |
 
-### 1. Durable Fact Storage (MEMORY.md)
-The LLM saves facts via `!memoria add` when it discovers:
-- User preferences ("daivolt prefers concise responses")
-- Project conventions ("all router endpoints need _audit()")
-- Environment quirks ("VPN causes 2s delay on first API call")
+**Orchestration:**
+| Command | Action |
+|---------|--------|
+| `!memoria task <project> <title>` | Create task on board |
+| `!memoria claim <task-id>` | Claim a pending task |
+| `!memoria done <task-id> [result]` | Mark task complete |
+| `!memoria fail <task-id> [error]` | Mark task failed |
+| `!memoria tasks [project]` | List tasks (filter by project) |
+| `!memoria agents [project]` | List active agents |
+| `!memoria snap <project> [msg]` | Create git snapshot |
+| `!memoria rollback <project> [id]` | Rollback to snapshot |
 
-Facts are declarative ("User prefers X"), not imperative ("Always do X").
-5KB character limit forces curation — LLM must replace/remove when full.
+### `compress.py` — Phase 1 + 2 Engine
+Pure stdlib, deterministic, zero LLM cost.
 
-### 2. Cross-Session Recall (FTS5)
-When starting a complex task, the LLM runs `!memoria recall <task>`.
-FTS5 searches all past session summaries, returns relevant matches.
-The LLM reads these before starting work — informed context.
+- **Phase 1**: Tool output → 1-line summaries (regex: exit code, match count, line count)
+- **Phase 2**: Structured turn merging — drop acks, placeholder reasoning, group sequential tools, preserve errors
 
-### 3. Context Compression
-When sessions grow long (tool outputs accumulate), `!memoria compress`
-replaces verbose blocks with 1-line summaries:
-```
-[grep] ran `grep -r "timeout" src/` → exit 0, 23 matches
-```
+### `context.py` — Active Context State
+Real-time task info per project. PID-based staleness (5min).
+File claims prevent concurrent edits.
 
-Phase 1 is zero-LLM-cost regex. The compressed version replaces the
-original, saving thousands of tokens.
+## Configuration
 
-### 4. Auto-Indexing (Daemon)
-Every 30s the daemon checks for new archived sessions, extracts
-structured records, updates FTS5. No LLM cost — pure SQL.
+| Env Var | Default | Purpose |
+|---------|---------|---------|
+| `MEMORIA_SERVER` | `http://100.121.245.69:19998` | REST server URL |
+| `MEMORIA_PROJECT` | `$(basename $(pwd))` | Project name for memory scoping |
+| `MEMORIA_PORT` | `19998` | Server port (server-side) |
+| `MEMORIA_HOST` | `0.0.0.0` | Server bind address |
 
 ## Token Cost
 
 | Component | Tokens | Frequency |
 |-----------|--------|-----------|
-| SKILL.md | ~600 | Once per session (prefix-cached) |
+| SKILL.md | ~800 | Once per session (prefix-cached) |
 | `!memoria recall` | 300-500 | On-demand |
 | `!memoria compress` | **Negative** | On-demand (saves tokens) |
-| Daemon | 0 | Always, filesystem-only |
+| Server | 0 | Background, filesystem-only |
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `memoria.py` | CLI tool invoked by LLM |
-| `memoriad.py` | Background daemon |
+| `memoria.py` | CLI tool (HTTP client to REST server) |
+| `memoriad_global.py` | REST server — memory + agents + tasks + safety + dashboard |
+| `memoriad.py` | [DEPRECATED] Old per-project daemon |
+| `compress.py` | Phase 1+2 compression engine |
+| `context.py` | Active context state management |
 | `README.md` | This file |
 
-## Hermes Import
+## Deployment
 
-If Hermes memories exist at `~/.hermes/memories/MEMORY.md`, first
-`!memoria init` imports them tagged with `[hermes]` prefix — zero
-context cost until needed.
+```bash
+# On the mini server:
+mkdir -p ~/memoria
+# rsync or copy files from mediserv
+uvicorn memoriad_global:app --host 0.0.0.0 --port 19998
 
-## Requirements
+# On any machine with network access to mini server:
+export MEMORIA_SERVER=http://100.121.245.69:19998
+!memoria status
+```
 
-- Python 3.10+
-- No external dependencies (stdlib only: sqlite3, json, asyncio)
-- Read access to opencode SQLite DB at `~/.local/share/opencode/opencode.db`
+## Migration from v1
+
+- v1 used per-project daemons (memoriad.py) that polled opencode.db individually
+- v2 uses a single REST server (memoriad_global.py) that handles all projects
+- All state still at `/var/tmp/memoria/` — compatible layout
+- CLI commands unchanged — `memoria.py` now proxies to REST
+- Daemon lifecycle commands (`init`, `stop`) are now no-ops / health checks
+# agent-os auto-commit test
