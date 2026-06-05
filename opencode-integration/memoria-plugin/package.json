@@ -1,0 +1,9 @@
+{
+  "name": "memoria-plugin",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    "./server": "./index.mjs"
+  }
+}

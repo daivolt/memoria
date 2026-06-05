@@ -36,6 +36,12 @@ Chitchat (episodic chat memory):
   memoria chitchat rooms               List tracked chat rooms
   memoria chitchat history <room>      Show recent chat messages
   memoria chitchat consolidate         Trigger hippocampal replay → topics
+
+Clients:
+  memoria clients                      List registered clients
+  memoria client <name> <host> [key] [user]  Register client
+  memoria client remove <name>         Remove client
+  memoria push-clients                 Push updates to all clients
 """
 
 import json
@@ -581,6 +587,57 @@ def main():
         else:
             print(f"unknown chitchat subcommand: {sub}", file=sys.stderr)
             sys.exit(1)
+    elif cmd == "clients":
+        r = _req("GET", "/clients")
+        if "error" in r:
+            print(r["error"], file=sys.stderr)
+            sys.exit(1)
+        clients = r.get("clients", [])
+        if not clients:
+            print("No clients registered")
+            return
+        for c in clients:
+            print(f"  {c['name']:<15} {c['host']:<20} {c.get('user', 'daivolt'):<10} {c.get('ssh_key', '~/.ssh/id_memoria')}")
+    elif cmd == "client":
+        if len(args) < 2:
+            print("usage: memoria client <name> <host> [ssh_key] [user]", file=sys.stderr)
+            print("       memoria client remove <name>", file=sys.stderr)
+            sys.exit(1)
+        if args[1] == "remove":
+            if len(args) < 3:
+                print("usage: memoria client remove <name>", file=sys.stderr)
+                sys.exit(1)
+            r = _req("DELETE", f"/clients/{urllib.parse.quote(args[2])}")
+            if "error" in r:
+                print(r["error"], file=sys.stderr)
+                sys.exit(1)
+            print(f"client '{args[2]}' removed")
+        else:
+            name = args[1]
+            host = args[2] if len(args) > 2 else ""
+            ssh_key = args[3] if len(args) > 3 else "~/.ssh/id_memoria"
+            user = args[4] if len(args) > 4 else "daivolt"
+            r = _req("POST", "/clients", {"name": name, "host": host, "ssh_key": ssh_key, "user": user})
+            if "error" in r:
+                print(r["error"], file=sys.stderr)
+                sys.exit(1)
+            print(f"client '{name}' {r.get('action', 'registered')}")
+    elif cmd == "push-clients":
+        print("Pushing updates to all clients ...")
+        r = _req("POST", "/clients/push")
+        if "error" in r:
+            print(r["error"], file=sys.stderr)
+            sys.exit(1)
+        for result in r.get("results", []):
+            status = result["status"]
+            name = result["name"]
+            if status == "ok":
+                print(f"  {name}: OK")
+            elif status == "skip":
+                print(f"  {name}: SKIP ({result.get('error', '')})")
+            else:
+                print(f"  {name}: {status.upper()} — {result.get('error', '')}")
+        print(f"Pushed {r.get('pushed', 0)}/{r.get('total', 0)} clients")
     else:
         print(f"unknown: {cmd}", file=sys.stderr)
         sys.exit(1)

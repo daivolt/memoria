@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const memoriaBase = "http://localhost:19998"
+var memoriaBase = getEnv("MEMORIA_SERVER", "http://100.121.245.69:19998")
 
 type MemoriaClient struct {
 	client *http.Client

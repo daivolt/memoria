@@ -50,6 +50,8 @@ CHITCHAT_ROOMS = [r.strip() for r in os.environ.get("CHITCHAT_ROOMS", "general")
 SLEEP_CYCLE_HOURS = int(os.environ.get("SLEEP_CYCLE_HOURS", "6"))
 SESSION_MAX_RECORDS = int(os.environ.get("SESSION_MAX_RECORDS", "5000"))  # total session slot limit
 AUTO_ACCEPT_THRESHOLD = int(os.environ.get("AUTO_ACCEPT_THRESHOLD", "3"))
+CLIENTS_DIR = WORKDIR / "clients"
+CLIENTS_CONF = Path(os.environ.get("MEMORIA_CLIENTS_CONF", "/mnt/external-drive/code/memoria/opencode-integration/clients.conf"))
 
 # ── Shared modules for session extraction ────────────────────
 
@@ -1695,6 +1697,128 @@ async def trigger_consolidation():
     _chitchat_unconsolidated = CHITCHAT_CONSOLIDATE_THRESHOLD
     _consolidate_chitchat()
     return {"ok": True}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Client Registry
+# ═══════════════════════════════════════════════════════════════
+
+class RegisterClient(BaseModel):
+    name: str
+    host: str
+    ssh_key: str = "~/.ssh/id_memoria"
+    user: str = "daivolt"
+
+
+def _load_clients() -> list[dict]:
+    CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
+    clients_file = CLIENTS_DIR / "clients.json"
+    if clients_file.exists():
+        try:
+            return json.loads(clients_file.read_text())
+        except (json.JSONDecodeError, ValueError):
+            pass
+    if CLIENTS_CONF.exists():
+        clients = []
+        for line in CLIENTS_CONF.read_text().strip().splitlines():
+            parts = line.strip().split()
+            if not parts or parts[0].startswith("#"):
+                continue
+            clients.append({
+                "name": parts[0],
+                "host": parts[1] if len(parts) > 1 else "",
+                "ssh_key": parts[2] if len(parts) > 2 else "~/.ssh/id_memoria",
+                "user": parts[3] if len(parts) > 3 else "daivolt",
+                "source": "conf",
+            })
+        clients_file.write_text(json.dumps(clients, ensure_ascii=False, indent=2))
+        return clients
+    return []
+
+
+def _save_clients(clients: list[dict]):
+    CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
+    (CLIENTS_DIR / "clients.json").write_text(json.dumps(clients, ensure_ascii=False, indent=2))
+
+
+@app.get("/clients")
+async def list_clients():
+    clients = _load_clients()
+    return {"clients": clients, "count": len(clients)}
+
+
+@app.post("/clients")
+async def register_client(body: RegisterClient):
+    clients = _load_clients()
+    existing = next((c for c in clients if c["name"] == body.name), None)
+    if existing:
+        existing["host"] = body.host
+        existing["ssh_key"] = body.ssh_key
+        existing["user"] = body.user
+    else:
+        clients.append(body.model_dump())
+    _save_clients(clients)
+    return {"ok": True, "name": body.name, "action": "updated" if existing else "registered"}
+
+
+@app.delete("/clients/{name}")
+async def remove_client(name: str):
+    clients = _load_clients()
+    before = len(clients)
+    clients = [c for c in clients if c["name"] != name]
+    if len(clients) == before:
+        raise HTTPException(404, f"client '{name}' not found")
+    _save_clients(clients)
+    return {"ok": True, "removed": name}
+
+
+@app.post("/clients/push")
+async def push_to_clients():
+    clients = _load_clients()
+    if not clients:
+        return {"ok": True, "pushed": 0, "message": "no clients registered"}
+
+    source_dir = str(CLIENTS_CONF.parent)
+    results = []
+
+    for client in clients:
+        name = client["name"]
+        host = client["host"]
+        key = os.path.expanduser(client.get("ssh_key", "~/.ssh/id_memoria"))
+        user = client.get("user", "daivolt")
+
+        if not os.path.isfile(key):
+            results.append({"name": name, "status": "skip", "error": "key not found"})
+            continue
+
+        try:
+            r_sync = subprocess.run(
+                ["rsync", "-avz", "--delete",
+                 "-e", f"ssh -i {key} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5",
+                 f"{source_dir}/", f"{user}@{host}:/tmp/memoria-update/"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r_sync.returncode != 0:
+                results.append({"name": name, "status": "fail", "error": r_sync.stderr[:200]})
+                continue
+
+            r_install = subprocess.run(
+                ["ssh", "-i", key, "-o", "StrictHostKeyChecking=accept-new",
+                 "-o", "ConnectTimeout=5",
+                 f"{user}@{host}", "bash /tmp/memoria-update/install.sh"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r_install.returncode != 0:
+                results.append({"name": name, "status": "fail", "error": r_install.stderr[:200]})
+            else:
+                results.append({"name": name, "status": "ok"})
+        except subprocess.TimeoutExpired:
+            results.append({"name": name, "status": "timeout"})
+        except Exception as e:
+            results.append({"name": name, "status": "error", "error": str(e)[:200]})
+
+    ok_count = sum(1 for r in results if r["status"] == "ok")
+    return {"ok": True, "pushed": ok_count, "total": len(clients), "results": results}
 
 
 # ═══════════════════════════════════════════════════════════════

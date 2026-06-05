@@ -3,15 +3,18 @@ package main
 import "github.com/charmbracelet/lipgloss"
 
 type Theme struct {
-	Name                   string
-	Base, Mantle           lipgloss.TerminalColor
-	Surface0, Surface1     lipgloss.TerminalColor
-	Text, Subtext0         lipgloss.TerminalColor
-	Overlay0               lipgloss.TerminalColor
-	Blue, Green            lipgloss.TerminalColor
-	Yellow, Red            lipgloss.TerminalColor
-	Mauve, Teal            lipgloss.TerminalColor
-	Peach                  lipgloss.TerminalColor
+	Name               string
+	Base, Mantle       lipgloss.TerminalColor
+	Surface0, Surface1 lipgloss.TerminalColor
+	Text, Subtext0     lipgloss.TerminalColor
+	Overlay0           lipgloss.TerminalColor
+	Blue, Green        lipgloss.TerminalColor
+	Yellow, Red        lipgloss.TerminalColor
+	Mauve, Teal        lipgloss.TerminalColor
+	Peach              lipgloss.TerminalColor
+	Lavender           lipgloss.TerminalColor
+	Pink               lipgloss.TerminalColor
+	Sky                lipgloss.TerminalColor
 }
 
 func c(hex string) lipgloss.TerminalColor {
@@ -34,60 +37,72 @@ var CatppuccinMocha = Theme{
 	Mauve:     c("#cba6f7"),
 	Teal:      c("#94e2d5"),
 	Peach:     c("#fab387"),
+	Lavender:  c("#b4befe"),
+	Pink:      c("#f5c2e7"),
+	Sky:       c("#89dceb"),
 }
 
 var Nord = Theme{
-	Name:     "Nord",
-	Base:     c("#2e3440"),
-	Mantle:   c("#3b4252"),
-	Surface0: c("#434c5e"),
-	Surface1: c("#4c566a"),
-	Text:     c("#eceff4"),
-	Subtext0: c("#d8dee9"),
-	Overlay0: c("#616e88"),
-	Blue:     c("#81a1c1"),
-	Green:    c("#a3be8c"),
-	Yellow:   c("#ebcb8b"),
-	Red:      c("#bf616a"),
-	Mauve:    c("#b48ead"),
-	Teal:     c("#88c0d0"),
-	Peach:    c("#d08770"),
+	Name:      "Nord",
+	Base:      c("#2e3440"),
+	Mantle:    c("#3b4252"),
+	Surface0:  c("#434c5e"),
+	Surface1:  c("#4c566a"),
+	Text:      c("#eceff4"),
+	Subtext0:  c("#d8dee9"),
+	Overlay0:  c("#616e88"),
+	Blue:      c("#81a1c1"),
+	Green:     c("#a3be8c"),
+	Yellow:    c("#ebcb8b"),
+	Red:       c("#bf616a"),
+	Mauve:     c("#b48ead"),
+	Teal:      c("#88c0d0"),
+	Peach:     c("#d08770"),
+	Lavender:  c("#a3be8c"),
+	Pink:      c("#b48ead"),
+	Sky:       c("#88c0d0"),
 }
 
 var Cyberpunk = Theme{
-	Name:     "Cyberpunk",
-	Base:     c("#0a0a1a"),
-	Mantle:   c("#12122a"),
-	Surface0: c("#1a1a3a"),
-	Surface1: c("#22224a"),
-	Text:     c("#e0e0ff"),
-	Subtext0: c("#a0a0cc"),
-	Overlay0: c("#505080"),
-	Blue:     c("#00aaff"),
-	Green:    c("#00ffaa"),
-	Yellow:   c("#ffaa00"),
-	Red:      c("#ff3355"),
-	Mauve:    c("#ff00ff"),
-	Teal:     c("#00ffcc"),
-	Peach:    c("#ff6600"),
+	Name:      "Cyberpunk",
+	Base:      c("#0a0a1a"),
+	Mantle:    c("#12122a"),
+	Surface0:  c("#1a1a3a"),
+	Surface1:  c("#22224a"),
+	Text:      c("#e0e0ff"),
+	Subtext0:  c("#a0a0cc"),
+	Overlay0:  c("#505080"),
+	Blue:      c("#00aaff"),
+	Green:     c("#00ffaa"),
+	Yellow:    c("#ffaa00"),
+	Red:       c("#ff3355"),
+	Mauve:     c("#ff00ff"),
+	Teal:      c("#00ffcc"),
+	Peach:     c("#ff6600"),
+	Lavender:  c("#aa88ff"),
+	Pink:      c("#ff66cc"),
+	Sky:       c("#66ffff"),
 }
 
 var Gruvbox = Theme{
-	Name:     "Gruvbox Dark",
-	Base:     c("#282828"),
-	Mantle:   c("#1d2021"),
-	Surface0: c("#3c3836"),
-	Surface1: c("#504945"),
-	Text:     c("#ebdbb2"),
-	Subtext0: c("#d5c4a1"),
-	Overlay0: c("#928374"),
-	Blue:     c("#83a598"),
-	Green:    c("#b8bb26"),
-	Yellow:   c("#fabd2f"),
-	Red:      c("#fb4934"),
-	Mauve:    c("#d3869b"),
-	Teal:     c("#8ec07c"),
-	Peach:    c("#fe8019"),
+	Name:      "Gruvbox Dark",
+	Base:      c("#282828"),
+	Mantle:    c("#1d2021"),
+	Surface0:  c("#3c3836"),
+	Surface1:  c("#504945"),
+	Text:      c("#ebdbb2"),
+	Subtext0:  c("#d5c4a1"),
+	Overlay0:  c("#928374"),
+	Blue:      c("#83a598"),
+	Green:     c("#b8bb26"),
+	Yellow:    c("#fabd2f"),
+	Red:       c("#fb4934"),
+	Mauve:     c("#d3869b"),
+	Teal:      c("#8ec07c"),
+	Peach:     c("#fe8019"),
+	Lavender:  c("#d3869b"),
+	Pink:      c("#d3869b"),
+	Sky:       c("#83a598"),
 }
 
 var themes = []Theme{CatppuccinMocha, Nord, Cyberpunk, Gruvbox}
@@ -96,9 +111,9 @@ type StyleBundle struct {
 	LeftPane  lipgloss.Style
 	RightPane lipgloss.Style
 
-	StatusBar    lipgloss.Style
-	Input        lipgloss.Style
-	FocusStyle   lipgloss.Style
+	StatusBar lipgloss.Style
+	Input     lipgloss.Style
+	FocusStyle lipgloss.Style
 
 	Tab       lipgloss.Style
 	ActiveTab lipgloss.Style
@@ -129,6 +144,18 @@ type StyleBundle struct {
 	SettingsValue  lipgloss.Style
 	SettingsKey    lipgloss.Style
 	ActionButton   lipgloss.Style
+
+	Divider     lipgloss.Style
+	Badge       lipgloss.Style
+	BadgeActive  lipgloss.Style
+	Card        lipgloss.Style
+	StatValue   lipgloss.Style
+	StatLabel   lipgloss.Style
+	BarFilled   lipgloss.Style
+	BarPartial  lipgloss.Style
+	BarEmpty    lipgloss.Style
+	SectionHead lipgloss.Style
+	KeyLine     lipgloss.Style
 }
 
 func NewStyleBundle(t Theme) StyleBundle {
@@ -146,9 +173,8 @@ func NewStyleBundle(t Theme) StyleBundle {
 	mauve := t.Mauve
 	teal := t.Teal
 	peach := t.Peach
-
 	dot := func(c lipgloss.TerminalColor) string {
-		return lipgloss.NewStyle().Foreground(c).Render("●")
+		return lipgloss.NewStyle().Foreground(c).Bold(true).Render("\u25CF")
 	}
 
 	return StyleBundle{
@@ -166,7 +192,7 @@ func NewStyleBundle(t Theme) StyleBundle {
 
 		StatusBar: lipgloss.NewStyle().
 			Foreground(text).
-			Background(mantle).
+			Background(surface1).
 			Padding(0, 1).
 			Align(lipgloss.Left),
 
@@ -182,21 +208,21 @@ func NewStyleBundle(t Theme) StyleBundle {
 			Bold(true),
 
 		Tab: lipgloss.NewStyle().
-			Padding(0, 2).
+			Padding(0, 1).
 			Foreground(overlay),
 
 		ActiveTab: lipgloss.NewStyle().
-			Padding(0, 2).
+			Padding(0, 1).
 			Foreground(text).
 			Background(blue).
 			Bold(true),
 
 		RoomTab: lipgloss.NewStyle().
-			Padding(0, 2).
+			Padding(0, 1).
 			Foreground(overlay),
 
 		ActiveRoomTab: lipgloss.NewStyle().
-			Padding(0, 2).
+			Padding(0, 1).
 			Foreground(text).
 			Background(blue).
 			Bold(true),
@@ -223,8 +249,7 @@ func NewStyleBundle(t Theme) StyleBundle {
 		SettingsHeader: lipgloss.NewStyle().
 			Foreground(peach).
 			Bold(true).
-			Padding(0, 1).
-			MarginTop(1),
+			Padding(0, 1),
 		SettingsValue: lipgloss.NewStyle().Foreground(text).Padding(0, 1),
 		SettingsKey:   lipgloss.NewStyle().Foreground(sub).Padding(0, 1),
 		ActionButton: lipgloss.NewStyle().
@@ -232,5 +257,47 @@ func NewStyleBundle(t Theme) StyleBundle {
 			Background(blue).
 			Bold(true).
 			Padding(0, 2),
+
+		Divider: lipgloss.NewStyle().Foreground(overlay),
+
+		Badge: lipgloss.NewStyle().
+			Foreground(text).
+			Background(surface0).
+			Padding(0, 1),
+
+		BadgeActive: lipgloss.NewStyle().
+			Foreground(base).
+			Background(mauve).
+			Padding(0, 1).
+			Bold(true),
+
+		Card: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(surface1).
+			Background(surface0).
+			Padding(0, 1),
+
+		StatValue: lipgloss.NewStyle().
+			Foreground(text).
+			Bold(true),
+
+		StatLabel: lipgloss.NewStyle().
+			Foreground(sub),
+
+		BarFilled: lipgloss.NewStyle().
+			Foreground(green),
+
+		BarPartial: lipgloss.NewStyle().
+			Foreground(yellow),
+
+		BarEmpty: lipgloss.NewStyle().
+			Foreground(surface1),
+
+		SectionHead: lipgloss.NewStyle().
+			Foreground(peach).
+			Bold(true),
+
+		KeyLine: lipgloss.NewStyle().
+			Foreground(surface1),
 	}
 }

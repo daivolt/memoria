@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const chitchatBase = "http://localhost:19999"
+var chitchatBase = getEnv("CHITCHAT_URL", "http://100.121.245.69:19999")
 
 type ChatMessage struct {
 	TS     string `json:"ts"`
