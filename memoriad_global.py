@@ -14,8 +14,10 @@ import subprocess
 import sys
 import time
 import tempfile
+import urllib.parse
 import urllib.request
 import uuid
+from collections import Counter
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -39,6 +41,11 @@ MEMORY_LIMIT = 5000
 POLL_INTERVAL = 30
 AGENT_STALE_SEC = 300
 CHITCHAT_URL = "http://localhost:19999"
+CHITCHAT_POLL_INTERVAL = 3
+CHITCHAT_CONSOLIDATE_THRESHOLD = 20
+CHITCHAT_DIR = WORKDIR / "chitchat"
+CHITCHAT_RETENTION_DAYS = 30
+CHITCHAT_ROOMS = [r.strip() for r in os.environ.get("CHITCHAT_ROOMS", "general").split(",")]
 
 # ── Shared modules for session extraction ────────────────────
 
@@ -132,6 +139,7 @@ def _init_index():
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     SAFETY_DIR.mkdir(parents=True, exist_ok=True)
+    CHITCHAT_DIR.mkdir(parents=True, exist_ok=True)
     path = WORKDIR / "index.db"
     db = sqlite3.connect(str(path))
     db.execute("PRAGMA journal_mode=WAL")
@@ -139,6 +147,10 @@ def _init_index():
     db.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts "
         "USING fts5(id UNINDEXED, title, summary, tokenize='porter unicode61')"
+    )
+    db.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chat_fts "
+        "USING fts5(id UNINDEXED, room, from_name, text, tokenize='porter unicode61')"
     )
     db.close()
 
@@ -207,6 +219,11 @@ def _write_memory(project: str, entries: list[str]):
 
 _last_id: str | None = None
 
+# ── Chitchat state ────────────────────────────────────────────
+
+_chitchat_cursors: dict[str, str] = {}
+_chitchat_unconsolidated: int = 0
+
 
 def poll_sessions():
     global _last_id
@@ -238,24 +255,182 @@ def poll_sessions():
         (WORKDIR / "last_id.txt").write_text(_last_id)
 
 
+# ── Chitchat poller & storage ────────────────────────────────
+
+
+def _chitchat_rooms() -> list[dict]:
+    try:
+        req = urllib.request.Request(f"{CHITCHAT_URL}/rooms")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read()).get("rooms", [])
+    except Exception:
+        return []
+
+
+def _chitchat_history(room: str) -> list[dict]:
+    try:
+        req = urllib.request.Request(f"{CHITCHAT_URL}/{urllib.parse.quote(room)}/history")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read()).get("messages", [])
+    except Exception:
+        return []
+
+
+def _index_chat_message(rec: dict):
+    path = WORKDIR / "index.db"
+    try:
+        db = sqlite3.connect(str(path))
+        db.execute(
+            "INSERT OR IGNORE INTO chat_fts(id, room, from_name, text) VALUES (?, ?, ?, ?)",
+            (rec["id"], rec["room"], rec["from"], rec["text"][:500]),
+        )
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+
+
+def _store_message(msg: dict, room: str):
+    record = {
+        "id": msg.get("ts", ""),
+        "from": msg.get("from", ""),
+        "text": msg.get("text", ""),
+        "topic": msg.get("topic", ""),
+        "room": room,
+        "ts": msg.get("ts", ""),
+        "type": msg.get("type", "message"),
+        "ingested_at": time.time(),
+    }
+    room_dir = CHITCHAT_DIR / room
+    room_dir.mkdir(parents=True, exist_ok=True)
+    path = room_dir / "inbox.jsonl"
+    with open(path, "a") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _index_chat_message(record)
+
+
+def poll_chitchat():
+    global _chitchat_unconsolidated
+    global _chitchat_cursors
+    rooms = _chitchat_rooms()
+    if not rooms:
+        return
+    for r in rooms:
+        name = r["name"]
+        if name not in CHITCHAT_ROOMS:
+            continue
+        history = _chitchat_history(name)
+        cursor = _chitchat_cursors.get(name, "")
+        new_count = 0
+        for msg in history:
+            ts = msg.get("ts", "")
+            if ts <= cursor:
+                continue
+            if msg.get("type") not in ("message",):
+                continue
+            _store_message(msg, name)
+            _chitchat_cursors[name] = ts
+            new_count += 1
+        _chitchat_unconsolidated += new_count
+
+
+def _consolidate_chitchat():
+    global _chitchat_unconsolidated
+    if _chitchat_unconsolidated < CHITCHAT_CONSOLIDATE_THRESHOLD:
+        return
+
+    all_messages: list[dict] = []
+    if not CHITCHAT_DIR.exists():
+        return
+    for room_dir in sorted(CHITCHAT_DIR.iterdir()):
+        if not room_dir.is_dir():
+            continue
+        path = room_dir / "inbox.jsonl"
+        if not path.exists():
+            continue
+        cutoff = time.time() - (CHITCHAT_RETENTION_DAYS * 86400)
+        lines = path.read_text().strip().splitlines()
+        for line in lines:
+            try:
+                msg = json.loads(line)
+                if msg.get("ingested_at", 0) >= cutoff:
+                    all_messages.append(msg)
+            except json.JSONDecodeError:
+                continue
+
+    if not all_messages:
+        _chitchat_unconsolidated = 0
+        return
+
+    # Deterministic pattern extraction (0 tokens)
+    keyword_counts: Counter = Counter()
+    room_counts: Counter = Counter()
+    from_counts: Counter = Counter()
+
+    for msg in all_messages:
+        text = msg.get("text", "")
+        room_counts[msg.get("room", "?")] += 1
+        from_counts[msg.get("from", "?")] += 1
+        words = [w.lower() for w in text.split() if len(w) >= 4]
+        keyword_counts.update(words)
+
+    top_keywords = [w for w, c in keyword_counts.most_common(10) if c >= 3]
+    if not top_keywords:
+        _chitchat_unconsolidated = 0
+        return
+
+    suggested_topic = top_keywords[0]
+
+    summary_parts = []
+    summary_parts.append(f"Pattern across {len(room_counts)} room(s): {', '.join(sorted(room_counts))}")
+    summary_parts.append(f"Participants: {', '.join(sorted(from_counts))}")
+    summary_parts.append(f"Keywords: {', '.join(top_keywords)}")
+    summary = " | ".join(summary_parts)
+
+    proposal_text = (
+        f"[chitchat consolidation] {summary[:400]}\n"
+        f"Messages sampled: {len(all_messages)}"
+    )
+    path = WORKDIR / "proposals.jsonl"
+    record = {
+        "id": f"chat_consolidate_{int(time.time())}",
+        "text": proposal_text,
+        "topic": suggested_topic[:50],
+        "proposed_at": time.time(),
+        "source": "chitchat_consolidation",
+    }
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+    _notify_chitchat(
+        f"[memoria] pattern '{suggested_topic}' from chat "
+        f"({len(all_messages)} msgs, {len(room_counts)} rooms) → proposed"
+    )
+
+    _chitchat_unconsolidated = 0
+
+
 # ── FastAPI app ──────────────────────────────────────────────
 
 
 _poll_task: asyncio.Task | None = None
+_chitchat_poll_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_index()
-    global _poll_task
+    global _poll_task, _chitchat_poll_task
     _poll_task = asyncio.create_task(_poll_loop())
+    _chitchat_poll_task = asyncio.create_task(_chitchat_poll_loop())
     yield
-    if _poll_task:
-        _poll_task.cancel()
-        try:
-            await _poll_task
-        except asyncio.CancelledError:
-            pass
+    for t in (_poll_task, _chitchat_poll_task):
+        if t:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 async def _poll_loop():
@@ -265,6 +440,17 @@ async def _poll_loop():
         except Exception:
             pass
         await asyncio.sleep(POLL_INTERVAL)
+
+
+async def _chitchat_poll_loop():
+    await asyncio.sleep(5)  # stagger startup
+    while True:
+        try:
+            poll_chitchat()
+            _consolidate_chitchat()
+        except Exception:
+            pass
+        await asyncio.sleep(CHITCHAT_POLL_INTERVAL)
 
 
 app = FastAPI(title="memoria", version="2.0.0", lifespan=lifespan)
@@ -286,10 +472,12 @@ async def health():
         if topics_dir.exists()
         else []
     )
+    chitchat_rooms_list = sorted(d.name for d in CHITCHAT_DIR.iterdir() if d.is_dir()) if CHITCHAT_DIR.exists() else []
     return {
         "ok": True,
         "sessions_indexed": count,
         "topics": topics,
+        "chitchat_rooms": chitchat_rooms_list,
         "db_exists": OPENCODE_DB.exists(),
         "memoria_version": "2.0.0",
     }
@@ -299,31 +487,57 @@ async def health():
 
 
 @app.get("/recall")
-async def recall(q: str = Query(...), limit: int = 5, project: Optional[str] = None):
+async def recall(
+    q: str = Query(...),
+    limit: int = 5,
+    project: Optional[str] = None,
+    source: Optional[str] = None,
+):
     path = WORKDIR / "index.db"
     if not path.exists():
         raise HTTPException(404, "no index — wait for session extraction")
     db = sqlite3.connect(str(path))
     qs = " OR ".join(q.split())
-    try:
-        rows = db.execute(
-            "SELECT id, title, summary, rank FROM sessions_fts "
-            "WHERE sessions_fts MATCH ? ORDER BY rank LIMIT ?",
-            (qs, limit),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        db.close()
-        return {"results": []}
+    results = []
+
+    if source in (None, "sessions"):
+        try:
+            rows = db.execute(
+                "SELECT id, title, summary, rank FROM sessions_fts "
+                "WHERE sessions_fts MATCH ? ORDER BY rank LIMIT ?",
+                (qs, limit),
+            ).fetchall()
+            for r in rows:
+                results.append({
+                    "id": r[0],
+                    "title": r[1],
+                    "summary": (r[2] or "")[:300],
+                    "source": "session",
+                })
+        except sqlite3.OperationalError:
+            pass
+
+    if source in (None, "chats"):
+        try:
+            rows = db.execute(
+                "SELECT id, room, from_name, text, rank FROM chat_fts "
+                "WHERE chat_fts MATCH ? ORDER BY rank LIMIT ?",
+                (qs, limit),
+            ).fetchall()
+            for r in rows:
+                results.append({
+                    "id": r[0],
+                    "title": f"[{r[1]}] {r[2]}",
+                    "summary": (r[3] or "")[:300],
+                    "source": "chat",
+                    "room": r[1],
+                    "from": r[2],
+                })
+        except sqlite3.OperationalError:
+            pass
+
     db.close()
-    results = [
-        {
-            "id": r[0],
-            "title": r[1],
-            "summary": (r[2] or "")[:300],
-        }
-        for r in rows
-    ]
-    return {"query": q, "count": len(results), "results": results}
+    return {"query": q, "count": len(results), "results": results[:limit]}
 
 
 @app.get("/review")
@@ -1058,6 +1272,42 @@ async def rollback_snapshot(project: str, body: RollbackRequest):
         "snapshot_id": target["id"],
         "message": target.get("message", ""),
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Chitchat Endpoints
+# ═══════════════════════════════════════════════════════════════
+
+
+@app.get("/chitchat/rooms")
+async def chitchat_rooms():
+    if not CHITCHAT_DIR.exists():
+        return {"rooms": []}
+    rooms = []
+    for d in sorted(CHITCHAT_DIR.iterdir()):
+        if d.is_dir():
+            path = d / "inbox.jsonl"
+            count = sum(1 for _ in path.open()) if path.exists() else 0
+            rooms.append({"room": d.name, "messages": count})
+    return {"rooms": rooms, "count": len(rooms)}
+
+
+@app.get("/chitchat/{room}")
+async def chitchat_history(room: str, limit: int = 20):
+    path = CHITCHAT_DIR / room / "inbox.jsonl"
+    if not path.exists():
+        raise HTTPException(404, f"no messages for room '{room}'")
+    lines = path.read_text().strip().splitlines()
+    messages = [json.loads(l) for l in lines[-limit:] if l.strip()]
+    return {"room": room, "messages": messages, "count": len(messages)}
+
+
+@app.post("/chitchat/consolidate")
+async def trigger_consolidation():
+    global _chitchat_unconsolidated
+    _chitchat_unconsolidated = CHITCHAT_CONSOLIDATE_THRESHOLD
+    _consolidate_chitchat()
+    return {"ok": True}
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -27,6 +27,11 @@ Orchestration:
   memoria agents [project]          List active agents
   memoria snap <project> [msg]      Create git snapshot
   memoria rollback <project> [id]   Rollback to snapshot
+
+Chitchat (episodic chat memory):
+  memoria chitchat rooms               List tracked chat rooms
+  memoria chitchat history <room>      Show recent chat messages
+  memoria chitchat consolidate         Trigger hippocampal replay → topics
 """
 
 import json
@@ -268,6 +273,41 @@ def cmd_reject(pid: str):
     print(f"rejected {pid}")
 
 
+def cmd_chitchat_history(room: str, limit: int = 20):
+    r = _req("GET", f"/chitchat/{urllib.parse.quote(room)}?limit={limit}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    msgs = r.get("messages", [])
+    if not msgs:
+        print(f"No messages in room '{room}'")
+        return
+    for m in msgs:
+        ts = m.get("ts", "")[:19] if m.get("ts") else "?"
+        print(f"  [{ts}] {m.get('from', '?')}: {m.get('text', '')[:200]}")
+
+
+def cmd_chitchat_rooms():
+    r = _req("GET", "/chitchat/rooms")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    rooms = r.get("rooms", [])
+    if not rooms:
+        print("No chitchat rooms tracked yet")
+        return
+    for rm in rooms:
+        print(f"  {rm['room']} — {rm['messages']} messages")
+
+
+def cmd_chitchat_consolidate():
+    r = _req("POST", "/chitchat/consolidate")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print("Consolidation triggered (chat replay → topics proposals)")
+
+
 def cmd_task(project: str, title: str, description: str = ""):
     r = _req(
         "POST",
@@ -467,6 +507,23 @@ def main():
             print("usage: memoria rollback <project> [snapshot-id]", file=sys.stderr)
             sys.exit(1)
         cmd_rollback(args[1], args[2] if len(args) > 2 else None)
+    elif cmd == "chitchat":
+        if len(args) < 2:
+            print("usage: memoria chitchat <history|rooms|consolidate> [...]", file=sys.stderr)
+            sys.exit(1)
+        sub = args[1]
+        if sub == "history":
+            if len(args) < 3:
+                print("usage: memoria chitchat history <room> [limit]", file=sys.stderr)
+                sys.exit(1)
+            cmd_chitchat_history(args[2], int(args[3]) if len(args) > 3 else 20)
+        elif sub == "rooms":
+            cmd_chitchat_rooms()
+        elif sub == "consolidate":
+            cmd_chitchat_consolidate()
+        else:
+            print(f"unknown chitchat subcommand: {sub}", file=sys.stderr)
+            sys.exit(1)
     else:
         print(f"unknown: {cmd}", file=sys.stderr)
         sys.exit(1)
