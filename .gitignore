@@ -1,0 +1,4 @@
+.index.db
+*.pyc
+__pycache__/
+/var/tmp/
