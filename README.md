@@ -120,6 +120,37 @@ Pure stdlib, deterministic, zero LLM cost.
 Real-time task info per project. PID-based staleness (5min).
 File claims prevent concurrent edits.
 
+### `tui/` — Charm TUI (Go)
+
+Terminal UI built with [Charm](https://charm.land/libs/) (Bubble Tea + Lip Gloss + Bubbles).
+
+**Layout:** Two panes — chat on the left, dashboard on the right.
+
+| Pane | Content |
+|------|---------|
+| **Chat** (left) | Room tabs, message viewport, text input. Connects to chitchat (port 19999). |
+| **Dashboard** (right) | Tabs: Agents, Tasks, Memory, Recall. Connects to memoria (port 19998). |
+
+**Controls:**
+
+| Key | Action |
+|-----|--------|
+| `←` `→` | Switch chat rooms |
+| `h` `l` | Switch dashboard tabs |
+| `1`-`4` | Jump to dashboard tab |
+| `tab` | Toggle chat input focus |
+| `r` | Focus recall search (on Recall tab) |
+| `enter` | Send message / submit search / load memory |
+| `q` / `ctrl+c` | Quit |
+
+```bash
+# Build
+cd tui && go build -o tui .
+
+# Run
+./tui/tui
+```
+
 ## Configuration
 
 | Env Var | Default | Purpose |
