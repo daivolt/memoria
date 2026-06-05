@@ -46,6 +46,7 @@ CHITCHAT_CONSOLIDATE_THRESHOLD = 20
 CHITCHAT_DIR = WORKDIR / "chitchat"
 CHITCHAT_RETENTION_DAYS = 30
 CHITCHAT_ROOMS = [r.strip() for r in os.environ.get("CHITCHAT_ROOMS", "general").split(",")]
+SLEEP_CYCLE_HOURS = int(os.environ.get("SLEEP_CYCLE_HOURS", "6"))
 
 # ── Shared modules for session extraction ────────────────────
 
@@ -334,6 +335,76 @@ def poll_chitchat():
         _chitchat_unconsolidated += new_count
 
 
+def _load_existing_topic_names() -> list[str]:
+    topics_dir = WORKDIR / "topics"
+    if not topics_dir.exists():
+        return []
+    return sorted(f.stem for f in topics_dir.iterdir() if f.suffix == ".md")
+
+
+def _load_topic_facts(name: str) -> list[str]:
+    path = WORKDIR / "topics" / f"{name}.md"
+    if not path.exists():
+        return []
+    return [e.strip() for e in path.read_text().split("§") if e.strip()]
+
+
+def _find_matching_topic(keywords: list[str], existing_topics: list[str]) -> str | None:
+    kw_set = set(keywords)
+    for topic in existing_topics:
+        t_lower = topic.lower()
+        t_words = set(t_lower.split())
+        overlap = kw_set & t_words
+        if overlap:
+            return topic
+    return None
+
+
+def _prune_chitchat():
+    for room_dir in sorted(CHITCHAT_DIR.iterdir()):
+        if not room_dir.is_dir():
+            continue
+        path = room_dir / "inbox.jsonl"
+        if not path.exists():
+            continue
+        cutoff = time.time() - (CHITCHAT_RETENTION_DAYS * 86400)
+        lines = path.read_text().strip().splitlines()
+        kept: list[str] = []
+        for line in lines:
+            try:
+                msg = json.loads(line)
+                if msg.get("ingested_at", 0) >= cutoff:
+                    kept.append(line)
+            except json.JSONDecodeError:
+                continue
+        if len(kept) < len(lines):
+            path.write_text("\n".join(kept) + "\n" if kept else "")
+    # Re-index FTS5 from pruned JSONL
+    path = WORKDIR / "index.db"
+    try:
+        db = sqlite3.connect(str(path))
+        db.execute("DELETE FROM chat_fts")
+        for room_dir in sorted(CHITCHAT_DIR.iterdir()):
+            if not room_dir.is_dir():
+                continue
+            jpath = room_dir / "inbox.jsonl"
+            if not jpath.exists():
+                continue
+            for line in jpath.read_text().strip().splitlines():
+                try:
+                    msg = json.loads(line)
+                    db.execute(
+                        "INSERT INTO chat_fts(id, room, from_name, text) VALUES (?, ?, ?, ?)",
+                        (msg.get("id", ""), msg.get("room", ""), msg.get("from", ""), msg.get("text", "")[:500]),
+                    )
+                except Exception:
+                    pass
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+
+
 def _consolidate_chitchat():
     global _chitchat_unconsolidated
     if _chitchat_unconsolidated < CHITCHAT_CONSOLIDATE_THRESHOLD:
@@ -362,7 +433,6 @@ def _consolidate_chitchat():
         _chitchat_unconsolidated = 0
         return
 
-    # Deterministic pattern extraction (0 tokens)
     keyword_counts: Counter = Counter()
     room_counts: Counter = Counter()
     from_counts: Counter = Counter()
@@ -391,23 +461,84 @@ def _consolidate_chitchat():
         f"[chitchat consolidation] {summary[:400]}\n"
         f"Messages sampled: {len(all_messages)}"
     )
-    path = WORKDIR / "proposals.jsonl"
-    record = {
-        "id": f"chat_consolidate_{int(time.time())}",
-        "text": proposal_text,
-        "topic": suggested_topic[:50],
-        "proposed_at": time.time(),
-        "source": "chitchat_consolidation",
-    }
-    with open(path, "a") as f:
-        f.write(json.dumps(record) + "\n")
 
-    _notify_chitchat(
-        f"[memoria] pattern '{suggested_topic}' from chat "
-        f"({len(all_messages)} msgs, {len(room_counts)} rooms) → proposed"
-    )
+    # Interleaved replay: check existing topics before proposing
+    existing_topics = _load_existing_topic_names()
+    match = _find_matching_topic(top_keywords, existing_topics)
+    if match:
+        # Append to existing topic directly (not via proposal — already vetted)
+        existing_facts = _load_topic_facts(match)
+        if proposal_text not in existing_facts:
+            existing_facts.append(proposal_text)
+            content = "\n§\n".join(existing_facts) + "\n"
+            (WORKDIR / "topics" / f"{match}.md").write_text(content)
+            _notify_chitchat(
+                f"[memoria] pattern '{suggested_topic}' appended to existing topic '{match}'"
+                f" ({len(all_messages)} msgs)"
+            )
+    else:
+        path = WORKDIR / "proposals.jsonl"
+        record = {
+            "id": f"chat_consolidate_{int(time.time())}",
+            "text": proposal_text,
+            "topic": suggested_topic[:50],
+            "proposed_at": time.time(),
+            "source": "chitchat_consolidation",
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        _notify_chitchat(
+            f"[memoria] pattern '{suggested_topic}' from chat "
+            f"({len(all_messages)} msgs, {len(room_counts)} rooms) → proposed"
+        )
+
+    # Prune old messages after consolidation
+    _prune_chitchat()
 
     _chitchat_unconsolidated = 0
+
+
+def _deep_consolidate():
+    """Cross-layer consolidation: sessions → topics + chat → topics."""
+    # 1. Force chitchat consolidation
+    global _chitchat_unconsolidated
+    old = _chitchat_unconsolidated
+    _chitchat_unconsolidated = CHITCHAT_CONSOLIDATE_THRESHOLD
+    _consolidate_chitchat()
+
+    # 2. Pull recent sessions and check if any new topic patterns emerge
+    path = WORKDIR / "sessions.jsonl"
+    if path.exists():
+        lines = path.read_text().strip().splitlines()
+        recent = lines[-5:]
+        session_keywords: Counter = Counter()
+        for line in recent:
+            try:
+                s = json.loads(line)
+                title = s.get("title", "")
+                task = s.get("task", "")
+                txt = f"{title} {task}"
+                words = [w.lower() for w in txt.split() if len(w) >= 4]
+                session_keywords.update(words)
+            except json.JSONDecodeError:
+                continue
+        top = [w for w, c in session_keywords.most_common(5) if c >= 2]
+        if top:
+            existing = _load_existing_topic_names()
+            if not _find_matching_topic(top, existing):
+                prop_text = f"[deep consolidation] Recent session keywords: {', '.join(top)}"
+                prop_path = WORKDIR / "proposals.jsonl"
+                record = {
+                    "id": f"deep_consolidate_{int(time.time())}",
+                    "text": prop_text,
+                    "topic": top[0][:50],
+                    "proposed_at": time.time(),
+                    "source": "deep_consolidation",
+                }
+                with open(prop_path, "a") as f:
+                    f.write(json.dumps(record) + "\n")
+
+    _chitchat_unconsolidated = old
 
 
 # ── FastAPI app ──────────────────────────────────────────────
@@ -415,16 +546,18 @@ def _consolidate_chitchat():
 
 _poll_task: asyncio.Task | None = None
 _chitchat_poll_task: asyncio.Task | None = None
+_sleep_cycle_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_index()
-    global _poll_task, _chitchat_poll_task
+    global _poll_task, _chitchat_poll_task, _sleep_cycle_task
     _poll_task = asyncio.create_task(_poll_loop())
     _chitchat_poll_task = asyncio.create_task(_chitchat_poll_loop())
+    _sleep_cycle_task = asyncio.create_task(_sleep_cycle_loop())
     yield
-    for t in (_poll_task, _chitchat_poll_task):
+    for t in (_poll_task, _chitchat_poll_task, _sleep_cycle_task):
         if t:
             t.cancel()
             try:
@@ -443,7 +576,7 @@ async def _poll_loop():
 
 
 async def _chitchat_poll_loop():
-    await asyncio.sleep(5)  # stagger startup
+    await asyncio.sleep(5)
     while True:
         try:
             poll_chitchat()
@@ -451,6 +584,16 @@ async def _chitchat_poll_loop():
         except Exception:
             pass
         await asyncio.sleep(CHITCHAT_POLL_INTERVAL)
+
+
+async def _sleep_cycle_loop():
+    await asyncio.sleep(300)
+    while True:
+        try:
+            _deep_consolidate()
+        except Exception:
+            pass
+        await asyncio.sleep(SLEEP_CYCLE_HOURS * 3600)
 
 
 app = FastAPI(title="memoria", version="2.0.0", lifespan=lifespan)
@@ -480,6 +623,7 @@ async def health():
         "chitchat_rooms": chitchat_rooms_list,
         "db_exists": OPENCODE_DB.exists(),
         "memoria_version": "2.0.0",
+        "sleep_cycle_hours": SLEEP_CYCLE_HOURS,
     }
 
 
