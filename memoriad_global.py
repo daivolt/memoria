@@ -17,7 +17,8 @@ import tempfile
 import urllib.parse
 import urllib.request
 import uuid
-from collections import Counter
+from collections import Counter, deque
+import difflib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -44,10 +45,11 @@ CHITCHAT_URL = "http://localhost:19999"
 CHITCHAT_POLL_INTERVAL = 3
 CHITCHAT_CONSOLIDATE_THRESHOLD = 20
 CHITCHAT_DIR = WORKDIR / "chitchat"
-CHITCHAT_RETENTION_DAYS = 30
+CHITCHAT_MAX_MESSAGES = 10000          # per-room slot limit (hippocampal capacity)
 CHITCHAT_ROOMS = [r.strip() for r in os.environ.get("CHITCHAT_ROOMS", "general").split(",")]
 SLEEP_CYCLE_HOURS = int(os.environ.get("SLEEP_CYCLE_HOURS", "6"))
-SESSION_RETENTION_DAYS = int(os.environ.get("SESSION_RETENTION_DAYS", "90"))
+SESSION_MAX_RECORDS = int(os.environ.get("SESSION_MAX_RECORDS", "5000"))  # total session slot limit
+AUTO_ACCEPT_THRESHOLD = int(os.environ.get("AUTO_ACCEPT_THRESHOLD", "3"))
 
 # ── Shared modules for session extraction ────────────────────
 
@@ -225,6 +227,8 @@ _last_id: str | None = None
 
 _chitchat_cursors: dict[str, str] = {}
 _chitchat_unconsolidated: int = 0
+_chitchat_consolidated_through: dict[str, float] = {}  # newest ingested_at processed per room
+_recent_chat_texts: dict[str, deque[str]] = {}  # per-room sliding window for dedup
 
 
 def poll_sessions():
@@ -278,13 +282,29 @@ def _chitchat_history(room: str) -> list[dict]:
         return []
 
 
+def _normalize_text(text: str) -> str:
+    text = text.lower()
+    text = "".join(c for c in text if c.isalnum() or c.isspace())
+    return " ".join(text.split())
+
+
 def _index_chat_message(rec: dict):
+    room = rec.get("room", "?")
+    text = rec.get("text", "")[:500]
+    norm = _normalize_text(text)
+    if len(norm) >= 10:
+        window = _recent_chat_texts.setdefault(room, deque(maxlen=20))
+        for existing in window:
+            ratio = difflib.SequenceMatcher(None, norm, existing).ratio()
+            if ratio > 0.85:
+                return  # pattern separation: skip near-duplicate
+        window.append(norm)
     path = WORKDIR / "index.db"
     try:
         db = sqlite3.connect(str(path))
         db.execute(
             "INSERT OR IGNORE INTO chat_fts(id, room, from_name, text) VALUES (?, ?, ?, ?)",
-            (rec["id"], rec["room"], rec["from"], rec["text"][:500]),
+            (rec["id"], room, rec.get("from", ""), text),
         )
         db.commit()
         db.close()
@@ -362,71 +382,84 @@ def _find_matching_topic(keywords: list[str], existing_topics: list[str]) -> str
 
 
 def _prune_chitchat():
+    all_pruned_ids: list[str] = []
     for room_dir in sorted(CHITCHAT_DIR.iterdir()):
         if not room_dir.is_dir():
             continue
         path = room_dir / "inbox.jsonl"
         if not path.exists():
             continue
-        cutoff = time.time() - (CHITCHAT_RETENTION_DAYS * 86400)
         lines = path.read_text().strip().splitlines()
-        kept: list[str] = []
+        if len(lines) <= CHITCHAT_MAX_MESSAGES:
+            continue
+        consolidated_through = _chitchat_consolidated_through.get(room_dir.name, 0)
+        unconsolidated: list[str] = []
+        consolidated: list[tuple[float, str]] = []
+        pruned_ids: list[str] = []
         for line in lines:
             try:
                 msg = json.loads(line)
-                if msg.get("ingested_at", 0) >= cutoff:
-                    kept.append(line)
+                ingested = msg.get("ingested_at", 0)
+                if ingested > consolidated_through:
+                    unconsolidated.append(line)
+                else:
+                    consolidated.append((ingested, line))
             except json.JSONDecodeError:
-                continue
+                unconsolidated.append(line)
+        consolidated.sort(key=lambda x: x[0])  # oldest first
+        slot_remaining = CHITCHAT_MAX_MESSAGES - len(unconsolidated)
+        if slot_remaining < 0:
+            unconsolidated = unconsolidated[-(CHITCHAT_MAX_MESSAGES // 2):]
+            slot_remaining = CHITCHAT_MAX_MESSAGES - len(unconsolidated)
+        kept_consolidated = consolidated[-slot_remaining:] if slot_remaining > 0 else []
+        kept = unconsolidated + [line for _, line in kept_consolidated]
         if len(kept) < len(lines):
-            path.write_text("\n".join(kept) + "\n" if kept else "")
-    # Re-index FTS5 from pruned JSONL
-    path = WORKDIR / "index.db"
-    try:
-        db = sqlite3.connect(str(path))
-        db.execute("DELETE FROM chat_fts")
-        for room_dir in sorted(CHITCHAT_DIR.iterdir()):
-            if not room_dir.is_dir():
-                continue
-            jpath = room_dir / "inbox.jsonl"
-            if not jpath.exists():
-                continue
-            for line in jpath.read_text().strip().splitlines():
+            pruned = consolidated[:max(0, len(consolidated) - slot_remaining)]
+            for _, line in pruned:
                 try:
-                    msg = json.loads(line)
-                    db.execute(
-                        "INSERT INTO chat_fts(id, room, from_name, text) VALUES (?, ?, ?, ?)",
-                        (msg.get("id", ""), msg.get("room", ""), msg.get("from", ""), msg.get("text", "")[:500]),
-                    )
+                    pruned_ids.append(json.loads(line).get("id", ""))
+                except json.JSONDecodeError:
+                    pass
+            all_pruned_ids.extend(pruned_ids)
+            path.write_text("\n".join(kept) + "\n" if kept else "")
+    if all_pruned_ids:
+        try:
+            db = sqlite3.connect(str(WORKDIR / "index.db"))
+            for pid in all_pruned_ids:
+                try:
+                    db.execute("DELETE FROM chat_fts WHERE id = ?", (pid,))
                 except Exception:
                     pass
-        db.commit()
-        db.close()
-    except Exception:
-        pass
+            db.commit()
+            db.close()
+        except Exception:
+            pass
 
 
 def _consolidate_chitchat():
-    global _chitchat_unconsolidated
+    global _chitchat_unconsolidated, _chitchat_consolidated_through
     if _chitchat_unconsolidated < CHITCHAT_CONSOLIDATE_THRESHOLD:
         return
 
     all_messages: list[dict] = []
     if not CHITCHAT_DIR.exists():
         return
+    max_ingested_per_room: dict[str, float] = {}
     for room_dir in sorted(CHITCHAT_DIR.iterdir()):
         if not room_dir.is_dir():
             continue
         path = room_dir / "inbox.jsonl"
         if not path.exists():
             continue
-        cutoff = time.time() - (CHITCHAT_RETENTION_DAYS * 86400)
         lines = path.read_text().strip().splitlines()
         for line in lines:
             try:
                 msg = json.loads(line)
-                if msg.get("ingested_at", 0) >= cutoff:
-                    all_messages.append(msg)
+                all_messages.append(msg)
+                ingested = msg.get("ingested_at", 0)
+                room = msg.get("room", room_dir.name)
+                if ingested > max_ingested_per_room.get(room, 0):
+                    max_ingested_per_room[room] = ingested
             except json.JSONDecodeError:
                 continue
 
@@ -478,22 +511,47 @@ def _consolidate_chitchat():
                 f" ({len(all_messages)} msgs)"
             )
     else:
-        path = WORKDIR / "proposals.jsonl"
-        record = {
-            "id": f"chat_consolidate_{int(time.time())}",
-            "text": proposal_text,
-            "topic": suggested_topic[:50],
-            "proposed_at": time.time(),
-            "source": "chitchat_consolidation",
-        }
-        with open(path, "a") as f:
-            f.write(json.dumps(record) + "\n")
-        _notify_chitchat(
-            f"[memoria] pattern '{suggested_topic}' from chat "
-            f"({len(all_messages)} msgs, {len(room_counts)} rooms) → proposed"
-        )
+        # Auto-accept flow: check if same topic already proposed
+        existing_proposals = _load_proposals()
+        existing = next((p for p in existing_proposals if p.get("topic") == suggested_topic[:50]), None)
+        if existing:
+            existing["hits"] = existing.get("hits", 1) + 1
+            if existing["hits"] >= AUTO_ACCEPT_THRESHOLD:
+                _add_fact_to_topic(existing["topic"], existing["text"])
+                existing_proposals = [p for p in existing_proposals if p.get("id") != existing["id"]]
+                _save_proposals(existing_proposals)
+                _notify_chitchat(
+                    f"[memoria] pattern '{suggested_topic}' auto-accepted"
+                    f" (hits={existing['hits']}, msgs={len(all_messages)})"
+                )
+            else:
+                _save_proposals(existing_proposals)
+                _notify_chitchat(
+                    f"[memoria] pattern '{suggested_topic}' hit {existing['hits']}/{AUTO_ACCEPT_THRESHOLD}"
+                )
+        else:
+            path = WORKDIR / "proposals.jsonl"
+            record = {
+                "id": f"chat_consolidate_{int(time.time())}",
+                "text": proposal_text,
+                "topic": suggested_topic[:50],
+                "proposed_at": time.time(),
+                "source": "chitchat_consolidation",
+                "hits": 1,
+            }
+            with open(path, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            _notify_chitchat(
+                f"[memoria] pattern '{suggested_topic}' from chat "
+                f"({len(all_messages)} msgs, {len(room_counts)} rooms) → proposed"
+            )
 
-    # Prune old messages after consolidation
+    # Mark what's been consolidated
+    for room, ingested in max_ingested_per_room.items():
+        if ingested > _chitchat_consolidated_through.get(room, 0):
+            _chitchat_consolidated_through[room] = ingested
+
+    # Prune by slot limit (keeps unconsolidated messages)
     _prune_chitchat()
 
     _chitchat_unconsolidated = 0
@@ -503,31 +561,27 @@ def _prune_sessions():
     path = WORKDIR / "sessions.jsonl"
     if not path.exists():
         return
-    cutoff_ms = (time.time() - SESSION_RETENTION_DAYS * 86400) * 1000
     lines = path.read_text().strip().splitlines()
-    kept = []
+    if len(lines) <= SESSION_MAX_RECORDS:
+        return
+    kept = lines[-SESSION_MAX_RECORDS:]
     pruned_ids: list[str] = []
-    for line in lines:
+    for line in lines[:-SESSION_MAX_RECORDS]:
         try:
             s = json.loads(line)
-            ts = s.get("created", 0)
-            if ts >= cutoff_ms:
-                kept.append(line)
-            else:
-                pruned_ids.append(s.get("id", ""))
+            pruned_ids.append(s.get("id", ""))
         except json.JSONDecodeError:
-            kept.append(line)
-    if len(kept) < len(lines):
-        path.write_text("\n".join(kept) + "\n" if kept else "")
-        if pruned_ids:
-            try:
-                db = sqlite3.connect(str(WORKDIR / "index.db"))
-                for sid in pruned_ids:
-                    db.execute("DELETE FROM sessions_fts WHERE id = ?", (sid,))
-                db.commit()
-                db.close()
-            except Exception:
-                pass
+            pass
+    path.write_text("\n".join(kept) + "\n" if kept else "")
+    if pruned_ids:
+        try:
+            db = sqlite3.connect(str(WORKDIR / "index.db"))
+            for sid in pruned_ids:
+                db.execute("DELETE FROM sessions_fts WHERE id = ?", (sid,))
+            db.commit()
+            db.close()
+        except Exception:
+            pass
 
 
 def _deep_consolidate():
@@ -659,7 +713,8 @@ async def health():
         "db_exists": OPENCODE_DB.exists(),
         "memoria_version": "2.0.0",
         "sleep_cycle_hours": SLEEP_CYCLE_HOURS,
-        "session_retention_days": SESSION_RETENTION_DAYS,
+        "session_max_records": SESSION_MAX_RECORDS,
+        "chitchat_max_messages": CHITCHAT_MAX_MESSAGES,
     }
 
 
@@ -775,6 +830,28 @@ async def read_topic(name: str):
     return {"topic": name, "facts": entries}
 
 
+@app.get("/topics/search")
+async def topics_search(q: str = Query(...), limit: int = 3):
+    keywords = {w.lower() for w in q.split() if len(w) >= 4}
+    if not keywords:
+        return {"query": q, "count": 0, "topics": []}
+    scored: list[tuple[int, str, list[str]]] = []
+    topics_dir = WORKDIR / "topics"
+    if not topics_dir.exists():
+        return {"query": q, "count": 0, "topics": []}
+    for f in sorted(topics_dir.iterdir()):
+        if f.suffix != ".md":
+            continue
+        facts = [e.strip() for e in f.read_text().split("§") if e.strip()]
+        body = (f.stem + " " + " ".join(facts)).lower()
+        overlap = sum(1 for k in keywords if k in body)
+        if overlap:
+            scored.append((overlap, f.stem, facts[:3]))
+    scored.sort(key=lambda x: -x[0])
+    topics = [{"name": t, "facts": f} for _, t, f in scored[:limit]]
+    return {"query": q, "count": len(topics), "topics": topics}
+
+
 class AddTopicFact(BaseModel):
     text: str
 
@@ -802,6 +879,37 @@ async def add_topic_fact(name: str, body: AddTopicFact):
 
 
 # ── Proposals ───────────────────────────────────────────────
+
+
+def _load_proposals() -> list[dict]:
+    path = WORKDIR / "proposals.jsonl"
+    if not path.exists():
+        return []
+    lines = path.read_text().strip().splitlines()
+    result = []
+    for line in lines:
+        try:
+            result.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return result
+
+
+def _save_proposals(proposals: list[dict]):
+    path = WORKDIR / "proposals.jsonl"
+    content = "\n".join(json.dumps(p, ensure_ascii=False) for p in proposals)
+    path.write_text(content + "\n" if content else "")
+
+
+def _add_fact_to_topic(topic: str, text: str):
+    topics_dir = WORKDIR / "topics"
+    topics_dir.mkdir(parents=True, exist_ok=True)
+    tpath = topics_dir / f"{topic}.md"
+    entries = []
+    if tpath.exists():
+        entries = [e.strip() for e in tpath.read_text().split("§") if e.strip()]
+    entries.append(text)
+    tpath.write_text("\n§\n".join(entries) + "\n")
 
 
 class ProposeFact(BaseModel):
@@ -894,6 +1002,56 @@ async def reject_proposal(pid: str):
     with open(path, "w") as f:
         f.writelines(l + "\n" for l in kept)
     return {"ok": True, "rejected": pid}
+
+
+@app.delete("/proposals")
+async def clear_proposals(confirm: bool = False):
+    if not confirm:
+        raise HTTPException(400, "set ?confirm=true to clear all proposals")
+    path = WORKDIR / "proposals.jsonl"
+    if path.exists():
+        path.write_text("")
+    return {"ok": True}
+
+
+@app.delete("/topics/{name}")
+async def delete_topic(name: str):
+    path = WORKDIR / "topics" / f"{name}.md"
+    if not path.exists():
+        raise HTTPException(404, f"topic '{name}' not found")
+    path.unlink()
+    return {"ok": True, "deleted": name}
+
+
+class EditTopicFact(BaseModel):
+    index: int
+    text: str
+
+
+@app.put("/topics/{name}")
+async def edit_topic_fact(name: str, body: EditTopicFact):
+    path = WORKDIR / "topics" / f"{name}.md"
+    if not path.exists():
+        raise HTTPException(404, f"topic '{name}' not found")
+    entries = [e.strip() for e in path.read_text().split("§") if e.strip()]
+    if body.index < 1 or body.index > len(entries):
+        raise HTTPException(400, f"index {body.index} out of range (1-{len(entries)})")
+    entries[body.index - 1] = body.text
+    path.write_text("\n§\n".join(entries) + "\n")
+    return {"ok": True, "topic": name, "entries": len(entries)}
+
+
+@app.delete("/topics/{name}/{index}")
+async def delete_topic_fact(name: str, index: int):
+    path = WORKDIR / "topics" / f"{name}.md"
+    if not path.exists():
+        raise HTTPException(404, f"topic '{name}' not found")
+    entries = [e.strip() for e in path.read_text().split("§") if e.strip()]
+    if index < 1 or index > len(entries):
+        raise HTTPException(400, f"index {index} out of range (1-{len(entries)})")
+    removed = entries.pop(index - 1)
+    path.write_text("\n§\n".join(entries) + "\n" if entries else "")
+    return {"ok": True, "removed": removed, "entries": len(entries)}
 
 
 # ── Context ─────────────────────────────────────────────────

@@ -11,11 +11,15 @@ Memory:
   memoria learnings             Show accumulated project knowledge
   memoria compress              Compress tool outputs (stdin) via REST
   memoria status                Server health + project memory
-  memoria topics                List cross-project topics
-  memoria topic <name> [text]   Show topic facts or add one
-  memoria propose <topic> <txt> Propose cross-project fact
-  memoria proposals             List pending proposals
-  memoria accept <id>           Accept proposal
+   memoria topics                List cross-project topics
+   memoria topic <name> [text]   Show topic facts or add one
+   memoria topic delete <name>   Delete entire topic
+   memoria topic edit <n> <i> <t> Edit fact at index i
+   memoria topic remove <n> <i>  Remove fact at index i
+   memoria propose <topic> <txt> Propose cross-project fact
+   memoria proposals             List pending proposals
+   memoria proposals clear       Clear all pending proposals
+   memoria accept <id>           Accept proposal
   memoria reject <id>           Reject proposal
 
 Orchestration:
@@ -253,7 +257,8 @@ def cmd_proposals():
         return
     for p in props:
         ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(p.get("proposed_at", 0)))
-        print(f"  {p['id']}  [{p['topic']}]  {ts}")
+        hits = p.get("hits", 1)
+        print(f"  {p['id']}  [{p['topic']}]  hits={hits}  {ts}")
         print(f"    {p['text'][:200]}")
 
 
@@ -271,6 +276,38 @@ def cmd_reject(pid: str):
         print(r["error"], file=sys.stderr)
         sys.exit(1)
     print(f"rejected {pid}")
+
+
+def cmd_topic_delete(name: str):
+    r = _req("DELETE", f"/topics/{urllib.parse.quote(name)}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"topic '{name}' deleted")
+
+
+def cmd_topic_edit(name: str, index: int, text: str):
+    r = _req("PUT", f"/topics/{urllib.parse.quote(name)}", {"index": index, "text": text})
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"fact {index} updated in topic '{name}'")
+
+
+def cmd_topic_remove(name: str, index: int):
+    r = _req("DELETE", f"/topics/{urllib.parse.quote(name)}/{index}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"fact {index} removed from topic '{name}'")
+
+
+def cmd_proposals_clear():
+    r = _req("DELETE", "/proposals?confirm=true")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print("all proposals cleared")
 
 
 def cmd_chitchat_history(room: str, limit: int = 20):
@@ -455,14 +492,34 @@ def main():
         if len(args) < 2:
             print("usage: memoria topic <name> [text]", file=sys.stderr)
             sys.exit(1)
-        cmd_topic(args[1], " ".join(args[2:]) if len(args) > 2 else None)
+        sub = args[1]
+        if sub == "delete":
+            if len(args) < 3:
+                print("usage: memoria topic delete <name>", file=sys.stderr)
+                sys.exit(1)
+            cmd_topic_delete(args[2])
+        elif sub == "edit":
+            if len(args) < 5:
+                print("usage: memoria topic edit <name> <index> <text>", file=sys.stderr)
+                sys.exit(1)
+            cmd_topic_edit(args[2], int(args[3]), " ".join(args[4:]))
+        elif sub == "remove":
+            if len(args) < 4:
+                print("usage: memoria topic remove <name> <index>", file=sys.stderr)
+                sys.exit(1)
+            cmd_topic_remove(args[2], int(args[3]))
+        else:
+            cmd_topic(args[1], " ".join(args[2:]) if len(args) > 2 else None)
     elif cmd == "propose":
         if len(args) < 3:
             print("usage: memoria propose <topic> <text>", file=sys.stderr)
             sys.exit(1)
         cmd_propose(args[1], " ".join(args[2:]))
     elif cmd == "proposals":
-        cmd_proposals()
+        if len(args) > 1 and args[1] == "clear":
+            cmd_proposals_clear()
+        else:
+            cmd_proposals()
     elif cmd == "accept":
         if len(args) < 2:
             print("usage: memoria accept <id>", file=sys.stderr)

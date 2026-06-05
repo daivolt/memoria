@@ -162,6 +162,29 @@ export MEMORIA_SERVER=http://100.121.245.69:19998
 !memoria status
 ```
 
+### systemd Service
+
+Memoria runs as a systemd service for automatic startup:
+
+```bash
+# Service definition: /etc/systemd/system/memoria.service
+#   WorkingDirectory:  /home/daivolt/memoria
+#   ExecStart:         uvicorn memoriad_global:app --host 0.0.0.0 --port 19998
+#   User:              daivolt
+#   Restart:           always
+
+# Enable (auto-start on boot):
+sudo systemctl enable memoria
+
+# Start/stop/status:
+sudo systemctl start memoria
+sudo systemctl stop memoria
+sudo systemctl status memoria
+```
+
+Note: `PrivateTmp=true` and `ReadWritePaths=/var/tmp/memoria` are set for security.
+The service does NOT use `ProtectHome` or `ProtectSystem` to allow git snapshot/rollback operations on project directories.
+
 ## Migration from v1
 
 - v1 used per-project daemons (memoriad.py) that polled opencode.db individually
