@@ -83,13 +83,29 @@ func (m model) renderSettings() string {
 
 	s.WriteString(m.styles.SettingsHeader.Render("Actions"))
 	s.WriteString("\n")
-	btn := m.styles.ActionButton.Render
-	s.WriteString(fmt.Sprintf("  %s  c  Force Consolidate Now\n", btn(" RUN ")))
-	s.WriteString(fmt.Sprintf("  %s  p  Clear All Proposals\n", btn(" CLEAR ")))
-	s.WriteString(fmt.Sprintf("  %s  t  Next Theme\n", btn(" THEME ")))
+
+	type actionItem struct {
+		key string
+		label string
+		desc string
+	}
+	actions := []actionItem{
+		{"c", " RUN ", "Force Consolidate Now"},
+		{"p", " CLEAR ", "Clear All Proposals"},
+		{"t", " THEME ", "Next Theme"},
+	}
+	for i, a := range actions {
+		btnLabel := a.label
+		if m.focusMode == 2 && m.settingsFocusIdx == i {
+			btnLabel = m.styles.FocusStyle.Render(a.label)
+		} else {
+			btnLabel = m.styles.ActionButton.Render(a.label)
+		}
+		s.WriteString(fmt.Sprintf("  %s  %s  %s\n", btnLabel, a.key, a.desc))
+	}
 
 	s.WriteString("\n")
-	s.WriteString(m.styles.Dim.Render("?  show keybindings"))
+	s.WriteString(m.styles.Dim.Render("↑↓ navigate  Enter activate  Tab cycle"))
 
 	return s.String()
 }

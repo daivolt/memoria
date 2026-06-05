@@ -78,6 +78,7 @@ func sshTUIHandler(next ssh.Handler) ssh.Handler {
 			tea.WithInput(s),
 			tea.WithOutput(s),
 			tea.WithAltScreen(),
+			tea.WithMouseCellMotion(),
 		)
 
 		if pty.Window.Height > 0 && pty.Window.Width > 0 {

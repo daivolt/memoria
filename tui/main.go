@@ -66,6 +66,11 @@ type model struct {
 	spinner          spinner.Model
 	currentThemeIdx  int
 	styles           StyleBundle
+
+	focusMode       int
+	settingsFocusIdx int
+	agentFocusIdx    int
+	taskFocusIdx     int
 }
 
 func initialModel() model {
@@ -99,6 +104,7 @@ func initialModel() model {
 		spinner:     s,
 		loading:     true,
 		currentThemeIdx: 0,
+		focusMode:   0,
 	}
 
 	m.applyTheme()
@@ -158,10 +164,10 @@ func initialLoad(cc *ChitchatClient, mc *MemoriaClient) tea.Cmd {
 		}
 
 		return initialDataMsg{
-			health:  health,
-			agents:  agents,
-			tasks:   tasks,
-			config:  cfg,
+			health: health,
+			agents: agents,
+			tasks:  tasks,
+			config: cfg,
 		}
 	}
 }
@@ -210,17 +216,94 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab":
 			if m.chatInput.Focused() {
 				m.chatInput.Blur()
-			} else {
+				m.focusMode = 1
+			} else if m.recallInput.Focused() {
 				m.recallInput.Blur()
+				m.memoryProject.Focus()
+				m.focusMode = 0
+			} else if m.memoryProject.Focused() {
 				m.memoryProject.Blur()
+				m.chatInput.Focus()
+				m.focusMode = 0
+			} else {
+				switch m.focusMode {
+				case 1:
+					m.focusMode = 2
+					m.settingsFocusIdx = 0
+				case 2:
+					m.focusMode = 3
+					m.agentFocusIdx = 0
+				case 3:
+					m.focusMode = 4
+					m.taskFocusIdx = 0
+				case 4:
+					m.focusMode = 5
+					m.recallInput.Focus()
+				case 5:
+					m.focusMode = 0
+					m.chatInput.Focus()
+				default:
+					m.focusMode = 1
+				}
+			}
+		case "esc":
+			if m.recallInput.Focused() {
+				m.recallInput.Blur()
+				m.focusMode = 1
+			} else if m.memoryProject.Focused() {
+				m.memoryProject.Blur()
+				m.focusMode = 1
+			} else if m.chatInput.Focused() {
+				m.chatInput.Blur()
+				m.focusMode = 1
+			} else {
+				m.focusMode = 0
 				m.chatInput.Focus()
 			}
 		}
 
 		if !m.chatInput.Focused() && !m.recallInput.Focused() && !m.memoryProject.Focused() {
 			switch msg.String() {
+			case "up", "k":
+				switch m.focusMode {
+				case 1:
+					if m.activeTab > 0 {
+						m.activeTab--
+					}
+				case 2:
+					if m.settingsFocusIdx > 0 {
+						m.settingsFocusIdx--
+					}
+				case 3:
+					if m.agentFocusIdx > 0 {
+						m.agentFocusIdx--
+					}
+				case 4:
+					if m.taskFocusIdx > 0 {
+						m.taskFocusIdx--
+					}
+				}
+			case "down", "j":
+				switch m.focusMode {
+				case 1:
+					if m.activeTab < len(m.tabs)-1 {
+						m.activeTab++
+					}
+				case 2:
+					if m.settingsFocusIdx < 2 {
+						m.settingsFocusIdx++
+					}
+				case 3:
+					if m.agentFocusIdx < len(m.agents)-1 {
+						m.agentFocusIdx++
+					}
+				case 4:
+					if m.taskFocusIdx < len(m.tasks)-1 {
+						m.taskFocusIdx++
+					}
+				}
 			case "left":
-				if m.activeTab == 4 {
+				if m.activeTab == 4 && m.focusMode != 1 {
 					m.currentThemeIdx = (m.currentThemeIdx - 1 + len(themes)) % len(themes)
 					m.applyTheme()
 					if m.ready {
@@ -231,7 +314,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.loadChatHistory()
 				}
 			case "right":
-				if m.activeTab == 4 {
+				if m.activeTab == 4 && m.focusMode != 1 {
 					m.currentThemeIdx = (m.currentThemeIdx + 1) % len(themes)
 					m.applyTheme()
 					if m.ready {
@@ -254,13 +337,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if idx >= 0 && idx < len(m.tabs) {
 					m.activeTab = idx
 				}
+			case "enter":
+				switch m.focusMode {
+				case 2:
+					switch m.settingsFocusIdx {
+					case 0:
+						cmds = append(cmds, doConsolidate(m.memoria))
+					case 1:
+						cmds = append(cmds, doClearProposals(m.memoria))
+					case 2:
+						m.currentThemeIdx = (m.currentThemeIdx + 1) % len(themes)
+						m.applyTheme()
+						if m.ready {
+							m.chatViewport.SetContent(m.renderChatMessages())
+						}
+					}
+				case 3:
+					if m.agentFocusIdx >= 0 && m.agentFocusIdx < len(m.agents) {
+						a := m.agents[m.agentFocusIdx]
+						m.statusText = fmt.Sprintf("agent %s | project: %s | status: %s | task: %s",
+							a.ID[:min(len(a.ID), 16)], a.Project, a.Status, a.Task)
+					}
+				case 4:
+					if m.taskFocusIdx >= 0 && m.taskFocusIdx < len(m.tasks) {
+						t := m.tasks[m.taskFocusIdx]
+						m.statusText = fmt.Sprintf("task %s | status: %s | assigned: %s | result: %s",
+							t.ID[:min(len(t.ID), 16)], t.Status, t.AssignedTo, t.Result)
+					}
+				default:
+					if m.activeTab == 2 {
+						m.memoryProject.Focus()
+						m.focusMode = 0
+					}
+				}
 			case "r":
 				if m.activeTab == 3 {
 					m.recallInput.Focus()
-				}
-			case "enter":
-				if m.activeTab == 2 {
-					m.memoryProject.Focus()
+					m.focusMode = 0
 				}
 			case "t":
 				m.currentThemeIdx = (m.currentThemeIdx + 1) % len(themes)
@@ -275,6 +388,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "p":
 				if m.activeTab == 4 {
 					cmds = append(cmds, doClearProposals(m.memoria))
+				}
+			case "?":
+				if m.statusText == "" {
+					m.statusText = "[h/l/←→] nav  [↑↓] select  [Enter] activate  [Tab] cycle  [t] theme  [q] quit"
+				} else {
+					m.statusText = ""
 				}
 			}
 		}
@@ -299,9 +418,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.recallInput.SetValue("")
 				m.recallInput.Blur()
 				cmds = append(cmds, doRecall(m.memoria, m.recallQuery))
-			}
-			if msg.String() == "esc" {
-				m.recallInput.Blur()
+				m.focusMode = 1
 			}
 			var cmd tea.Cmd
 			m.recallInput, cmd = m.recallInput.Update(msg)
@@ -317,13 +434,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.memoryProject.SetValue("")
 				m.memoryProject.Blur()
 				cmds = append(cmds, loadMemory(m.memoria, proj))
-			}
-			if msg.String() == "esc" {
-				m.memoryProject.Blur()
+				m.focusMode = 1
 			}
 			var cmd tea.Cmd
 			m.memoryProject, cmd = m.memoryProject.Update(msg)
 			cmds = append(cmds, cmd)
+		}
+
+	case tea.MouseMsg:
+		if msg.Action != tea.MouseActionRelease {
+			break
+		}
+		tabStartY := 0
+		roomTabsY := 0
+		if msg.Y == tabStartY && msg.X < m.width {
+			colPerTab := (m.width * 55 / 100) / len(m.tabs)
+			if colPerTab < 6 {
+				colPerTab = 6
+			}
+			tabIdx := msg.X / colPerTab
+			leftPaneW := m.width * 45 / 100
+			if msg.X > leftPaneW && tabIdx >= 0 && tabIdx < len(m.tabs) {
+				m.activeTab = tabIdx
+			}
+		}
+		if msg.Y == roomTabsY && msg.X >= 0 {
+			leftPaneW := m.width * 45 / 100
+			if msg.X < leftPaneW && len(m.rooms) > 0 {
+				colPerRoom := leftPaneW / len(m.rooms)
+				if colPerRoom < 6 {
+					colPerRoom = 6
+				}
+				roomIdx := msg.X / colPerRoom
+				if roomIdx >= 0 && roomIdx < len(m.rooms) {
+					m.activeRoom = roomIdx
+					m.loadChatHistory()
+				}
+			}
 		}
 
 	case initialDataMsg:
@@ -554,7 +701,11 @@ func (m model) renderTabBar() string {
 	var tabs []string
 	for i, tab := range m.tabs {
 		if i == m.activeTab {
-			tabs = append(tabs, m.styles.ActiveTab.Render(tab))
+			if m.focusMode == 1 {
+				tabs = append(tabs, m.styles.FocusStyle.Render("▸ "+tab+" ◂"))
+			} else {
+				tabs = append(tabs, m.styles.ActiveTab.Render(tab))
+			}
 		} else {
 			tabs = append(tabs, m.styles.Tab.Render(tab))
 		}
@@ -579,12 +730,29 @@ func (m model) renderTabContent() string {
 	}
 }
 
+func wrapString(s string, width int) []string {
+	var lines []string
+	for _, line := range strings.Split(s, "\n") {
+		for len(line) > width {
+			brk := width
+			if idx := strings.LastIndex(line[:width], " "); idx > 0 {
+				brk = idx
+			}
+			lines = append(lines, line[:brk])
+			line = line[brk:]
+			line = strings.TrimLeft(line, " ")
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
 func (m model) renderAgents() string {
 	if len(m.agents) == 0 {
 		return m.styles.Dim.Render("No active agents.")
 	}
 	var lines []string
-	for _, a := range m.agents {
+	for i, a := range m.agents {
 		dot := m.statusDotForAgent(a.Status)
 		id := a.ID
 		if len(id) > 16 {
@@ -596,6 +764,9 @@ func (m model) renderAgents() string {
 		}
 		started := time.Unix(int64(a.StartedAt), 0).Format("15:04")
 		line := fmt.Sprintf(" %s %s  %s  [%s]", dot, m.styles.SettingsKey.Render(id), task, started)
+		if m.focusMode == 3 && i == m.agentFocusIdx {
+			line = m.styles.FocusStyle.Render(line)
+		}
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
@@ -619,7 +790,7 @@ func (m model) renderTasks() string {
 		return m.styles.Dim.Render("No tasks.")
 	}
 	var lines []string
-	for _, t := range m.tasks {
+	for i, t := range m.tasks {
 		dot := m.statusDotForTask(t.Status)
 		id := t.ID
 		if len(id) > 16 {
@@ -634,6 +805,9 @@ func (m model) renderTasks() string {
 			assigned = "unassigned"
 		}
 		line := fmt.Sprintf(" %s %s  %s  [%s]", dot, m.styles.SettingsKey.Render(id), title, assigned)
+		if m.focusMode == 4 && i == m.taskFocusIdx {
+			line = m.styles.FocusStyle.Render(line)
+		}
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
@@ -740,8 +914,21 @@ func (m model) renderChatMessages() string {
 			senderStr = m.styles.AgentMsg.Render(from + ":")
 		}
 
-		lines = append(lines, fmt.Sprintf(" %s %s %s",
-			tsStr, senderStr, msg.Text))
+		prefix := fmt.Sprintf(" %s %s ", tsStr, senderStr)
+		prefixWidth := lipgloss.Width(prefix)
+		wrapWidth := m.chatViewport.Width - prefixWidth - 1
+		if wrapWidth < 15 {
+			wrapWidth = 15
+		}
+
+		parts := wrapString(msg.Text, wrapWidth)
+		for i, p := range parts {
+			if i == 0 {
+				lines = append(lines, prefix+p)
+			} else {
+				lines = append(lines, strings.Repeat(" ", prefixWidth)+p)
+			}
+		}
 	}
 	return strings.Join(lines, "\n")
 }
@@ -751,9 +938,26 @@ func (m model) renderStatusBar() string {
 	if m.health != nil {
 		healthDot = m.styles.DotGreen
 	}
-	left := fmt.Sprintf(" %s memoria  %s chitchat  %s %s ",
-		healthDot, m.styles.DotGreen, m.styles.DotDim, m.rooms[m.activeRoom])
-	right := " [h/l] tabs  [←/→] rooms  [tab] input  [t] theme  [q] quit "
+
+	focusLabel := ""
+	switch m.focusMode {
+	case 0:
+		if m.chatInput.Focused() || m.recallInput.Focused() || m.memoryProject.Focused() {
+			focusLabel = " typing..."
+		}
+	case 1:
+		focusLabel = " [tab bar]"
+	case 2:
+		focusLabel = " [actions]"
+	case 3:
+		focusLabel = " [agents]"
+	case 4:
+		focusLabel = " [tasks]"
+	}
+
+	left := fmt.Sprintf(" %s memoria  %s chitchat  %s %s%s",
+		healthDot, m.styles.DotGreen, m.styles.DotDim, m.rooms[m.activeRoom], focusLabel)
+	right := " [?] help [Tab] cycle [q] quit "
 	spacing := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if spacing < 1 {
 		spacing = 1
@@ -779,19 +983,22 @@ func main() {
 		fmt.Println("  tui --sshd     Run as SSH server on port 23234")
 		fmt.Println()
 		fmt.Println("Controls:")
-		fmt.Println("  ← →            Switch chat rooms / cycle themes on Settings tab")
+		fmt.Println("  ↑↓               Navigate lists / tabs")
+		fmt.Println("  ← →             Switch chat rooms / cycle themes")
 		fmt.Println("  h l             Switch dashboard tabs")
 		fmt.Println("  1-5             Jump to dashboard tab")
-		fmt.Println("  tab             Toggle chat input focus")
+		fmt.Println("  Tab             Cycle through interactive zones")
+		fmt.Println("  Enter           Activate / send / inspect")
+		fmt.Println("  Esc             Leave zone back to tab bar")
 		fmt.Println("  t               Next theme")
 		fmt.Println("  c               Force consolidate (Settings tab)")
 		fmt.Println("  p               Clear proposals (Settings tab)")
 		fmt.Println("  r               Focus recall search")
-		fmt.Println("  enter           Send message / submit")
+		fmt.Println("  ?               Toggle help in status bar")
 		fmt.Println("  q / ctrl+c      Quit")
 		return
 	}
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		panic(err)
 	}

@@ -3,14 +3,15 @@ package main
 import "github.com/charmbracelet/lipgloss"
 
 type Theme struct {
-	Name            string
-	Base, Mantle    lipgloss.TerminalColor
-	Text, Subtext0  lipgloss.TerminalColor
-	Overlay0        lipgloss.TerminalColor
-	Blue, Green     lipgloss.TerminalColor
-	Yellow, Red     lipgloss.TerminalColor
-	Mauve, Teal     lipgloss.TerminalColor
-	Peach           lipgloss.TerminalColor
+	Name                   string
+	Base, Mantle           lipgloss.TerminalColor
+	Surface0, Surface1     lipgloss.TerminalColor
+	Text, Subtext0         lipgloss.TerminalColor
+	Overlay0               lipgloss.TerminalColor
+	Blue, Green            lipgloss.TerminalColor
+	Yellow, Red            lipgloss.TerminalColor
+	Mauve, Teal            lipgloss.TerminalColor
+	Peach                  lipgloss.TerminalColor
 }
 
 func c(hex string) lipgloss.TerminalColor {
@@ -18,25 +19,29 @@ func c(hex string) lipgloss.TerminalColor {
 }
 
 var CatppuccinMocha = Theme{
-	Name:     "Catppuccin Mocha",
-	Base:     c("#1e1e2e"),
-	Mantle:   c("#181825"),
-	Text:     c("#cdd6f4"),
-	Subtext0: c("#a6adc8"),
-	Overlay0: c("#6c7086"),
-	Blue:     c("#89b4fa"),
-	Green:    c("#a6e3a1"),
-	Yellow:   c("#f9e2af"),
-	Red:      c("#f38ba8"),
-	Mauve:    c("#cba6f7"),
-	Teal:     c("#94e2d5"),
-	Peach:    c("#fab387"),
+	Name:      "Catppuccin Mocha",
+	Base:      c("#1e1e2e"),
+	Mantle:    c("#181825"),
+	Surface0:  c("#313244"),
+	Surface1:  c("#45475a"),
+	Text:      c("#cdd6f4"),
+	Subtext0:  c("#a6adc8"),
+	Overlay0:  c("#6c7086"),
+	Blue:      c("#89b4fa"),
+	Green:     c("#a6e3a1"),
+	Yellow:    c("#f9e2af"),
+	Red:       c("#f38ba8"),
+	Mauve:     c("#cba6f7"),
+	Teal:      c("#94e2d5"),
+	Peach:     c("#fab387"),
 }
 
 var Nord = Theme{
 	Name:     "Nord",
 	Base:     c("#2e3440"),
 	Mantle:   c("#3b4252"),
+	Surface0: c("#434c5e"),
+	Surface1: c("#4c566a"),
 	Text:     c("#eceff4"),
 	Subtext0: c("#d8dee9"),
 	Overlay0: c("#616e88"),
@@ -53,6 +58,8 @@ var Cyberpunk = Theme{
 	Name:     "Cyberpunk",
 	Base:     c("#0a0a1a"),
 	Mantle:   c("#12122a"),
+	Surface0: c("#1a1a3a"),
+	Surface1: c("#22224a"),
 	Text:     c("#e0e0ff"),
 	Subtext0: c("#a0a0cc"),
 	Overlay0: c("#505080"),
@@ -69,6 +76,8 @@ var Gruvbox = Theme{
 	Name:     "Gruvbox Dark",
 	Base:     c("#282828"),
 	Mantle:   c("#1d2021"),
+	Surface0: c("#3c3836"),
+	Surface1: c("#504945"),
 	Text:     c("#ebdbb2"),
 	Subtext0: c("#d5c4a1"),
 	Overlay0: c("#928374"),
@@ -87,8 +96,9 @@ type StyleBundle struct {
 	LeftPane  lipgloss.Style
 	RightPane lipgloss.Style
 
-	StatusBar lipgloss.Style
-	Input     lipgloss.Style
+	StatusBar    lipgloss.Style
+	Input        lipgloss.Style
+	FocusStyle   lipgloss.Style
 
 	Tab       lipgloss.Style
 	ActiveTab lipgloss.Style
@@ -124,6 +134,8 @@ type StyleBundle struct {
 func NewStyleBundle(t Theme) StyleBundle {
 	base := t.Base
 	mantle := t.Mantle
+	surface0 := t.Surface0
+	surface1 := t.Surface1
 	text := t.Text
 	sub := t.Subtext0
 	overlay := t.Overlay0
@@ -143,11 +155,13 @@ func NewStyleBundle(t Theme) StyleBundle {
 		LeftPane: lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(blue).
+			Background(base).
 			Padding(0, 1),
 
 		RightPane: lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(blue).
+			Background(mantle).
 			Padding(0, 1),
 
 		StatusBar: lipgloss.NewStyle().
@@ -159,7 +173,13 @@ func NewStyleBundle(t Theme) StyleBundle {
 		Input: lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(overlay).
+			Background(surface0).
 			Padding(0, 1),
+
+		FocusStyle: lipgloss.NewStyle().
+			Background(surface1).
+			Foreground(text).
+			Bold(true),
 
 		Tab: lipgloss.NewStyle().
 			Padding(0, 2).
