@@ -47,6 +47,7 @@ CHITCHAT_DIR = WORKDIR / "chitchat"
 CHITCHAT_RETENTION_DAYS = 30
 CHITCHAT_ROOMS = [r.strip() for r in os.environ.get("CHITCHAT_ROOMS", "general").split(",")]
 SLEEP_CYCLE_HOURS = int(os.environ.get("SLEEP_CYCLE_HOURS", "6"))
+SESSION_RETENTION_DAYS = int(os.environ.get("SESSION_RETENTION_DAYS", "90"))
 
 # ── Shared modules for session extraction ────────────────────
 
@@ -498,8 +499,42 @@ def _consolidate_chitchat():
     _chitchat_unconsolidated = 0
 
 
+def _prune_sessions():
+    path = WORKDIR / "sessions.jsonl"
+    if not path.exists():
+        return
+    cutoff_ms = (time.time() - SESSION_RETENTION_DAYS * 86400) * 1000
+    lines = path.read_text().strip().splitlines()
+    kept = []
+    pruned_ids: list[str] = []
+    for line in lines:
+        try:
+            s = json.loads(line)
+            ts = s.get("created", 0)
+            if ts >= cutoff_ms:
+                kept.append(line)
+            else:
+                pruned_ids.append(s.get("id", ""))
+        except json.JSONDecodeError:
+            kept.append(line)
+    if len(kept) < len(lines):
+        path.write_text("\n".join(kept) + "\n" if kept else "")
+        if pruned_ids:
+            try:
+                db = sqlite3.connect(str(WORKDIR / "index.db"))
+                for sid in pruned_ids:
+                    db.execute("DELETE FROM sessions_fts WHERE id = ?", (sid,))
+                db.commit()
+                db.close()
+            except Exception:
+                pass
+
+
 def _deep_consolidate():
     """Cross-layer consolidation: sessions → topics + chat → topics."""
+    # 0. Prune old sessions first
+    _prune_sessions()
+
     # 1. Force chitchat consolidation
     global _chitchat_unconsolidated
     old = _chitchat_unconsolidated
@@ -624,6 +659,7 @@ async def health():
         "db_exists": OPENCODE_DB.exists(),
         "memoria_version": "2.0.0",
         "sleep_cycle_hours": SLEEP_CYCLE_HOURS,
+        "session_retention_days": SESSION_RETENTION_DAYS,
     }
 
 
