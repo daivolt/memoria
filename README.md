@@ -122,7 +122,7 @@ File claims prevent concurrent edits.
 
 ### `tui/` — Charm TUI (Go)
 
-Terminal UI built with [Charm](https://charm.land/libs/) (Bubble Tea + Lip Gloss + Bubbles).
+Terminal UI built with [Charm](https://charm.land/libs/) (Bubble Tea + Lip Gloss + Bubbles + Wish).
 
 **Layout:** Two panes — chat on the left, dashboard on the right.
 
@@ -143,12 +143,32 @@ Terminal UI built with [Charm](https://charm.land/libs/) (Bubble Tea + Lip Gloss
 | `enter` | Send message / submit search / load memory |
 | `q` / `ctrl+c` | Quit |
 
-```bash
-# Build
-cd tui && go build -o tui .
+**Modes:**
 
-# Run
-./tui/tui
+| Command | Mode |
+|---------|------|
+| `tui` | Run as local TUI |
+| `tui --sshd` | Run as SSH server on port 23234 |
+| `tui --help` | Show help |
+
+The TUI is also available as a **Tailscale service** via SSH. From any device on your Tailscale network:
+
+```bash
+ssh -p 23234 daivolt@100.121.245.69
+```
+
+### systemd — TUI SSH Server
+
+`memoria-tui.service` runs the TUI as an SSH server (port 23234):
+
+```bash
+# Service definition: /etc/systemd/system/memoria-tui.service
+#   WorkingDirectory: /home/daivolt/memoria/tui
+#   ExecStart:        tui --sshd
+#   User:             daivolt
+#   Restart:          always
+
+sudo systemctl enable --now memoria-tui
 ```
 
 ## Configuration

@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -604,6 +606,31 @@ func (m model) renderStatusBar() string {
 }
 
 func main() {
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "--sshd" {
+		log.Println("starting memoria TUI SSH server...")
+		if err := startSSHServer(); err != nil {
+			log.Fatalf("SSH server: %v", err)
+		}
+		return
+	}
+	if len(args) > 0 && args[0] == "--help" {
+		fmt.Println("memoria-tui — AgentOS terminal dashboard")
+		fmt.Println()
+		fmt.Println("Usage:")
+		fmt.Println("  tui            Run as local TUI")
+		fmt.Println("  tui --sshd     Run as SSH server on port 23234")
+		fmt.Println()
+		fmt.Println("Controls:")
+		fmt.Println("  ← →            Switch chat rooms")
+		fmt.Println("  h l             Switch dashboard tabs")
+		fmt.Println("  1-4             Jump to dashboard tab")
+		fmt.Println("  tab             Toggle chat input focus")
+		fmt.Println("  r               Focus recall search")
+		fmt.Println("  enter           Send message / submit")
+		fmt.Println("  q / ctrl+c      Quit")
+		return
+	}
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		panic(err)
