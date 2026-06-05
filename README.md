@@ -170,3 +170,4 @@ export MEMORIA_SERVER=http://100.121.245.69:19998
 - CLI commands unchanged — `memoria.py` now proxies to REST
 - Daemon lifecycle commands (`init`, `stop`) are now no-ops / health checks
 # agent-os auto-commit test
+# agent-os auto-commit verification
