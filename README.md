@@ -171,6 +171,33 @@ ssh -p 23234 daivolt@100.121.245.69
 sudo systemctl enable --now memoria-tui
 ```
 
+## OpenCode Integration
+
+Memoria integrates with opencode via two mechanisms:
+
+### Plugin (automatic lifecycle)
+
+`~/.config/opencode/plugins/memoria.js` — hooks into opencode events:
+
+| Event | Action | Failure mode |
+|-------|--------|-------------|
+| `shell.env` | Injects `MEMORIA_SERVER` + `MEMORIA_PROJECT` | Silent skip |
+| `session.created` | `POST /agents` — registers this session | Silent skip |
+| `session.updated` | `PATCH /agents/{id}` — heartbeat | Silent skip |
+| `session.deleted` | `DELETE /agents/{id}` — deregisters | Silent skip |
+
+All HTTP calls have 3s timeout. All errors are caught silently — memoria being down never affects the session. The plugin never touches opencode.db or modifies any config files.
+
+### Skill (agent instructions)
+
+`~/.config/opencode/skills/memoria/SKILL.md` — tells every opencode agent:
+- What memoria is and its 6-layer architecture
+- All `!memoria` commands (memory, recall, tasks, agents, safety, topics)
+- Session startup/shutdown checklists
+- How the plugin handles automatic registration
+
+Reference copies are kept at `opencode-integration/` in this repo.
+
 ## Configuration
 
 | Env Var | Default | Purpose |
@@ -199,6 +226,7 @@ sudo systemctl enable --now memoria-tui
 | `compress.py` | Phase 1+2 compression engine |
 | `context.py` | Active context state management |
 | `README.md` | This file |
+| `opencode-integration/` | Reference copies of opencode plugin + skill (installed at `~/.config/opencode/`) |
 
 ## Deployment
 
