@@ -115,6 +115,12 @@ func (c *ChitchatClient) GetMessages(room string) []ChatMessage {
 	return msgs
 }
 
+func (c *ChitchatClient) MessageCount(room string) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.messages[room])
+}
+
 func (c *ChitchatClient) GetRooms() []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

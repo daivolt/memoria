@@ -69,7 +69,7 @@ func startSSHServer() error {
 
 func sshTUIHandler(next ssh.Handler) ssh.Handler {
 	return func(s ssh.Session) {
-		pty, _, _ := s.Pty()
+		pty, winCh, _ := s.Pty()
 
 		model := initialModel()
 
@@ -78,7 +78,6 @@ func sshTUIHandler(next ssh.Handler) ssh.Handler {
 			tea.WithInput(s),
 			tea.WithOutput(s),
 			tea.WithAltScreen(),
-			tea.WithMouseCellMotion(),
 		)
 
 		if pty.Window.Height > 0 && pty.Window.Width > 0 {
@@ -89,19 +88,8 @@ func sshTUIHandler(next ssh.Handler) ssh.Handler {
 		}
 
 		go func() {
-			for {
-				select {
-				case <-s.Context().Done():
-					return
-				case <-time.After(200 * time.Millisecond):
-					pty2, _, _ := s.Pty()
-					if pty2.Window.Height > 0 && pty2.Window.Width > 0 {
-						p.Send(tea.WindowSizeMsg{
-							Width:  pty2.Window.Width,
-							Height: pty2.Window.Height,
-						})
-					}
-				}
+			for win := range winCh {
+				p.Send(tea.WindowSizeMsg{Width: win.Width, Height: win.Height})
 			}
 		}()
 

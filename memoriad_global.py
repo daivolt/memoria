@@ -591,7 +591,6 @@ def _deep_consolidate():
 
     # 1. Force chitchat consolidation
     global _chitchat_unconsolidated
-    old = _chitchat_unconsolidated
     _chitchat_unconsolidated = CHITCHAT_CONSOLIDATE_THRESHOLD
     _consolidate_chitchat()
 
@@ -626,8 +625,6 @@ def _deep_consolidate():
                 }
                 with open(prop_path, "a") as f:
                     f.write(json.dumps(record) + "\n")
-
-    _chitchat_unconsolidated = old
 
 
 # ── FastAPI app ──────────────────────────────────────────────
@@ -1638,6 +1635,58 @@ async def chitchat_history(room: str, limit: int = 20):
     lines = path.read_text().strip().splitlines()
     messages = [json.loads(l) for l in lines[-limit:] if l.strip()]
     return {"room": room, "messages": messages, "count": len(messages)}
+
+
+@app.get("/config")
+async def get_config():
+    return {
+        "memory_limit": MEMORY_LIMIT,
+        "poll_interval": POLL_INTERVAL,
+        "agent_stale_sec": AGENT_STALE_SEC,
+        "chitchat_poll_interval": CHITCHAT_POLL_INTERVAL,
+        "chitchat_consolidate_threshold": CHITCHAT_CONSOLIDATE_THRESHOLD,
+        "chitchat_max_messages": CHITCHAT_MAX_MESSAGES,
+        "sleep_cycle_hours": SLEEP_CYCLE_HOURS,
+        "session_max_records": SESSION_MAX_RECORDS,
+        "auto_accept_threshold": AUTO_ACCEPT_THRESHOLD,
+        "chitchat_url": CHITCHAT_URL,
+        "port": int(os.environ.get("MEMORIA_PORT", "19998")),
+        "host": os.environ.get("MEMORIA_HOST", "0.0.0.0"),
+    }
+
+
+class ConfigUpdate(BaseModel):
+    memory_limit: Optional[int] = None
+    poll_interval: Optional[int] = None
+    agent_stale_sec: Optional[int] = None
+    chitchat_poll_interval: Optional[int] = None
+    chitchat_consolidate_threshold: Optional[int] = None
+    chitchat_max_messages: Optional[int] = None
+    sleep_cycle_hours: Optional[int] = None
+    session_max_records: Optional[int] = None
+    auto_accept_threshold: Optional[int] = None
+    chitchat_url: Optional[str] = None
+
+
+@app.patch("/config")
+async def update_config(updates: ConfigUpdate):
+    data = updates.model_dump(exclude_none=True)
+    field_map = {
+        "memory_limit": "MEMORY_LIMIT",
+        "poll_interval": "POLL_INTERVAL",
+        "agent_stale_sec": "AGENT_STALE_SEC",
+        "chitchat_poll_interval": "CHITCHAT_POLL_INTERVAL",
+        "chitchat_consolidate_threshold": "CHITCHAT_CONSOLIDATE_THRESHOLD",
+        "chitchat_max_messages": "CHITCHAT_MAX_MESSAGES",
+        "sleep_cycle_hours": "SLEEP_CYCLE_HOURS",
+        "session_max_records": "SESSION_MAX_RECORDS",
+        "auto_accept_threshold": "AUTO_ACCEPT_THRESHOLD",
+        "chitchat_url": "CHITCHAT_URL",
+    }
+    for field, var_name in field_map.items():
+        if field in data:
+            globals()[var_name] = data[field]
+    return {"ok": True, "updated": list(data.keys())}
 
 
 @app.post("/chitchat/consolidate")

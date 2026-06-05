@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
+	"net/url"
 	"time"
 )
 
@@ -59,6 +59,21 @@ type RecallHit struct {
 	From    string `json:"from,omitempty"`
 }
 
+type MemoriaConfig struct {
+	MemoryLimit                 int    `json:"memory_limit"`
+	PollInterval                int    `json:"poll_interval"`
+	AgentStaleSec               int    `json:"agent_stale_sec"`
+	ChitchatPollInterval        int    `json:"chitchat_poll_interval"`
+	ChitchatConsolidateThreshold int   `json:"chitchat_consolidate_threshold"`
+	ChitchatMaxMessages         int    `json:"chitchat_max_messages"`
+	SleepCycleHours             int    `json:"sleep_cycle_hours"`
+	SessionMaxRecords           int    `json:"session_max_records"`
+	AutoAcceptThreshold         int    `json:"auto_accept_threshold"`
+	ChitchatURL                 string `json:"chitchat_url"`
+	Port                        int    `json:"port"`
+	Host                        string `json:"host"`
+}
+
 type HealthInfo struct {
 	Ok              bool     `json:"ok"`
 	SessionsIndexed int      `json:"sessions_indexed"`
@@ -79,7 +94,10 @@ func (m *MemoriaClient) get(path string, dest interface{}) error {
 		return fmt.Errorf("GET %s: %w", path, err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
 	if err := json.Unmarshal(body, dest); err != nil {
 		return fmt.Errorf("decode %s: %w", path, err)
 	}
@@ -92,6 +110,14 @@ func (m *MemoriaClient) Health() (*HealthInfo, error) {
 		return nil, err
 	}
 	return &h, nil
+}
+
+func (m *MemoriaClient) GetConfig() (*MemoriaConfig, error) {
+	var cfg MemoriaConfig
+	if err := m.get("/config", &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }
 
 func (m *MemoriaClient) Agents() ([]AgentInfo, error) {
@@ -128,9 +154,30 @@ func (m *MemoriaClient) Memory(project string) (*MemoryEntry, error) {
 	return &result, nil
 }
 
+func (m *MemoriaClient) TriggerConsolidation() error {
+	resp, err := m.client.Post(memoriaBase+"/chitchat/consolidate", "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("consolidate: %w", err)
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+func (m *MemoriaClient) ClearProposals() error {
+	req, err := http.NewRequest("DELETE", memoriaBase+"/proposals?confirm=true", nil)
+	if err != nil {
+		return fmt.Errorf("clear proposals req: %w", err)
+	}
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("clear proposals: %w", err)
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
 func (m *MemoriaClient) Recall(query string, limit int) ([]RecallHit, error) {
-	q := strings.ReplaceAll(query, " ", "+")
-	path := fmt.Sprintf("/recall?q=%s&limit=%d", q, limit)
+	path := fmt.Sprintf("/recall?q=%s&limit=%d", url.QueryEscape(query), limit)
 	var result RecallResult
 	if err := m.get(path, &result); err != nil {
 		return nil, err
