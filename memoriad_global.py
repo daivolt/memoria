@@ -61,6 +61,8 @@ _chitchat_poll_task: asyncio.Task | None = None
 _sleep_cycle_task: asyncio.Task | None = None
 _cortex_task: asyncio.Task | None = None
 _skill_watch_task: asyncio.Task | None = None
+_awake_replay_task: asyncio.Task | None = None
+# (duplicate declarations at lines ~710 are intentional module-level re-decl)
 
 # ── Shared modules for session extraction ────────────────────
 
@@ -613,7 +615,6 @@ def _deep_consolidate():
 
     # 2. Consolidate hippocampal episodes: cluster by similarity
     try:
-        from cortex import get_engine
         projects = set()
         tasks = _list_tasks(None, None)
         for t in tasks:
@@ -707,24 +708,18 @@ def _deep_consolidate():
 # ── FastAPI app ──────────────────────────────────────────────
 
 
-_poll_task: asyncio.Task | None = None
-_chitchat_poll_task: asyncio.Task | None = None
-_sleep_cycle_task: asyncio.Task | None = None
-_cortex_task: asyncio.Task | None = None
-_skill_watch_task: asyncio.Task | None = None
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_index()
-    global _poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task
+    global _poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task, _awake_replay_task
     _poll_task = asyncio.create_task(_poll_loop())
     _chitchat_poll_task = asyncio.create_task(_chitchat_poll_loop())
     _sleep_cycle_task = asyncio.create_task(_sleep_cycle_loop())
     _cortex_task = asyncio.create_task(_cortex_auction_loop())
     _skill_watch_task = asyncio.create_task(_skill_watch_loop())
+    _awake_replay_task = asyncio.create_task(_awake_replay_loop())
     yield
-    for t in (_poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task):
+    for t in (_poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task, _awake_replay_task):
         if t:
             t.cancel()
             try:
@@ -751,6 +746,28 @@ async def _chitchat_poll_loop():
         except Exception:
             pass
         await asyncio.sleep(CHITCHAT_POLL_INTERVAL)
+
+
+async def _awake_replay_loop():
+    """Awake hippocampal replay — lightweight replay every 60s.
+    
+    Based on Awake Replay (Trends Neurosci 2025):
+    Replay during quiet wakefulness performs fictive learning.
+    This runs lightweight replay steps on hippocampal buffer.
+    """
+    await asyncio.sleep(60)
+    while True:
+        try:
+            projects = set(t.get("project", "unknown") for t in _list_tasks(None, None))
+            for project in projects:
+                engine = get_engine(project)
+                if engine.replay.buffer:
+                    updates = engine.replay.replay_step()
+                    if updates:
+                        pass  # replay running silently
+        except Exception:
+            pass
+        await asyncio.sleep(60)
 
 
 async def _sleep_cycle_loop():
@@ -1593,7 +1610,6 @@ async def cortex_bid(body: CortexBidRequest):
 
 @app.post("/cortex/complete")
 async def cortex_complete(body: CortexCompleteRequest):
-    engine = get_engine("_global")
     t = _load_task(body.task_id)
     if t is None:
         raise HTTPException(404, "task not found")
@@ -1624,6 +1640,45 @@ async def cortex_complete(body: CortexCompleteRequest):
     }
 
 
+@app.post("/cortex/context")
+async def cortex_context(body: CortexBidRequest):
+    """Automatic context retrieval for a task — hippocampal pattern completion.
+    
+    Given a task description, finds the most similar past episodes and returns
+    them as structured context. No manual query needed — the task itself IS the query.
+    """
+    project = body.project or "unknown"
+    engine = get_engine(project)
+    pending = _list_tasks(project, "pending")
+    if not pending:
+        return {"ok": True, "context": [], "source": "no_pending_tasks"}
+    task = pending[0]
+    meta = task.get("payload", {}) or {}
+    if isinstance(meta, str):
+        try: meta = json.loads(meta)
+        except: meta = {}
+    similar = engine.hippocampus.context_for_task(
+        task.get("title", ""),
+        meta.get("type", "generic"),
+        int(meta.get("complexity", 5)),
+    )
+    context_list = []
+    for ep in similar:
+        context_list.append({
+            "task_title": ep.get("task_title", ""),
+            "outcome": ep.get("outcome", ""),
+            "reward": ep.get("reward", 0.5),
+            "agent_id": ep.get("agent_id", ""),
+            "age_sec": int(time.time() - ep.get("timestamp", 0)),
+        })
+    return {
+        "ok": True,
+        "task_id": task["id"],
+        "context": context_list,
+        "count": len(context_list),
+    }
+
+
 @app.get("/cortex/learnings")
 async def cortex_learnings(project: Optional[str] = None, n: int = 5):
     p = project or "unknown"
@@ -1633,7 +1688,7 @@ async def cortex_learnings(project: Optional[str] = None, n: int = 5):
         "ok": True,
         "project": p,
         "total_episodes": len(engine.hippocampus.episodes),
-        "recent": reversed(recent),
+        "recent": list(reversed(recent)),
     }
 
 
@@ -2330,7 +2385,7 @@ body {
   background: var(--bg-primary);
 }
 .tab-content { display: none; }
-.tab-content.active { display: block; }
+.tab-content.active { display: flex; flex-direction: column; height: calc(100vh - var(--topbar-h) - 40px); overflow-y: auto; }
 .tab-header {
   display: flex;
   align-items: center;
@@ -2903,6 +2958,7 @@ body {
     <div class="nav-item" data-tab="5" onclick="switchTab(5)"><span class="icon">💬</span> Chat <span class="badge" id="chatBadge">0</span></div>
     <div class="nav-item" data-tab="6" onclick="switchTab(6)"><span class="icon">🛡</span> Safety</div>
     <div class="nav-item" data-tab="7" onclick="switchTab(7)"><span class="icon">⚙</span> Settings</div>
+    <div class="nav-item" data-tab="8" onclick="switchTab(8)"><span class="icon">🧠</span> Brain</div>
   </div>
 
   <!-- Main Content -->
@@ -3024,6 +3080,34 @@ body {
         <div class="card-title">Proposals</div>
         <div id="proposalsList"></div>
       </div>
+    <!-- Tab 8: Brain Network -->
+    <div class="tab-content" id="tab8">
+      <div class="tab-header">
+        <div class="tab-title">🧠 Brain — Real-Time Network</div>
+        <div class="tab-actions">
+          <span class="text-sm text-muted" id="brainTs"></span>
+          <button class="btn btn-sm" onclick="resetBrainZoom()">⟲ Reset</button>
+        </div>
+      </div>
+      <div style="display:flex;gap:16px;flex:1;min-height:0;">
+        <div style="flex:1;position:relative;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;min-height:400px;">
+          <canvas id="brainCanvas" style="width:100%;height:100%;"></canvas>
+          <div id="brainTooltip" style="display:none;position:absolute;background:var(--bg-elevated);border:1px solid var(--accent);border-radius:var(--radius-xs);padding:8px 12px;font-size:12px;pointer-events:none;z-index:10;max-width:280px;color:var(--text-primary);"></div>
+        </div>
+        <div style="width:280px;display:flex;flex-direction:column;gap:8px;overflow-y:auto;">
+          <div class="card"><div class="card-title">Signals</div><div id="brainSignals" style="font-size:12px;font-family:var(--mono);"></div></div>
+          <div class="card"><div class="card-title">Legend</div>
+            <div style="font-size:11px;display:flex;flex-direction:column;gap:4px;">
+              <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#6c5ce7;margin-right:6px;"></span>Brain Region</div>
+              <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#00b894;margin-right:6px;"></span>Active Agent</div>
+              <div><span style="display:inline-block;width:3px;height:12px;background:#fdcb6e;margin-right:6px;display:inline-block;"></span>Q-Learning</div>
+              <div><span style="display:inline-block;width:3px;height:12px;background:#e17055;margin-right:6px;display:inline-block;"></span>RPE Signal</div>
+              <div><span style="display:inline-block;width:3px;height:12px;background:#00cec9;margin-right:6px;display:inline-block;"></span>Replay</div>
+              <div><span style="display:inline-block;width:3px;height:12px;background:#a29bfe;margin-right:6px;display:inline-block;"></span>Context Retrieval</div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -3036,7 +3120,7 @@ body {
   <div class="modal">
     <button class="modal-close" onclick="toggleHelp()">×</button>
     <h2>Keyboard Shortcuts</h2>
-    <div class="shortcut"><span>Switch tab</span><span class="key"><kbd>1</kbd>–<kbd>8</kbd></span></div>
+    <div class="shortcut"><span>Switch tab</span><span class="key"><kbd>1</kbd>–<kbd>9</kbd></span></div>
     <div class="shortcut"><span>Search recall</span><span class="key"><kbd>/</kbd></span></div>
     <div class="shortcut"><span>Close modal / blur</span><span class="key"><kbd>Esc</kbd></span></div>
     <div class="shortcut"><span>Toggle help</span><span class="key"><kbd>?</kbd></span></div>
@@ -3089,7 +3173,7 @@ function switchTab(n) {
   document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
   document.querySelector('.nav-item[data-tab="' + n + '"]')?.classList.add('active');
   document.getElementById('sidebar').classList.remove('open');
-  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, null, loadChat, loadSafety, loadSettings];
+  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, null, loadChat, loadSafety, loadSettings, loadBrainDelayed];
   if (loaders[n]) loaders[n]();
 }
 
@@ -3129,6 +3213,9 @@ function ago(ts) {
   if (sec < 86400) return Math.floor(sec / 3600) + 'h ago';
   return Math.floor(sec / 86400) + 'd ago';
 }
+
+// -- Helpers --
+function el(id) { return document.getElementById(id); }
 
 // -- Fetch Wrapper --
 async function api(path) {
@@ -3741,8 +3828,222 @@ async function clearProposals() {
   } catch(e) { toast('Failed: ' + e.message, 'error'); }
 }
 
-// -- Helper: document.getElementById shorthand --
-function el(id) { return document.getElementById(id); }
+// ============================================
+// BRAIN NETWORK VISUALIZATION
+// ============================================
+
+const BRAIN_NODES = [
+  { id: 'pfc', label: 'PFC\\ndecomposer', x: 0.5, y: 0.08, color: '#6c5ce7', size: 28 },
+  { id: 'bg', label: 'BG\\ngating', x: 0.25, y: 0.35, color: '#6c5ce7', size: 26 },
+  { id: 'dacc', label: 'dACC\\nsurprise', x: 0.75, y: 0.35, color: '#6c5ce7', size: 24 },
+  { id: 'snd', label: 'SNc/VTA\\nRPE', x: 0.5, y: 0.52, color: '#6c5ce7', size: 22 },
+  { id: 'hip', label: 'Hippocampus\\nmemory', x: 0.25, y: 0.68, color: '#6c5ce7', size: 26 },
+  { id: 'thal', label: 'Thalamus\\nrelay', x: 0.5, y: 0.82, color: '#6c5ce7', size: 20 },
+  { id: 'ctx', label: 'Context\\npreloader', x: 0.75, y: 0.68, color: '#6c5ce7', size: 22 },
+];
+
+const BRAIN_EDGES = [
+  { from: 'pfc', to: 'bg', label: 'task → gate', color: '#fdcb6e' },
+  { from: 'bg', to: 'snd', label: 'action → RPE', color: '#e17055' },
+  { from: 'snd', to: 'dacc', label: 'surprise', color: '#e17055' },
+  { from: 'dacc', to: 'bg', label: 'ε modulation', color: '#fdcb6e' },
+  { from: 'hip', to: 'bg', label: 'replay → Q', color: '#00cec9' },
+  { from: 'hip', to: 'ctx', label: 'episodes', color: '#a29bfe' },
+  { from: 'bg', to: 'thal', label: 'Go/NoGo', color: '#fdcb6e' },
+  { from: 'thal', to: 'pfc', label: 'gated output', color: '#fdcb6e' },
+  { from: 'ctx', to: 'pfc', label: 'context', color: '#a29bfe' },
+];
+
+let brainAnim = [];
+let brainTimer = 0;
+
+function loadBrainDelayed() {
+  setTimeout(loadBrain, 100);
+}
+
+function loadBrain() {
+  const canvas = document.getElementById('brainCanvas');
+  if (!canvas) return;
+  const container = canvas.parentElement;
+  const W = container.offsetWidth || container.clientWidth || container.getBoundingClientRect().width || 600;
+  const H = container.offsetHeight || container.clientHeight || container.getBoundingClientRect().height || 400;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  fetch(BASE + '/cortex/status')
+    .then(r => r.json())
+    .then(data => {
+      const cortex = data.cortex || {};
+      document.getElementById('brainTs').textContent = new Date().toLocaleTimeString();
+      drawBrain(ctx, W, H, cortex);
+    })
+    .catch(() => drawBrain(ctx, W, H, {}));
+}
+
+function drawBrain(ctx, W, H, cortex) {
+  ctx.clearRect(0, 0, W, H);
+
+  // Map nodes to pixel coords
+  const pad = 60;
+  const nodes = BRAIN_NODES.map(n => ({
+    ...n,
+    px: pad + n.x * (W - 2 * pad),
+    py: pad + n.y * (H - 2 * pad),
+  }));
+  const nodeMap = {};
+  nodes.forEach(n => nodeMap[n.id] = n);
+
+  // Draw edges with animated particles
+  const now = Date.now();
+  brainTimer = (brainTimer + 1) % 200;
+
+  BRAIN_EDGES.forEach((edge, ei) => {
+    const from = nodeMap[edge.from];
+    const to = nodeMap[edge.to];
+    if (!from || !to) return;
+
+    ctx.beginPath();
+    ctx.moveTo(from.px, from.py);
+    ctx.lineTo(to.px, to.py);
+    ctx.strokeStyle = 'rgba(139,141,160,0.25)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Animated particle
+    const t = ((now / 2000 + ei * 0.3) % 1);
+    const px = from.px + (to.px - from.px) * t;
+    const py = from.py + (to.py - from.py) * t;
+    ctx.beginPath();
+    ctx.arc(px, py, 3, 0, Math.PI * 2);
+    ctx.fillStyle = edge.color;
+    ctx.fill();
+
+    // Edge label
+    ctx.fillStyle = 'rgba(139,141,160,0.5)';
+    ctx.font = '9px sans-serif';
+    ctx.textAlign = 'center';
+    const mx = (from.px + to.px) / 2;
+    const my = (from.py + to.py) / 2 + 12;
+    ctx.fillText(edge.label, mx, my);
+  });
+
+  // Draw nodes
+  nodes.forEach(n => {
+    // Glow
+    const grad = ctx.createRadialGradient(n.px, n.py, 0, n.px, n.py, n.size);
+    grad.addColorStop(0, n.color + '40');
+    grad.addColorStop(1, n.color + '00');
+    ctx.beginPath();
+    ctx.arc(n.px, n.py, n.size * 1.5, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Circle
+    ctx.beginPath();
+    ctx.arc(n.px, n.py, n.size * 0.5, 0, Math.PI * 2);
+    ctx.fillStyle = n.color;
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Label
+    ctx.fillStyle = '#e8e8f0';
+    ctx.font = 'bold 10px sans-serif';
+    ctx.textAlign = 'center';
+    const lines = n.label.split('\\n');
+    lines.forEach((l, i) => {
+      ctx.fillText(l, n.px, n.py + n.size * 0.5 + 14 + i * 13);
+    });
+  });
+
+  // Agent nodes (dynamic from cortex data)
+  const agents = cortex.agents_tracked || 0;
+  const reputations = cortex.avg_reputations || {};
+  let ai = 0;
+  for (const [agentId, rep] of Object.entries(reputations)) {
+    const ax = 0.08 * W + ai * 50;
+    const ay = H - 40;
+    ctx.beginPath();
+    ctx.arc(ax, ay, 6, 0, Math.PI * 2);
+    ctx.fillStyle = rep > 0.6 ? '#00b894' : rep > 0.3 ? '#fdcb6e' : '#e17055';
+    ctx.fill();
+    ctx.fillStyle = '#8b8da0';
+    ctx.font = '8px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(agentId.slice(0, 8), ax, ay + 18);
+    ai++;
+  }
+
+  // Stats overlay
+  ctx.fillStyle = 'rgba(139,141,160,0.6)';
+  ctx.font = '11px monospace';
+  ctx.textAlign = 'left';
+  const stats = [
+    `ε=${(cortex.epsilon || 0).toFixed(3)}`,
+    `Q-states=${cortex.q_table_size || 0}`,
+    `episodes=${cortex.episodes || 0}`,
+    `replay=${cortex.replay_buffer || 0}`,
+    `agents=${agents}`,
+    `wm=${cortex.wm_stack_depth || 0}`,
+  ];
+  stats.forEach((s, i) => {
+    ctx.fillText(s, 12, 20 + i * 16);
+  });
+
+  // Tooltip on hover
+  const tooltip = document.getElementById('brainTooltip');
+  canvas.onmousemove = (e) => {
+    const r = canvas.getBoundingClientRect();
+    const mx2 = e.clientX - r.left;
+    const my2 = e.clientY - r.top;
+    let found = null;
+    for (const n of nodes) {
+      const dx = mx2 - n.px, dy = my2 - n.py;
+      if (dx * dx + dy * dy < (n.size * 0.5 + 10) ** 2) {
+        found = n;
+        break;
+      }
+    }
+    if (found) {
+      const descs = {
+        pfc: 'Prefrontal Cortex: hierarchical task decomposition, subgoal generation',
+        bg: 'Basal Ganglia: Go/NoGo gating, Q-learning, action selection',
+        dacc: 'Dorsal ACC: surprise tracking, epsilon modulation, meta-learning',
+        snd: 'SNc/VTA: dopamine reward prediction error (RPE) signal',
+        hip: 'Hippocampus: episodic memory, pattern completion, replay buffer',
+        thal: 'Thalamus: winner-take-all relay, gates cortical output',
+        ctx: 'Context Preloader: automatic pattern completion for current task',
+      };
+      tooltip.style.display = 'block';
+      tooltip.style.left = (e.clientX - r.left + 15) + 'px';
+      tooltip.style.top = (e.clientY - r.top - 10) + 'px';
+      tooltip.innerHTML = `<strong>${found.id.toUpperCase()}</strong><br>${descs[found.id] || ''}`;
+    } else {
+      tooltip.style.display = 'none';
+    }
+  };
+
+  // Signals panel
+  const signalsEl = document.getElementById('brainSignals');
+  if (signalsEl) {
+    const items = [
+      `Q-updates: ${cortex.q_table_size || 0}`,
+      `Replay buffer: ${cortex.replay_buffer || 0} entries`,
+      `Episodic: ${cortex.episodes || 0} stored`,
+      `Working Mem: depth ${cortex.wm_stack_depth || 0}`,
+      `Surprise α: ${(cortex.alpha_surprise || 0)} β: ${(cortex.beta_surprise || 0)}`,
+    ];
+    signalsEl.innerHTML = items.map(s => `<div>${s}</div>`).join('');
+  }
+}
+
+function resetBrainZoom() { loadBrain(); }
 
 // ============================================
 // INIT
@@ -3757,7 +4058,8 @@ setInterval(() => {
   else if (state.tab === 5) { loadChat(); }
   else if (state.tab === 6) loadSafety();
   else if (state.tab === 7) { loadSettings(); }
-}, 5000);
+  else if (state.tab === 8) { loadBrainDelayed(); }
+}, 3000);
 
 setInterval(() => {
   if (state.tab === 5 && state.chatRoom) loadChatMessages();
