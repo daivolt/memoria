@@ -495,8 +495,22 @@ def _consolidate_chitchat():
     if not top_keywords:
         _chitchat_unconsolidated = 0
         return
+    
+    # Skip overly generic single-keyword patterns (e.g. just "agent" from system messages)
+    if len(top_keywords) <= 2 and all(kw in ("agent", "task", "server", "project", "message", "started", "pattern") for kw in top_keywords):
+        _chitchat_unconsolidated = 0
+        return
 
     suggested_topic = top_keywords[0]
+
+    # Dedup: skip if very similar to last 3 facts in this topic
+    existing_facts = _load_topic_facts(suggested_topic[:50])
+    if existing_facts:
+        last_three = " ".join(existing_facts[-3:])
+        overlap = sum(1 for w in top_keywords if w in last_three)
+        if overlap >= len(top_keywords) * 0.7:
+            _chitchat_unconsolidated = 0
+            return
 
     summary_parts = []
     summary_parts.append(f"Pattern across {len(room_counts)} room(s): {', '.join(sorted(room_counts))}")
@@ -513,8 +527,9 @@ def _consolidate_chitchat():
     existing_topics = _load_existing_topic_names()
     match = _find_matching_topic(top_keywords, existing_topics)
     if match:
-        # Append to existing topic directly (not via proposal — already vetted)
         existing_facts = _load_topic_facts(match)
+        if len(existing_facts) >= 50:
+            existing_facts = existing_facts[-49:]
         if proposal_text not in existing_facts:
             existing_facts.append(proposal_text)
             content = "\n§\n".join(existing_facts) + "\n"
@@ -1141,6 +1156,8 @@ def _add_fact_to_topic(topic: str, text: str):
     entries = []
     if tpath.exists():
         entries = [e.strip() for e in tpath.read_text().split("§") if e.strip()]
+    if len(entries) >= 50:
+        entries = entries[-49:]
     entries.append(text)
     tpath.write_text("\n§\n".join(entries) + "\n")
 
@@ -3336,7 +3353,8 @@ body {
            <button class="btn btn-sm" onclick="resetBrainZoom()">⟲ Reset</button>
          </div>
        </div>
-       <div id="brainWrap" style="position:relative;width:100%;height:calc(100vh - 140px);min-height:400px;">
+       <div id="brainWrap" style="position:relative;width:100%;height:calc(100vh - 140px);min-height:400px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius);">
+         <div id="brainDebug" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#ff0000;font-size:24px;font-weight:bold;">LOADING BRAIN...</div>
          <canvas id="brainCanvas" style="display:block;width:100%;height:100%;"></canvas>
          <div id="brainTooltip" style="display:none;position:absolute;background:var(--bg-elevated);border:1px solid var(--accent);border-radius:var(--radius-xs);padding:8px 12px;font-size:12px;pointer-events:none;z-index:10;max-width:280px;color:var(--text-primary);"></div>
          <div style="position:absolute;top:8px;right:8px;width:260px;display:flex;flex-direction:column;gap:8px;">
@@ -4110,11 +4128,14 @@ function loadBrainDelayed() {
 
 function loadBrain() {
   const canvas = document.getElementById('brainCanvas');
-  if (!canvas) return;
+  const debug = document.getElementById('brainDebug');
+  if (!canvas) { if (debug) debug.textContent = 'ERROR: canvas not found'; return; }
   const wrap = document.getElementById('brainWrap');
   const W = wrap ? wrap.clientWidth : (window.innerWidth - 280);
   const H = wrap ? wrap.clientHeight : (window.innerHeight - 140);
-  if (W < 50 || H < 50) return;
+  if (debug) debug.textContent = 'W=' + W + ' H=' + H;
+  if (W < 50 || H < 50) { if (debug) debug.textContent = 'TOO SMALL: W=' + W + ' H=' + H; return; }
+  if (debug) debug.style.display = 'none';
   canvas.width = W;
   canvas.height = H;
   const ctx = canvas.getContext('2d');
