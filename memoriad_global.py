@@ -847,6 +847,12 @@ async def _awake_replay_loop():
                 if kill_signal > 0.05:
                     signals["kill_event"] = kill_signal
 
+                # Manual trigger signal (from POST /replay/trigger or agent_join)
+                global _manual_replay_signal
+                if _manual_replay_signal and _manual_replay_signal.get("project") in ("", project):
+                    signals["manual_trigger"] = _manual_replay_signal.get("urgency", 0.5)
+                    _manual_replay_signal = None
+
                 if signals:
                     updates = engine.replay.signal_weighted_replay(signals)
                     if updates:
@@ -1459,6 +1465,12 @@ async def register_agent(body: RegisterAgent):
         f"agent {agent_id[:12]} started on project '{body.project}': {body.task[:200]}"
         + (f" — conflicts: {'; '.join(conflicts)}" if conflicts else "")
     )
+    try:
+        eng = get_engine(body.project or "unknown")
+        if eng.replay.buffer:
+            eng.replay.signal_weighted_replay({"agent_join": 0.5})
+    except Exception:
+        pass
     return {"ok": True, "agent_id": agent_id, "conflicts": conflicts}
 
 
@@ -1496,11 +1508,18 @@ async def deregister_agent(agent_id: str):
     a = _load_agent(agent_id)
     if a is None:
         raise HTTPException(404, "agent not found")
+    project = a.get("project", "unknown")
     _delete_agent(agent_id)
     _notify_chitchat(
         f"agent {agent_id[:12]} finished: {a.get('task', '?')[:200]}"
         + f" — {len(a.get('commit_log', []))} commits"
     )
+    try:
+        eng = get_engine(project)
+        if eng.replay.buffer:
+            eng.replay.signal_weighted_replay({"agent_leave": 0.4})
+    except Exception:
+        pass
     return {"ok": True, "commits": len(a.get("commit_log", []))}
 
 
@@ -1733,6 +1752,40 @@ async def cortex_complete(body: CortexCompleteRequest):
     }
 
 
+class ReplayTriggerRequest(BaseModel):
+    project: str = ""
+    reason: str = "manual"
+    urgency: float = 0.5
+
+
+@app.post("/replay/trigger")
+async def trigger_replay(body: ReplayTriggerRequest):
+    """Manual replay trigger — injects a signal into the next awake replay cycle.
+    
+    The signal is stored globally and consumed by _awake_replay_loop()
+    on its next iteration. This provides the MANUAL trigger from the spec.
+    """
+    global _manual_replay_signal
+    project = body.project or "unknown"
+    _manual_replay_signal = {
+        "project": project,
+        "reason": body.reason[:100],
+        "urgency": min(1.0, max(0.0, body.urgency)),
+        "timestamp": time.time(),
+    }
+    engine = get_engine(project)
+    forced = engine.replay.signal_weighted_replay({"manual_trigger": body.urgency})
+    return {
+        "ok": True,
+        "project": project,
+        "updates": len(forced),
+        "reason": body.reason,
+    }
+
+
+_manual_replay_signal: dict | None = None
+
+
 @app.post("/cortex/context")
 async def cortex_context(body: CortexBidRequest):
     """Automatic context retrieval for a task — hippocampal pattern completion.
@@ -1852,10 +1905,15 @@ async def _cortex_auction_loop():
     while True:
         try:
             pending = _list_tasks(None, "pending")
+            if not pending:
+                await asyncio.sleep(30)
+                continue
             projects = set(t.get("project", "unknown") for t in pending)
             for project in projects:
-                engine = get_engine(project)
                 agents = _list_agents(project)
+                if not agents:
+                    continue
+                engine = get_engine(project)
                 project_tasks = [t for t in pending if t.get("project") == project]
                 for task in project_tasks:
                     assignment = engine.process_task_assignment(task, agents)

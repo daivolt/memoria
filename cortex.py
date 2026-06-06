@@ -972,6 +972,11 @@ class CortexEngine:
             if not isinstance(caps, list):
                 caps = ["general"]
             bid = self.auction.compute_bid(aid, caps, task_type, complexity)
+            # Cold-start: if state has never been visited, skip gate
+            n_visits = sum(self.gating.N.get(state, {}).values())
+            if n_visits == 0:
+                bids.append(bid)
+                continue
             action_scores = [self.gating.get_q(state, c) for c in caps]
             gate_signal = max(action_scores) if action_scores else 0.5
             if gate_signal >= 0.2:
