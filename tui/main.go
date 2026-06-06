@@ -250,21 +250,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "tab":
-			if m.chatInput.Focused() {
-				m.chatInput.Blur()
-				m.focusMode = focusDashboard
-			} else if m.recallInput.Focused() {
-				m.recallInput.Blur()
-				m.focusMode = focusDashboard
-			} else if m.memoryProject.Focused() {
-				m.memoryProject.Blur()
-				m.focusMode = focusDashboard
-			} else if m.focusMode == focusDashboard {
-				m.focusMode = focusInput
-				m.chatInput.Focus()
-			} else {
-				m.focusMode = focusChat
-			}
+			m.activeTab = (m.activeTab + 1) % len(m.tabs)
+			m.detailView = false
 		case "esc":
 			if m.recallInput.Focused() {
 				m.recallInput.Blur()
@@ -538,81 +525,104 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleMouse(msg tea.MouseMsg) {
-	if msg.Action == tea.MouseActionMotion {
-		return
-	}
-
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
 		if msg.X < m.chatPaneW {
 			m.chatViewport.LineUp(3)
+		} else {
+			m.chatViewport.LineUp(1)
 		}
 		return
 	case tea.MouseButtonWheelDown:
 		if msg.X < m.chatPaneW {
 			m.chatViewport.LineDown(3)
+		} else {
+			m.chatViewport.LineDown(1)
 		}
 		return
 	}
 
-	if msg.Action != tea.MouseActionRelease {
+	if msg.Action != tea.MouseActionRelease && msg.Action != tea.MouseActionPress {
 		return
 	}
 
-	relX := msg.X
+	isClick := msg.Action == tea.MouseActionRelease
 
-	if relX >= m.dashPaneX {
-		relY := msg.Y
-		if relY <= 1 {
-			xAccum := m.dashPaneX + 2
-			for i, tw := range m.tabWidths {
-				if relX < xAccum+tw {
-					m.activeTab = i
-					return
-				}
-				xAccum += tw
+	dx := m.dashPaneX
+	borderTop := 0
+	borderLeft := 0
+
+	tabBarY := borderTop
+	tabBarX := dx + 2 + borderLeft
+
+	if isClick && msg.Y == tabBarY && msg.X >= tabBarX {
+		xAccum := tabBarX
+		for i, tw := range m.tabWidths {
+			if msg.X < xAccum+tw {
+				m.activeTab = i
+				return
 			}
-			return
+			xAccum += tw
 		}
+	}
 
-		contentStartY := 3
-		contentY := relY - contentStartY
+	contentStartY := borderTop + 2
+	contentX := dx + 2 + borderLeft
+
+	if isClick && msg.X >= contentX && msg.X < contentX+m.dashContentWidth() && msg.Y >= contentStartY {
+		contentY := msg.Y - contentStartY
 		if contentY < 0 {
 			return
 		}
 
 		switch m.activeTab {
 		case tabAgents:
-			if m.detailView && m.detailIdx >= 0 && m.detailIdx < len(m.agents) {
-				return
-			}
-			if contentY < len(m.agents) {
-				m.agentFocusIdx = contentY
-				m.focusMode = focusDashboard
+			if !m.detailView {
+				linesPerAgent := 2
+				idx := contentY / linesPerAgent
+				if idx >= 0 && idx < len(m.agents) {
+					m.agentFocusIdx = idx
+					m.focusMode = focusDashboard
+				}
 			}
 		case tabTasks:
-			if m.detailView && m.detailIdx >= 0 && m.detailIdx < len(m.tasks) {
-				return
-			}
-			if contentY < len(m.tasks) {
-				m.taskFocusIdx = contentY
-				m.focusMode = focusDashboard
+			if !m.detailView {
+				if contentY >= 0 && contentY < len(m.tasks) {
+					m.taskFocusIdx = contentY
+					m.focusMode = focusDashboard
+				}
 			}
 		case tabSettings:
-			if contentY < settingsActionCount {
-				m.settingsFocusIdx = contentY
+			settingsStartY := 1
+			actionStartY := settingsStartY + 8
+			actionY := contentY - actionStartY
+			if actionY >= 0 && actionY < settingsActionCount {
+				m.settingsFocusIdx = actionY
 				m.focusMode = focusDashboard
 			}
+		case tabMemory:
+			if contentY == 0 {
+				m.memoryProject.Focus()
+				m.focusMode = focusInput
+			}
+		case tabRecall:
+			if contentY == 0 {
+				m.recallInput.Focus()
+				m.focusMode = focusInput
+			}
 		}
-	} else if relX < m.chatPaneW {
-		if msg.Y <= 0 && len(m.rooms) > 0 {
-			roomAccum := 0
+	}
+
+	if isClick && msg.X < m.chatPaneW {
+		roomTabsY := borderTop
+		if msg.Y == roomTabsY && len(m.rooms) > 0 {
+			roomAccum := 2 + borderLeft
 			for i, room := range m.rooms {
 				rw := lipgloss.Width(m.styles.RoomTab.Render(room))
 				if i == m.activeRoom {
 					rw = lipgloss.Width(m.styles.ActiveRoomTab.Render(room))
 				}
-				if relX < roomAccum+rw {
+				if msg.X >= roomAccum && msg.X < roomAccum+rw {
 					m.activeRoom = i
 					m.loadChatHistory()
 					return
@@ -620,6 +630,19 @@ func (m *model) handleMouse(msg tea.MouseMsg) {
 				roomAccum += rw
 			}
 		}
+
+		inputY := m.height - 3
+		if msg.Y >= inputY && msg.Y <= inputY+2 {
+			m.chatInput.Focus()
+			m.focusMode = focusInput
+		}
+	}
+
+	if isClick && msg.X >= dx {
+		m.chatInput.Blur()
+		m.recallInput.Blur()
+		m.memoryProject.Blur()
+		m.focusMode = focusChat
 	}
 }
 

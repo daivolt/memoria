@@ -9,9 +9,12 @@ Architecture (neuroscience mapping v2):
   Prefrontal Cortex    → Task decomposition + priority arbitration
 """
 
+import collections
 import json
 import math
 import random
+import re
+import textwrap
 import time
 from pathlib import Path
 from typing import Any
@@ -46,6 +49,7 @@ class PFCBGGating:
         self.reward_var: dict[str, float] = {}
         # ACC meta-learning (surprise-driven epsilon)
         self.rpe_history: list[float] = []
+        self.raw_rewards: list[float] = []
         # PRO model: dual surprise channels
         self.alpha_surprise: list[float] = []
         self.beta_surprise: list[float] = []
@@ -115,6 +119,8 @@ class PFCBGGating:
             self.Go[state][action] = 0.5
             self.NoGo[state][action] = 0.5
             self.N[state][action] = 0
+            self.reward_mean[self._key(state, action)] = 0.5
+            self.reward_var[self._key(state, action)] = 0.25
     
     def get_q(self, state: str, action: str) -> float:
         self._init_state_action(state, action)
@@ -132,42 +138,36 @@ class PFCBGGating:
         self._init_state_action(state, action)
         return self.NoGo[state][action]
     
-    def _acc_surprise_epsilon(self) -> float:
+    def _acc_surprise_epsilon(self, reward: float | None = None) -> float:
         """ACC PRO model: dual-channel surprise-driven epsilon adaptation.
         
         PRO Model (Topics Cog Sci 2019):
           α_j(t) = max(0, p_j(t-1) - o_j(t))  negative surprise (predicted but didn't occur)
           β_j(t) = max(0, o_j(t) - p_j(t-1))  positive surprise (occurred but not predicted)
-          ACC_activity = α + β  (non-valence-specific surprise)
         
-        EVC theory (Nature Neuro 4384):
-          EVC(s) = max_control [ Σ V(i|s, control) * P(i|s, control) - Cost(control) ]
-        
-        High surprise → explore more (increase epsilon).
-        Low surprise → exploit more (decrease epsilon).
+        Uses raw rewards (not RPEs) for PRO model as specified by the paper.
+        Prediction is the running average of recent rewards (dynamic expectation).
         """
-        if len(self.rpe_history) < 5:
+        if reward is not None:
+            self.raw_rewards.append(reward)
+        if len(self.raw_rewards) < 5:
             return self.epsilon
-        recent = self.rpe_history[-10:]
-        predictions = [0.5] * len(recent)
-        alpha_vals = []
-        beta_vals = []
-        for pred, outcome in zip(predictions, recent):
-            neg_surprise = max(0, pred - outcome)
-            pos_surprise = max(0, outcome - pred)
-            alpha_vals.append(neg_surprise)
-            beta_vals.append(pos_surprise)
-        mean_alpha = sum(alpha_vals) / len(alpha_vals)
-        mean_beta = sum(beta_vals) / len(beta_vals)
-        total_surprise = mean_alpha + mean_beta
-        self.alpha_surprise.append(mean_alpha)
-        self.beta_surprise.append(mean_beta)
+        if len(self.raw_rewards) > 200:
+            self.raw_rewards = self.raw_rewards[-200:]
+        reward_window = self.raw_rewards[-10:]
+        prediction = sum(reward_window[:-1]) / len(reward_window[:-1]) if len(reward_window) > 1 else 0.5
+        outcome = reward_window[-1]
+        neg_surprise = max(0, prediction - outcome)
+        pos_surprise = max(0, outcome - prediction)
+        total_surprise = neg_surprise + pos_surprise
+        self.alpha_surprise.append(neg_surprise)
+        self.beta_surprise.append(pos_surprise)
         if len(self.alpha_surprise) > 200:
             self.alpha_surprise = self.alpha_surprise[-200:]
             self.beta_surprise = self.beta_surprise[-200:]
         base = self.min_epsilon
         max_e = 0.5
-        scaled = base + (max_e - base) * min(1.0, total_surprise * 2)
+        scaled = base + (max_e - base) * min(1.0, total_surprise * 3)
         return 0.7 * self.epsilon + 0.3 * scaled
     
     def select_action(self, state: str, available_actions: list[str]) -> str | None:
@@ -240,8 +240,8 @@ class PFCBGGating:
         if len(self.rpe_history) > 200:
             self.rpe_history = self.rpe_history[-200:]
         
-        # Update epsilon via ACC meta-learning (surprise-driven)
-        self.epsilon = self._acc_surprise_epsilon()
+        # Update epsilon via ACC meta-learning (surprise-driven) using raw reward
+        self.epsilon = self._acc_surprise_epsilon(reward)
         
         # Efferent feedback multiplexing
         self.efferent_feedback(state, action, delta_v)
@@ -274,8 +274,56 @@ class PFCBGGating:
 
 # ── Hippocampal Episodic Memory ────────────────────────────────
 
+class TextEmbedder:
+    """Lightweight text embedder using character n-gram frequency vectors.
+    
+    No external dependencies. Uses character trigrams to build sparse
+    vectors, which capture semantic similarity without needing a model.
+    Based on the principle that similar texts share character-level patterns
+    (Cavnar & Trenkle, 1994 — N-gram-based text categorization).
+    """
+    
+    N = 3
+    
+    @classmethod
+    def _ngrams(cls, text: str) -> collections.Counter:
+        cleaned = re.sub(r'[^a-z0-9\s]', '', text.lower())
+        words = cleaned.split()
+        ngrams: list[str] = []
+        for word in words:
+            padded = f"  {word} " if len(word) > 2 else word
+            for i in range(len(padded) - cls.N + 1):
+                ngrams.append(padded[i:i + cls.N])
+        ngrams.extend(f"w_{w}" for w in words)
+        return collections.Counter(ngrams)
+    
+    @classmethod
+    def embed(cls, text: str) -> dict[str, float]:
+        total = 0
+        counter = cls._ngrams(text)
+        for v in counter.values():
+            total += v * v
+        mag = total ** 0.5
+        if mag == 0:
+            return {}
+        return {k: v / mag for k, v in counter.items()}
+    
+    @classmethod
+    def cosine_similarity(cls, a: dict[str, float], b: dict[str, float]) -> float:
+        dot = 0.0
+        for k, v in a.items():
+            if k in b:
+                dot += v * b[k]
+        return dot
+
+
 class HippocampalMemory:
-    """Episodic memory with similarity recall (hippocampal replay)."""
+    """Episodic memory with automatic context retrieval via embeddings.
+    
+    Pattern completion (CA3-like): when a new task comes in, compute its
+    embedding and auto-find similar past episodes — no manual query needed.
+    This mirrors hippocampal pattern completion (Marr, 1971; Treves & Rolls, 1994).
+    """
     
     def __init__(self, project: str):
         self.project = project
@@ -302,6 +350,8 @@ class HippocampalMemory:
     
     def store(self, task_id: str, agent_id: str, task_title: str,
               outcome: str, reward: float, meta: dict | None = None):
+        text = f"{task_title} {outcome} {meta or {}}"
+        embedding = TextEmbedder.embed(text)
         entry = {
             "task_id": task_id,
             "agent_id": agent_id,
@@ -309,6 +359,7 @@ class HippocampalMemory:
             "outcome": outcome,
             "reward": reward,
             "meta": meta or {},
+            "embedding": embedding,
             "timestamp": time.time(),
         }
         self.episodes.append(entry)
@@ -316,19 +367,34 @@ class HippocampalMemory:
             self.episodes = self.episodes[-self.max_episodes:]
         self.save()
     
-    def recall_similar(self, task_type: str, complexity: int, top_k: int = 3) -> list[dict]:
+    def context_for_task(self, task_title: str, task_type: str = "",
+                         complexity: int = 5, top_k: int = 3) -> list[dict]:
+        """Automatic context retrieval — like hippocampal pattern completion.
+        
+        Computes embedding of the current task and finds similar past episodes.
+        No manual query needed — the context IS the query.
+        """
+        query_text = f"{task_title} {task_type}"
+        query_emb = TextEmbedder.embed(query_text)
         scored = []
         for ep in self.episodes:
+            emb = ep.get("embedding")
+            if emb and query_emb:
+                sim = TextEmbedder.cosine_similarity(query_emb, emb)
+            else:
+                sim = 0.0
             meta = ep.get("meta", {}) or {}
-            score = 0.0
             if meta.get("type") == task_type:
-                score += 0.5
+                sim += 0.2
             c = meta.get("complexity", 5)
-            score += 0.3 * (1 - abs(c - complexity) / 10)
-            score += 0.2 * ep.get("reward", 0.5)
-            scored.append((score, ep))
+            sim += 0.1 * (1 - abs(c - complexity) / 10)
+            sim += 0.1 * ep.get("reward", 0.5)
+            scored.append((sim, ep))
         scored.sort(key=lambda x: -x[0])
         return [ep for _, ep in scored[:top_k]]
+    
+    def recall_similar(self, task_type: str, complexity: int, top_k: int = 3) -> list[dict]:
+        return self.context_for_task("", task_type, complexity, top_k)
     
     def avg_reward_for_agent(self, agent_id: str) -> float:
         matched = [e for e in self.episodes if e.get("agent_id") == agent_id]
@@ -656,6 +722,182 @@ class PrefrontalDecomposer:
         return max(1, min(20, base_p + complexity_bonus - queue_penalty))
 
 
+# ── Socratic Decomposer (Philosophical Task Refinement) ───────
+
+class SocraticDecomposer:
+    """Socratic elenchus before task decomposition.
+    
+    Philosophy-specialized task refiner that:
+    1. Questions the goal — exposes hidden assumptions
+    2. Refines success criteria before subgoaling
+    3. Logs assumptions as structured metadata
+    4. Supports cross-agent dialectic — flags disagreements
+    
+    Based on Socratic method: systematic questioning to expose
+    contradictions in beliefs and arrive at deeper truth.
+    """
+    
+    SOCRATIC_QUESTIONS = [
+        "What do you mean by '{goal}'? Can you define it more precisely?",
+        "What would success look like? How would we measure it?",
+        "What assumptions are we making about this problem?",
+        "What if the opposite of our assumption is true?",
+        "Why is this the right goal to pursue? What makes it important?",
+        "Who benefits from this goal? Who might be harmed?",
+        "What prior knowledge or experience informs this approach?",
+        "If we achieve this, what new problems might it create?",
+        "What are we NOT considering? What's outside the frame?",
+        "Is this goal means or ends? Could it be a means to a deeper end?",
+    ]
+    
+    def __init__(self, project: str):
+        self.project = project
+        self.assumptions: list[dict] = []
+        self.dialectic_records: list[dict] = []
+        self._load()
+    
+    def _path(self) -> Path:
+        return CORTEX_DIR / f"socratic_{self.project}.json"
+    
+    def _load(self):
+        p = self._path()
+        if p.exists():
+            try:
+                data = json.loads(p.read_text())
+                self.assumptions = data.get("assumptions", [])
+                self.dialectic_records = data.get("dialectic_records", [])
+            except (json.JSONDecodeError, OSError):
+                pass
+    
+    def save(self):
+        self._path().write_text(json.dumps({
+            "assumptions": self.assumptions[-100:],
+            "dialectic_records": self.dialectic_records[-50:],
+        }, indent=2))
+    
+    def question_goal(self, title: str, description: str) -> list[dict]:
+        """Generate Socratic questions for a task goal.
+        
+        Returns structured questions with category and Socratic target.
+        """
+        goal = title or description[:60]
+        questions = []
+        for i, q_template in enumerate(self.SOCRATIC_QUESTIONS):
+            q = q_template.replace("{goal}", goal)
+            category = "definition" if i == 0 else \
+                       "measurement" if i == 1 else \
+                       "assumption" if i in (2, 3) else \
+                       "motivation" if i in (4, 5) else \
+                       "knowledge" if i == 6 else \
+                       "consequence" if i == 7 else \
+                       "blindspot" if i == 8 else \
+                       "reframing"
+            questions.append({
+                "id": i,
+                "question": q,
+                "category": category,
+                "target": goal,
+                "answer": None,
+                "assumption_exposed": None,
+            })
+        return questions
+    
+    def record_answer(self, question_id: int, answer: str, assumption: str | None = None):
+        """Record an answer to a Socratic question and any exposed assumption."""
+        record = {
+            "question_id": question_id,
+            "answer": answer[:500],
+            "assumption": assumption[:300] if assumption else None,
+            "timestamp": time.time(),
+        }
+        self.assumptions.append(record)
+        if assumption:
+            self.assumptions[-1]["exposed_assumption"] = assumption[:300]
+        self.save()
+    
+    def refine_task(self, title: str, description: str, answers: list[dict] | None = None) -> dict:
+        """Refine a task based on Socratic answers.
+        
+        Returns enriched task model with:
+        - refined_title: more precise goal statement
+        - success_criteria: measurable outcomes
+        - exposed_assumptions: list of assumptions found
+        - blindspots: identified gaps
+        """
+        refined = {
+            "original_title": title,
+            "original_description": description,
+            "refined_title": title,
+            "refined_description": description,
+            "success_criteria": [],
+            "exposed_assumptions": [],
+            "blindspots": [],
+            "socratic_depth": len(answers or []),
+        }
+        if not answers:
+            return refined
+        
+        for a in answers:
+            if a.get("assumption"):
+                refined["exposed_assumptions"].append(a["assumption"])
+            cat = a.get("category", "")
+            ans = a.get("answer", "")
+            if cat == "measurement" and ans:
+                refined["success_criteria"].append(ans)
+            elif cat == "blindspot" and ans:
+                refined["blindspots"].append(ans)
+        
+        if refined["exposed_assumptions"]:
+            refined["refined_description"] += (
+                "\n\n[Assumptions exposed by Socratic questioning]\n" +
+                "\n".join(f"- {a}" for a in refined["exposed_assumptions"])
+            )
+        if refined["success_criteria"]:
+            refined["refined_title"] = refined["refined_title"]
+        
+        return refined
+    
+    def detect_dialectic(self, task_id: str, agent_a: str, agent_b: str,
+                         position_a: str, position_b: str) -> dict | None:
+        """Detect and record dialectic disagreement between two agents.
+        
+        When two agents have conflicting positions on the same task,
+        this flags the disagreement for resolution (Hegelian dialectic).
+        """
+        conflict_score = 0.0
+        a_words = set(position_a.lower().split())
+        b_words = set(position_b.lower().split())
+        common = a_words & b_words
+        diff = a_words ^ b_words
+        if len(common) > 0:
+            conflict_score = len(diff) / (len(common) + len(diff))
+        
+        record = {
+            "task_id": task_id,
+            "agent_a": agent_a,
+            "agent_b": agent_b,
+            "position_a": position_a[:200],
+            "position_b": position_b[:200],
+            "conflict_score": round(conflict_score, 3),
+            "resolution": None,
+            "timestamp": time.time(),
+        }
+        self.dialectic_records.append(record)
+        self.save()
+        
+        if conflict_score > 0.5:
+            return record
+        return None
+    
+    def resolve_dialectic(self, task_id: str, synthesis: str):
+        """Record Hegelian synthesis for a dialectic conflict."""
+        for r in self.dialectic_records:
+            if r["task_id"] == task_id and r["resolution"] is None:
+                r["resolution"] = synthesis[:500]
+                r["resolved_at"] = time.time()
+        self.save()
+
+
 # ── Main CORTEX Engine ────────────────────────────────────────
 
 class CortexEngine:
@@ -668,6 +910,7 @@ class CortexEngine:
         self.replay = HippocampalReplay(project, self.gating)
         self.auction = AuctionCoordinator(project)
         self.decomposer = PrefrontalDecomposer(project)
+        self.socrates = SocraticDecomposer(project)
         self.wm = self.decomposer.wm
     
     def process_task_assignment(self, task: dict, agents: list[dict]) -> dict | None:
@@ -680,7 +923,7 @@ class CortexEngine:
         task_type = meta.get("type", "generic")
         complexity = int(meta.get("complexity", 5))
         state = self.gating.state_key(task_type, complexity)
-        similar = self.hippocampus.recall_similar(task_type, complexity)
+        similar = self.hippocampus.context_for_task(meta.get("title", ""), task_type, complexity)
         bids = []
         for agent in agents:
             aid = agent.get("id", "")
@@ -722,7 +965,13 @@ class CortexEngine:
             nogo_vals = self.gating.NoGo.get(state, {})
             all_actions = set(go_vals) | set(nogo_vals)
             if all_actions:
-                net = {a: go_vals.get(a, 0.5) - nogo_vals.get(a, 0.5) for a in all_actions}
+                net = {}
+                for a in all_actions:
+                    bg = self.gating.beta_g.get(state, {}).get(a, 1.0)
+                    bn = self.gating.beta_n.get(state, {}).get(a, 1.0)
+                    gv = go_vals.get(a, 0.5)
+                    nv = nogo_vals.get(a, 0.5)
+                    net[a] = bg * gv - bn * nv
                 best = max(net, key=net.get)
                 visits = sum(self.gating.N.get(state, {}).values())
                 q_summary[state] = {
@@ -739,9 +988,15 @@ class CortexEngine:
             "wm_stack_depth": len(self.wm.subgoal_stack) if self.wm else 0,
             "wm_active_goals": [sg["goal"][:40] for sg in (self.wm.subgoal_stack if self.wm else []) if sg.get("status") == "active"],
             "replay_buffer": len(self.replay.buffer),
-            "replay_evb_top": round(self.replay.buffer[0]["evb"], 3) if self.replay.buffer else 0.0,
+            "replay_evb_top": round(max(e["evb"] for e in self.replay.buffer), 3) if self.replay.buffer else 0.0,
             "agents_tracked": len(self.auction.reputation),
             "avg_reputations": {a: round(r, 3) for a, r in self.auction.reputation.items()},
+            "alpha_surprise": round(self.gating.alpha_surprise[-1], 4) if self.gating.alpha_surprise else 0,
+            "beta_surprise": round(self.gating.beta_surprise[-1], 4) if self.gating.beta_surprise else 0,
+            "avg_responsiveness": round(sum(self.auction.responsiveness.values()) / max(len(self.auction.responsiveness), 1), 3) if self.auction.responsiveness else 0,
+            "avg_choice": round(sum(self.auction.choice.values()) / max(len(self.auction.choice), 1), 3) if self.auction.choice else 0,
+            "socratic_assumptions": len(self.socrates.assumptions),
+            "socratic_dialectics": len(self.socrates.dialectic_records),
         }
 
 

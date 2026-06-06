@@ -19,16 +19,16 @@ export class PFCBG_Gating {
     this.agentId = agentId;
     this.capabilities = capabilities || [];
     this.Q = {};
-    this.N = {};
     this.Go = {};
     this.NoGo = {};
+    this.N = {};
     this.alpha = 0.15;
     this.gamma = 0.9;
     this.epsilon = 0.3;
-    this.beta_g = 1.0;
-    this.beta_n = 1.0;
-    this.lastAction = null;
+    this.betaG = {};
+    this.betaN = {};
     this._useServer = true;
+    this._pendingActions = {};
   }
 
   stateKey(task) {
@@ -45,100 +45,134 @@ export class PFCBG_Gating {
     }
   }
 
-  async getQ(state) {
-    if (this._useServer) {
-      try {
-        const data = await this._serverStatus();
-        if (data && data.cortex && data.cortex.q_summary && data.cortex.q_summary[state]) {
-          this.epsilon = data.cortex.epsilon;
-          return data.cortex.q_summary[state];
+  async _syncFromServer() {
+    try {
+      const data = await fetchJSON(`/cortex/policy?project=${encodeURIComponent(this.projectName)}`);
+      if (data && data.policy) {
+        this.epsilon = data.epsilon ?? this.epsilon;
+        for (const [state, actions] of Object.entries(data.policy)) {
+          this.Q[state] = actions;
         }
-      } catch {}
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  async _sendComplete(task, reward) {
+    try {
+      await fetchJSON("/cortex/complete", {
+        method: "POST",
+        body: JSON.stringify({
+          agent_id: this.agentId,
+          task_id: task.id || "local",
+          reward: reward,
+          task_type: task.type || "generic",
+          complexity: task.complexity || 5,
+          result: "completed",
+        }),
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async ensureState(state) {
+    if (this._useServer) {
+      const ok = await this._syncFromServer();
+      if (ok) return;
       this._useServer = false;
     }
     if (!this.Q[state]) {
       this.Q[state] = {};
+      this.Go[state] = {};
+      this.NoGo[state] = {};
       this.N[state] = {};
+      this.betaG[state] = {};
+      this.betaN[state] = {};
     }
     const caps = this.capabilities.length ? this.capabilities : ["general"];
     for (const c of caps) {
       if (this.Q[state][c] === undefined) {
         this.Q[state][c] = 0.5;
+        this.Go[state][c] = 0.5;
+        this.NoGo[state][c] = 0.5;
         this.N[state][c] = 0;
+        this.betaG[state][c] = 1.0;
+        this.betaN[state][c] = 1.0;
       }
     }
-    return this.Q[state];
   }
 
-  selectAction(state) {
-    const q = this.Q[state] || {};
-    const caps = Object.keys(q);
+  async selectAction(state) {
+    await this.ensureState(state);
+    const caps = Object.keys(this.Q[state] || {});
     if (caps.length === 0) return null;
     if (Math.random() < this.epsilon) {
       return caps[Math.floor(Math.random() * caps.length)];
     }
     let best = caps[0];
-    let bestVal = q[best];
+    let bestVal = this.Q[state][best] || 0;
     for (const c of caps) {
-      if (q[c] > bestVal) {
-        bestVal = q[c];
+      const v = this.Q[state][c] || 0;
+      if (v > bestVal) {
+        bestVal = v;
         best = c;
       }
     }
     return best;
   }
 
-  shouldBid(task) {
+  async shouldBid(task) {
     const state = this.stateKey(task);
-    const action = this.selectAction(state);
+    const action = await this.selectAction(state);
     if (!action) return false;
-    this.lastAction = { state, action };
-    const q = this.Q[state] || {};
-    return (q[action] || 0.5) >= (task.threshold || 0.3);
+    this._pendingActions[task.id] = { state, action };
+    return (this.Q[state][action] || 0.5) >= (task.threshold || 0.3);
   }
 
   async update(task, reward) {
-    if (this._useServer) {
-      try {
-        await fetchJSON("/cortex/complete", {
-          method: "POST",
-          body: JSON.stringify({
-            agent_id: this.agentId,
-            task_id: task.id || "local",
-            reward: reward,
-            task_type: task.type || "generic",
-            complexity: task.complexity || 5,
-            result: "completed",
-          }),
-        });
-        return;
-      } catch {}
-      this._useServer = false;
-    }
-    if (!this.lastAction) return;
-    const { state, action } = this.lastAction;
-    if (!this.Q[state]) this.Q[state] = {};
-    if (!this.N[state]) this.N[state] = {};
+    const sent = await this._sendComplete(task, reward);
+    if (sent) return;
+
+    const pending = this._pendingActions[task.id];
+    const state = pending ? pending.state : this.stateKey(task);
+    const action = pending ? pending.action : this.capabilities[0] || "general";
+    delete this._pendingActions[task.id];
+
+    await this.ensureState(state);
     const oldQ = this.Q[state][action] || 0.5;
     this.N[state][action] = (this.N[state][action] || 0) + 1;
     const lr = this.alpha / (1 + 0.02 * this.N[state][action]);
     const rpe = reward - oldQ;
-    this.Q[state][action] = oldQ + lr * rpe;
+    this.Q[state][action] = Math.max(0.01, Math.min(0.99, oldQ + lr * rpe));
+    this.Go[state][action] = Math.max(0.01, Math.min(0.99, (this.Go[state][action] || 0.5) + lr * rpe * (this.Go[state][action] || 0.5)));
+    this.NoGo[state][action] = Math.max(0.01, Math.min(0.99, (this.NoGo[state][action] || 0.5) + lr * (-rpe) * (this.NoGo[state][action] || 0.5)));
     this.epsilon = Math.max(0.05, this.epsilon * 0.999);
-    this.lastAction = null;
   }
 
   toJSON() {
-    return { Go: this.Go, NoGo: this.NoGo, Q: this.Q, N: this.N, epsilon: this.epsilon };
+    return { Go: this.Go, NoGo: this.NoGo, Q: this.Q, N: this.N, epsilon: this.epsilon, betaG: this.betaG, betaN: this.betaN };
   }
 
   fromJSON(data) {
-    if (data) {
-      this.Q = data.Q || data.Go || {};
-      this.Go = data.Go || {};
-      this.NoGo = data.NoGo || {};
-      this.N = data.N || {};
-      this.epsilon = data.epsilon ?? 0.3;
+    if (!data) return;
+    this.Go = data.Go || {};
+    this.NoGo = data.NoGo || {};
+    this.Q = data.Q || {};
+    if (!Object.keys(this.Q).length && Object.keys(this.Go).length) {
+      for (const [s, vals] of Object.entries(this.Go)) {
+        this.Q[s] = {};
+        const nv = this.NoGo[s] || {};
+        for (const [a, g] of Object.entries(vals)) {
+          this.Q[s][a] = g - (nv[a] || 0.5);
+        }
+      }
     }
+    this.N = data.N || {};
+    this.epsilon = data.epsilon ?? 0.3;
+    this.betaG = data.betaG || {};
+    this.betaN = data.betaN || {};
   }
 }

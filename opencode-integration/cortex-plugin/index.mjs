@@ -6,9 +6,10 @@ const MEMORIA_URL = "http://localhost:19998";
 const POLL_INTERVAL_MS = 30000;
 const STATE_TOPIC = "cortex_state";
 
-let gating, bidding, memory;
+let gating, bidding, memory, projectName;
 let pollTimer = null;
 let lastPoll = 0;
+let contextCache = {};
 
 function getProjectName(project, directory) {
   if (project && project.name) return project.name;
@@ -75,7 +76,8 @@ async function pollAndBid() {
   try {
     const tasks = await bidding.fetchPendingTasks();
     for (const task of tasks) {
-      if (gating.shouldBid(task)) {
+      const should = await gating.shouldBid(task);
+      if (should) {
         const bid = bidding.computeBid(task);
         if (bid.score >= 0.3) {
           await bidding.submitBid(bid);
@@ -89,7 +91,7 @@ async function pollAndBid() {
 export default {
   id: "cortex",
   server: async ({ project, client, $, directory, worktree }) => {
-    const projectName = getProjectName(project, directory);
+    projectName = getProjectName(project, directory);
     const capabilities = getDefaultCapabilities(project);
     const agentId = `cortex-${projectName}-${Date.now()}`;
 
@@ -149,9 +151,31 @@ export default {
             if (taskId && bidding) {
               const reward = args.reward !== undefined ? parseFloat(args.reward) : 0.8;
               await bidding.completeTask(taskId, result, reward);
-              gating.update({ type: args.type || "generic", complexity: 5 }, reward);
+              await gating.update({ id: taskId, type: args.type || "generic", complexity: 5 }, reward);
               memory.store(taskId, agentId, taskId, "completed", reward, { tool: toolName });
               await persistState(projectName);
+            }
+          }
+          return;
+        }
+
+        // Automatic context preloading: when a tool is about to execute with a task description,
+        // preload relevant past episodes from memoria (hippocampal pattern completion).
+        if (ev.type === "tool.execute.before") {
+          const toolName = ev.properties?.tool || "";
+          if (["write", "edit", "bash"].includes(toolName)) {
+            const args = ev.properties?.args || {};
+            const query = args.command || args.filePath || args.oldString || "";
+            if (query && query.length > 10) {
+              try {
+                const resp = await fetchJSON("/cortex/context", {
+                  method: "POST",
+                  body: JSON.stringify({ project: projectName }),
+                });
+                if (resp && resp.context && resp.context.length > 0) {
+                  contextCache[query.slice(0, 50)] = resp.context;
+                }
+              } catch {}
             }
           }
           return;
@@ -159,6 +183,32 @@ export default {
       },
 
       tool: {
+        memoria_context: {
+          description: "Automatically retrieve relevant past episodes (hippocampal pattern completion) given the current task. No manual query needed — the context IS the query.",
+          args: {
+            task_title: { type: "string", description: "Optional task title to search for. If empty, uses current pending task.", default: "" },
+          },
+          execute: async (args) => {
+            try {
+              const resp = await fetchJSON("/cortex/context", {
+                method: "POST",
+                body: JSON.stringify({ project: projectName }),
+              });
+              if (!resp || !resp.context || resp.context.length === 0) {
+                return "No relevant past context found.";
+              }
+              let out = `Found ${resp.count} relevant past episode(s):\n`;
+              for (const ep of resp.context) {
+                const ago = ep.age_sec < 60 ? "just now" : ep.age_sec < 3600 ? `${Math.floor(ep.age_sec / 60)}m ago` : `${Math.floor(ep.age_sec / 3600)}h ago`;
+                out += `- "${ep.task_title}" → ${ep.outcome} (reward: ${ep.reward}, ${ago})\n`;
+              }
+              return out;
+            } catch (err) {
+              return `Error fetching context: ${err.message}`;
+            }
+          },
+        },
+
         cortex_bid: {
           description: "Trigger CORTEX to scan and bid on pending tasks matching agent capabilities",
           args: {},
@@ -168,7 +218,7 @@ export default {
               const results = [];
               for (const task of tasks) {
                 const bid = bidding.computeBid(task);
-                const should = gating.shouldBid(task);
+                const should = await gating.shouldBid(task);
                 results.push({
                   taskId: task.id,
                   title: task.title,
@@ -256,7 +306,7 @@ export default {
                 args.title, args.description, args.type, args.complexity
               );
               const bid = bidding.computeBid(task);
-              const shouldBid = gating.shouldBid(task);
+              const shouldBid = await gating.shouldBid(task);
               let assigned = false;
               if (shouldBid && bid.score >= 0.3) {
                 await bidding.submitBid(bid);
@@ -287,7 +337,7 @@ export default {
             try {
               const reward = args.reward !== undefined ? parseFloat(args.reward) : 0.8;
               await bidding.completeTask(args.taskId, args.result, reward);
-              gating.update({ type: args.type || "generic", complexity: 5 }, reward);
+              await gating.update({ id: args.taskId, type: args.type || "generic", complexity: 5 }, reward);
               memory.store(args.taskId, agentId, args.taskId, "completed", reward, { type: args.type });
               await persistState(projectName);
               return JSON.stringify({
