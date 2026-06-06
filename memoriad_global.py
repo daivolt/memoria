@@ -2632,7 +2632,7 @@ body {
   background: var(--bg-primary);
 }
 .tab-content { display: none; }
-.tab-content.active { display: flex; flex-direction: column; height: calc(100vh - var(--topbar-h) - 40px); overflow-y: auto; }
+.tab-content.active { display: flex; flex-direction: column; height: calc(100vh - var(--topbar-h) - 40px); min-height: 500px; overflow-y: auto; }
 .tab-header {
   display: flex;
   align-items: center;
@@ -3336,9 +3336,9 @@ body {
           <button class="btn btn-sm" onclick="resetBrainZoom()">⟲ Reset</button>
         </div>
       </div>
-      <div style="display:flex;gap:16px;flex:1;min-height:0;">
-        <div style="flex:1;position:relative;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;min-height:400px;">
-          <canvas id="brainCanvas" style="width:100%;height:100%;"></canvas>
+      <div style="display:flex;gap:16px;flex:1;min-height:500px;overflow:hidden;">
+        <div style="flex:1;min-width:0;position:relative;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;min-height:500px;">
+          <canvas id="brainCanvas" style="display:block;width:100%;height:100%;min-height:500px;"></canvas>
           <div id="brainTooltip" style="display:none;position:absolute;background:var(--bg-elevated);border:1px solid var(--accent);border-radius:var(--radius-xs);padding:8px 12px;font-size:12px;pointer-events:none;z-index:10;max-width:280px;color:var(--text-primary);"></div>
         </div>
         <div style="width:280px;display:flex;flex-direction:column;gap:8px;overflow-y:auto;">
@@ -4113,16 +4113,23 @@ function loadBrainDelayed() {
 function loadBrain() {
   const canvas = document.getElementById('brainCanvas');
   if (!canvas) return;
-  const container = canvas.parentElement;
-  const W = container.offsetWidth || container.clientWidth || container.getBoundingClientRect().width || 600;
-  const H = container.offsetHeight || container.clientHeight || container.getBoundingClientRect().height || 400;
+  // Measure from the tab panel itself — the most reliable source of truth
+  const tab = document.getElementById('tab8');
+  const header = tab ? tab.querySelector('.tab-header') : null;
+  const headerH = header ? header.offsetHeight : 50;
+  // Available width = tab width minus sidebar (280px) minus gaps and padding
+  const tabW = tab ? tab.clientWidth : 800;
+  const tabH = tab ? tab.clientHeight : 600;
+  const W = Math.max(tabW - 280 - 48, 400);
+  const H = Math.max(tabH - headerH - 40, 300);
   const dpr = window.devicePixelRatio || 1;
   canvas.width = W * dpr;
   canvas.height = H * dpr;
-  canvas.style.width = W + 'px';
-  canvas.style.height = H + 'px';
+  canvas.style.width = '100%';
+  canvas.style.height = '100%';
+  canvas.style.display = 'block';
   const ctx = canvas.getContext('2d');
-  ctx.scale(dpr, dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   fetch(BASE + '/cortex/status')
     .then(r => r.json())
