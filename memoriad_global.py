@@ -3328,34 +3328,32 @@ body {
         <div id="proposalsList"></div>
       </div>
     <!-- Tab 8: Brain Network -->
-    <div class="tab-content" id="tab8">
-      <div class="tab-header">
-        <div class="tab-title">🧠 Brain — Real-Time Network</div>
-        <div class="tab-actions">
-          <span class="text-sm text-muted" id="brainTs"></span>
-          <button class="btn btn-sm" onclick="resetBrainZoom()">⟲ Reset</button>
-        </div>
-      </div>
-      <div style="display:flex;gap:16px;flex:1;min-height:0;">
-        <div style="flex:1;min-width:0;position:relative;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;">
-          <canvas id="brainCanvas" style="display:block;"></canvas>
-          <div id="brainTooltip" style="display:none;position:absolute;background:var(--bg-elevated);border:1px solid var(--accent);border-radius:var(--radius-xs);padding:8px 12px;font-size:12px;pointer-events:none;z-index:10;max-width:280px;color:var(--text-primary);"></div>
-        </div>
-        <div style="width:280px;display:flex;flex-direction:column;gap:8px;overflow-y:auto;">
-          <div class="card"><div class="card-title">Signals</div><div id="brainSignals" style="font-size:12px;font-family:var(--mono);"></div></div>
-          <div class="card"><div class="card-title">Legend</div>
-            <div style="font-size:11px;display:flex;flex-direction:column;gap:4px;">
-              <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#6c5ce7;margin-right:6px;"></span>Brain Region</div>
-              <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#00b894;margin-right:6px;"></span>Active Agent</div>
-              <div><span style="display:inline-block;width:3px;height:12px;background:#fdcb6e;margin-right:6px;display:inline-block;"></span>Q-Learning</div>
-              <div><span style="display:inline-block;width:3px;height:12px;background:#e17055;margin-right:6px;display:inline-block;"></span>RPE Signal</div>
-              <div><span style="display:inline-block;width:3px;height:12px;background:#00cec9;margin-right:6px;display:inline-block;"></span>Replay</div>
-              <div><span style="display:inline-block;width:3px;height:12px;background:#a29bfe;margin-right:6px;display:inline-block;"></span>Context Retrieval</div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
+     <div class="tab-content" id="tab8">
+       <div class="tab-header">
+         <div class="tab-title">🧠 Brain — Real-Time Network</div>
+         <div class="tab-actions">
+           <span class="text-sm text-muted" id="brainTs"></span>
+           <button class="btn btn-sm" onclick="resetBrainZoom()">⟲ Reset</button>
+         </div>
+       </div>
+       <div id="brainWrap" style="position:relative;width:100%;height:calc(100vh - 140px);min-height:400px;">
+         <canvas id="brainCanvas" style="display:block;width:100%;height:100%;"></canvas>
+         <div id="brainTooltip" style="display:none;position:absolute;background:var(--bg-elevated);border:1px solid var(--accent);border-radius:var(--radius-xs);padding:8px 12px;font-size:12px;pointer-events:none;z-index:10;max-width:280px;color:var(--text-primary);"></div>
+         <div style="position:absolute;top:8px;right:8px;width:260px;display:flex;flex-direction:column;gap:8px;">
+           <div class="card"><div class="card-title">Signals</div><div id="brainSignals" style="font-size:12px;font-family:var(--mono);"></div></div>
+           <div class="card"><div class="card-title">Legend</div>
+             <div style="font-size:11px;display:flex;flex-direction:column;gap:4px;">
+               <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#6c5ce7;margin-right:6px;"></span>Brain Region</div>
+               <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#00b894;margin-right:6px;"></span>Active Agent</div>
+               <div><span style="display:inline-block;width:3px;height:12px;background:#fdcb6e;margin-right:6px;display:inline-block;"></span>Q-Learning</div>
+               <div><span style="display:inline-block;width:3px;height:12px;background:#e17055;margin-right:6px;display:inline-block;"></span>RPE Signal</div>
+               <div><span style="display:inline-block;width:3px;height:12px;background:#00cec9;margin-right:6px;display:inline-block;"></span>Replay</div>
+               <div><span style="display:inline-block;width:3px;height:12px;background:#a29bfe;margin-right:6px;display:inline-block;"></span>Context Retrieval</div>
+             </div>
+           </div>
+         </div>
+       </div>
+     </div>
   </div>
 </div>
 
@@ -4113,20 +4111,12 @@ function loadBrainDelayed() {
 function loadBrain() {
   const canvas = document.getElementById('brainCanvas');
   if (!canvas) return;
-  const container = canvas.parentElement;
-  const flexRow = container ? container.parentElement : null;
-  // Use viewport height as the definitive size source
-  const vh = window.innerHeight || document.documentElement.clientHeight || 600;
-  const W = Math.max((window.innerWidth || 1200) - 280 - 80, 400);
-  const H = Math.max(vh - 120, 300);
-  // Set container and canvas to explicit pixel sizes
-  if (flexRow) { flexRow.style.height = H + 'px'; }
-  if (container) { container.style.height = H + 'px'; }
+  const wrap = document.getElementById('brainWrap');
+  const W = wrap ? wrap.clientWidth : (window.innerWidth - 280);
+  const H = wrap ? wrap.clientHeight : (window.innerHeight - 140);
+  if (W < 50 || H < 50) return;
   canvas.width = W;
   canvas.height = H;
-  canvas.style.width = W + 'px';
-  canvas.style.height = H + 'px';
-  canvas.style.display = 'block';
   const ctx = canvas.getContext('2d');
 
   fetch(BASE + '/cortex/status')
