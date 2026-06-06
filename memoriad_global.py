@@ -3622,7 +3622,7 @@ function renderMarkdown(text) {
   s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
   s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-  s = s.replace(/\\n/g, '<br>');
+  s = s.replaceAll(String.fromCharCode(10), '<br>');
   return s;
 }
 
@@ -3644,7 +3644,9 @@ async function loadChatMessages() {
         '<div class="body">' + renderMarkdown(m.text) + '</div>' +
         '</div>';
     }).join('');
-    container.scrollTop = container.scrollHeight;
+    // Only auto-scroll if user is near the bottom (within 50px)
+    const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 50;
+    if (nearBottom) container.scrollTop = container.scrollHeight;
     setConn(true);
   } catch(e) {
     setConn(false);
@@ -3832,17 +3834,17 @@ async function clearProposals() {
 // BRAIN NETWORK VISUALIZATION
 // ============================================
 
-const BRAIN_NODES = [
-  { id: 'pfc', label: 'PFC\\ndecomposer', x: 0.5, y: 0.08, color: '#6c5ce7', size: 28 },
-  { id: 'bg', label: 'BG\\ngating', x: 0.25, y: 0.35, color: '#6c5ce7', size: 26 },
-  { id: 'dacc', label: 'dACC\\nsurprise', x: 0.75, y: 0.35, color: '#6c5ce7', size: 24 },
-  { id: 'snd', label: 'SNc/VTA\\nRPE', x: 0.5, y: 0.52, color: '#6c5ce7', size: 22 },
-  { id: 'hip', label: 'Hippocampus\\nmemory', x: 0.25, y: 0.68, color: '#6c5ce7', size: 26 },
-  { id: 'thal', label: 'Thalamus\\nrelay', x: 0.5, y: 0.82, color: '#6c5ce7', size: 20 },
-  { id: 'ctx', label: 'Context\\npreloader', x: 0.75, y: 0.68, color: '#6c5ce7', size: 22 },
+var BRAIN_NODES = [
+  { id: 'pfc', label: 'PFC|decomposer', x: 0.5, y: 0.08, color: '#6c5ce7', size: 28 },
+  { id: 'bg', label: 'BG|gating', x: 0.25, y: 0.35, color: '#6c5ce7', size: 26 },
+  { id: 'dacc', label: 'dACC|surprise', x: 0.75, y: 0.35, color: '#6c5ce7', size: 24 },
+  { id: 'snd', label: 'SNc/VTA|RPE', x: 0.5, y: 0.52, color: '#6c5ce7', size: 22 },
+  { id: 'hip', label: 'Hippocampus|memory', x: 0.25, y: 0.68, color: '#6c5ce7', size: 26 },
+  { id: 'thal', label: 'Thalamus|relay', x: 0.5, y: 0.82, color: '#6c5ce7', size: 20 },
+  { id: 'ctx', label: 'Context|preloader', x: 0.75, y: 0.68, color: '#6c5ce7', size: 22 },
 ];
 
-const BRAIN_EDGES = [
+var BRAIN_EDGES = [
   { from: 'pfc', to: 'bg', label: 'task → gate', color: '#fdcb6e' },
   { from: 'bg', to: 'snd', label: 'action → RPE', color: '#e17055' },
   { from: 'snd', to: 'dacc', label: 'surprise', color: '#e17055' },
@@ -3854,8 +3856,8 @@ const BRAIN_EDGES = [
   { from: 'ctx', to: 'pfc', label: 'context', color: '#a29bfe' },
 ];
 
-let brainAnim = [];
-let brainTimer = 0;
+var brainAnim = [];
+var brainTimer = 0;
 
 function loadBrainDelayed() {
   setTimeout(loadBrain, 100);
@@ -3880,12 +3882,12 @@ function loadBrain() {
     .then(data => {
       const cortex = data.cortex || {};
       document.getElementById('brainTs').textContent = new Date().toLocaleTimeString();
-      drawBrain(ctx, W, H, cortex);
+      drawBrain(ctx, W, H, cortex, canvas);
     })
-    .catch(() => drawBrain(ctx, W, H, {}));
+    .catch(() => drawBrain(ctx, W, H, {}, canvas));
 }
 
-function drawBrain(ctx, W, H, cortex) {
+function drawBrain(ctx, W, H, cortex, canvas) {
   ctx.clearRect(0, 0, W, H);
 
   // Map nodes to pixel coords
@@ -3956,7 +3958,7 @@ function drawBrain(ctx, W, H, cortex) {
     ctx.fillStyle = '#e8e8f0';
     ctx.font = 'bold 10px sans-serif';
     ctx.textAlign = 'center';
-    const lines = n.label.split('\\n');
+    const lines = n.label.split('|');
     lines.forEach((l, i) => {
       ctx.fillText(l, n.px, n.py + n.size * 0.5 + 14 + i * 13);
     });
