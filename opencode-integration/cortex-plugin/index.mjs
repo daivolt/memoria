@@ -6,10 +6,48 @@ const MEMORIA_URL = "http://localhost:19998";
 const POLL_INTERVAL_MS = 30000;
 const STATE_TOPIC = "cortex_state";
 
-let gating, bidding, memory, projectName;
+let gating, bidding, memory, projectName, pluginOutput;
 let pollTimer = null;
 let lastPoll = 0;
 let contextCache = {};
+let wsReconnectTimer = null;
+
+
+function connectEventStream() {
+  if (wsReconnectTimer) return;
+  try {
+    const ws = new WebSocket(`ws://localhost:19998/events`);
+    ws.onopen = () => console.log("[cortex] event stream connected");
+    ws.onmessage = (msg) => {
+      try {
+        const ev = JSON.parse(msg.data);
+        const out = pluginOutput || { terminal: (s) => console.log(s) };
+        const text = ev.title || ev.reason || "";
+        switch (ev.type) {
+          case "task_created":
+            out.terminal?.(`[memoria] Created: ${text}${ev.assigned_to ? " -> " + ev.assigned_to.slice(0, 16) : ""}`);
+            break;
+          case "task_assigned":
+            out.terminal?.(`[memoria] ${text} -> ${(ev.agent_id || "").slice(0, 16)}`);
+            break;
+          case "agent_registered":
+            console.log(`[cortex] agent ${(ev.agent_id || "").slice(0, 12)} joined ${ev.project}`);
+            break;
+          case "agent_deregistered":
+            console.log(`[cortex] agent ${(ev.agent_id || "").slice(0, 12)} left ${ev.project}`);
+            break;
+          case "replay_triggered":
+            console.log(`[cortex] replay: ${ev.updates || 0} updates`);
+            break;
+        }
+      } catch {}
+    };
+    ws.onclose = () => {
+      wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; connectEventStream(); }, 5000);
+    };
+    ws.onerror = () => ws.close();
+  } catch {}
+}
 
 function getProjectName(project, directory) {
   if (project && project.name) return project.name;
@@ -90,8 +128,9 @@ async function pollAndBid() {
 
 export default {
   id: "cortex",
-  server: async ({ project, client, $, directory, worktree }) => {
+  server: async ({ project, client, $, directory, worktree, output }) => {
     projectName = getProjectName(project, directory);
+    pluginOutput = output;
     const capabilities = getDefaultCapabilities(project);
     const agentId = `cortex-${projectName}-${Date.now()}`;
 
@@ -126,6 +165,7 @@ export default {
           } catch (_) {}
           await loadState(projectName);
           pollTimer = setInterval(pollAndBid, 15000);
+          connectEventStream();
           return;
         }
 
@@ -136,8 +176,10 @@ export default {
 
         if (ev.type === "session.deleted") {
           if (pollTimer) clearInterval(pollTimer);
+          if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
           await persistState(projectName);
           pollTimer = null;
+          wsReconnectTimer = null;
           gating = bidding = memory = null;
           return;
         }

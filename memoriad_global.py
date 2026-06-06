@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -888,6 +888,45 @@ app.add_middleware(
 )
 
 
+# ── WebSocket Event Bus ────────────────────────────────────────
+
+class EventBroadcaster:
+    """Push event notifications to all connected WebSocket clients."""
+    def __init__(self):
+        self._connections: set[WebSocket] = set()
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self._connections.add(ws)
+
+    def disconnect(self, ws: WebSocket):
+        self._connections.discard(ws)
+
+    async def broadcast(self, event_type: str, data: dict):
+        msg = json.dumps({"type": event_type, **data, "ts": time.time()})
+        stale = set()
+        for ws in self._connections:
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                stale.add(ws)
+        self._connections -= stale
+
+_events = EventBroadcaster()
+
+
+@app.websocket("/events")
+async def event_websocket(ws: WebSocket):
+    await _events.connect(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        _events.disconnect(ws)
+    except Exception:
+        _events.disconnect(ws)
+
+
 @app.get("/health")
 async def health():
     sess_path = WORKDIR / "sessions.jsonl"
@@ -1471,6 +1510,12 @@ async def register_agent(body: RegisterAgent):
             eng.replay.signal_weighted_replay({"agent_join": 0.5})
     except Exception:
         pass
+    await _events.broadcast("agent_registered", {
+        "agent_id": agent_id,
+        "project": body.project,
+        "capabilities": body.capabilities,
+        "task": body.task[:100],
+    })
     return {"ok": True, "agent_id": agent_id, "conflicts": conflicts}
 
 
@@ -1520,6 +1565,11 @@ async def deregister_agent(agent_id: str):
             eng.replay.signal_weighted_replay({"agent_leave": 0.4})
     except Exception:
         pass
+    await _events.broadcast("agent_deregistered", {
+        "agent_id": agent_id,
+        "project": project,
+        "task": a.get("task", "")[:100],
+    })
     return {"ok": True, "commits": len(a.get("commit_log", []))}
 
 
@@ -1607,8 +1657,12 @@ async def create_task(body: CreateTask):
     _save_task(task)
     if body.assigned_to:
         _notify_chitchat(
-            f"@{body.assigned_to} task assigned: {body.title[:200]} on '{body.project}'"
+            f"@{body.assigned_to} task assigned: {body.task[:200]} on '{body.project}'"
         )
+    asyncio.ensure_future(_events.broadcast("task_created", {
+        "task_id": task_id, "project": body.project,
+        "title": body.title[:100], "assigned_to": body.assigned_to,
+    }))
     return {"ok": True, "task_id": task_id}
 
 
@@ -1890,6 +1944,11 @@ async def cortex_replay(body: CortexReplayRequest):
         body.signals or None,
         batch_size=body.batch_size,
     )
+    await _events.broadcast("replay_triggered", {
+        "project": body.project,
+        "updates": len(updates),
+        "signals": body.signals,
+    })
     return {
         "ok": True,
         "project": body.project,
@@ -1922,6 +1981,13 @@ async def _cortex_auction_loop():
                         task["assigned_to"] = assignment["winner"]["agent_id"]
                         task["assigned_at"] = time.time()
                         _save_task(task)
+                        await _events.broadcast("task_assigned", {
+                            "task_id": task["id"],
+                            "project": project,
+                            "title": task.get("title", "")[:100],
+                            "agent_id": assignment["winner"]["agent_id"],
+                            "winner": assignment,
+                        })
         except Exception:
             pass
         await asyncio.sleep(15)
