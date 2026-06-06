@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from compress import compress
 from context import current_state, write_state, release_state, claim_file
+from cortex import get_engine, CortexEngine
 
 # ── Paths ──────────────────────────────────────────────────────
 
@@ -52,6 +53,13 @@ SESSION_MAX_RECORDS = int(os.environ.get("SESSION_MAX_RECORDS", "5000"))  # tota
 AUTO_ACCEPT_THRESHOLD = int(os.environ.get("AUTO_ACCEPT_THRESHOLD", "3"))
 CLIENTS_DIR = WORKDIR / "clients"
 CLIENTS_CONF = Path(os.environ.get("MEMORIA_CLIENTS_CONF", "/mnt/external-drive/code/memoria/opencode-integration/clients.conf"))
+
+# ── Background task references ────────────────────────────────
+
+_poll_task: asyncio.Task | None = None
+_chitchat_poll_task: asyncio.Task | None = None
+_sleep_cycle_task: asyncio.Task | None = None
+_cortex_task: asyncio.Task | None = None
 
 # ── Shared modules for session extraction ────────────────────
 
@@ -640,12 +648,13 @@ _sleep_cycle_task: asyncio.Task | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_index()
-    global _poll_task, _chitchat_poll_task, _sleep_cycle_task
+    global _poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task
     _poll_task = asyncio.create_task(_poll_loop())
     _chitchat_poll_task = asyncio.create_task(_chitchat_poll_loop())
     _sleep_cycle_task = asyncio.create_task(_sleep_cycle_loop())
+    _cortex_task = asyncio.create_task(_cortex_auction_loop())
     yield
-    for t in (_poll_task, _chitchat_poll_task, _sleep_cycle_task):
+    for t in (_poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task):
         if t:
             t.cancel()
             try:
@@ -1238,6 +1247,7 @@ class RegisterAgent(BaseModel):
     task: str = ""
     files: list[str] = []
     chitchat_name: str = ""
+    capabilities: list[str] = ["general"]
 
 
 class AgentHeartbeat(BaseModel):
@@ -1261,6 +1271,7 @@ async def register_agent(body: RegisterAgent):
         "commit_log": [],
         "chitchat_name": body.chitchat_name,
         "conflicts_warned": conflicts,
+        "capabilities": body.capabilities,
     }
     _save_agent(agent)
     _notify_chitchat(
@@ -1447,6 +1458,149 @@ async def delete_task(task_id: str):
         raise HTTPException(404, "task not found")
     _delete_task(task_id)
     return {"ok": True}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CORTEX — Brain-Inspired Autonomous Task Allocation
+# ═══════════════════════════════════════════════════════════════
+
+
+class CortexBidRequest(BaseModel):
+    agent_id: str = ""
+    project: str = ""
+
+
+class CortexCompleteRequest(BaseModel):
+    agent_id: str
+    task_id: str
+    reward: float = 0.8
+    task_type: str = "generic"
+    complexity: int = 5
+    result: str = "completed"
+
+
+@app.get("/cortex/status")
+async def cortex_status(project: Optional[str] = None):
+    p = project or "unknown"
+    engine = get_engine(p)
+    return {"ok": True, "cortex": engine.get_status()}
+
+
+@app.post("/cortex/bid")
+async def cortex_bid(body: CortexBidRequest):
+    project = body.project or "unknown"
+    engine = get_engine(project)
+    pending = _list_tasks(project, "pending")
+    agents = _list_agents(project)
+    results = []
+    for task in pending:
+        assignment = engine.process_task_assignment(task, agents)
+        if assignment:
+            task["status"] = "assigned"
+            task["assigned_to"] = assignment["winner"]["agent_id"]
+            task["assigned_at"] = time.time()
+            payload = task.get("payload", {}) or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+            payload["cortex_bid"] = assignment
+            task["payload"] = payload
+            _save_task(task)
+            results.append(assignment)
+    return {
+        "ok": True,
+        "project": project,
+        "tasks_scanned": len(pending),
+        "assignments": len(results),
+        "details": results,
+    }
+
+
+@app.post("/cortex/complete")
+async def cortex_complete(body: CortexCompleteRequest):
+    engine = get_engine("_global")
+    t = _load_task(body.task_id)
+    if t is None:
+        raise HTTPException(404, "task not found")
+    project = t.get("project", "unknown")
+    engine = get_engine(project)
+    t["status"] = "completed"
+    t["result"] = body.result[:2000] if body.result else "completed"
+    payload = t.get("payload", {}) or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+    payload["cortex_reward"] = body.reward
+    t["payload"] = payload
+    _save_task(t)
+    rpe = engine.record_outcome(
+        body.task_id, body.agent_id,
+        t.get("title", "?"),
+        body.task_type, body.complexity, body.reward,
+    )
+    return {
+        "ok": True,
+        "task_id": body.task_id,
+        "reward": body.reward,
+        "rpe": round(rpe, 4),
+        "status": "completed",
+    }
+
+
+@app.get("/cortex/learnings")
+async def cortex_learnings(project: Optional[str] = None, n: int = 5):
+    p = project or "unknown"
+    engine = get_engine(p)
+    recent = engine.hippocampus.recent(n)
+    return {
+        "ok": True,
+        "project": p,
+        "total_episodes": len(engine.hippocampus.episodes),
+        "recent": reversed(recent),
+    }
+
+
+@app.get("/cortex/policy")
+async def cortex_policy(project: Optional[str] = None):
+    p = project or "unknown"
+    engine = get_engine(p)
+    policy = {}
+    for state, vals in engine.gating.Q.items():
+        sorted_actions = sorted(vals.items(), key=lambda x: -x[1])
+        policy[state] = {a: round(v, 3) for a, v in sorted_actions}
+    return {
+        "ok": True,
+        "project": p,
+        "epsilon": engine.gating.epsilon,
+        "policy": policy,
+    }
+
+
+async def _cortex_auction_loop():
+    """Background task: scan for pending tasks and run CORTEX auction."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            pending = _list_tasks(None, "pending")
+            projects = set(t.get("project", "unknown") for t in pending)
+            for project in projects:
+                engine = get_engine(project)
+                agents = _list_agents(project)
+                project_tasks = [t for t in pending if t.get("project") == project]
+                for task in project_tasks:
+                    assignment = engine.process_task_assignment(task, agents)
+                    if assignment:
+                        task["status"] = "assigned"
+                        task["assigned_to"] = assignment["winner"]["agent_id"]
+                        task["assigned_at"] = time.time()
+                        _save_task(task)
+        except Exception:
+            pass
+        await asyncio.sleep(15)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1832,106 +1986,1558 @@ DASHBOARD_HTML = """\
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AgentOS Dashboard</title>
+<title>Memoria Dashboard</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }
-  h1 { color: #58a6ff; margin-bottom: 20px; }
-  h2 { color: #8b949e; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; margin: 20px 0 10px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
-  .card h3 { color: #58a6ff; font-size: 14px; margin-bottom: 8px; }
-  .stat { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
-  .stat span:first-child { color: #8b949e; }
-  .tag { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
-  .tag-active { background: #1b3a1b; color: #3fb950; }
-  .tag-idle { background: #3a2e1b; color: #d29922; }
-  .tag-done { background: #1b283a; color: #58a6ff; }
-  .tag-pending { background: #3a1b1b; color: #f85149; }
-  pre { background: #0d1117; border-radius: 4px; padding: 8px; font-size: 12px; overflow-x: auto; margin-top: 8px; }
-  .meta { font-size: 11px; color: #484f58; margin-top: 8px; }
-  .refresh { float: right; color: #58a6ff; text-decoration: none; font-size: 13px; cursor: pointer; }
-  .empty { color: #484f58; font-style: italic; font-size: 13px; padding: 12px; }
-  .error { color: #f85149; }
+:root {
+  --bg-primary: #0d0f14;
+  --bg-surface: #13151c;
+  --bg-elevated: #1a1d27;
+  --bg-hover: #222536;
+  --border: #2a2d3a;
+  --border-light: #353847;
+  --accent: #6c5ce7;
+  --accent-glow: rgba(108, 92, 231, 0.15);
+  --accent-secondary: #00cec9;
+  --success: #00b894;
+  --warning: #fdcb6e;
+  --error: #e17055;
+  --text-primary: #e8e8f0;
+  --text-secondary: #8b8da0;
+  --text-muted: #5a5c6a;
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-xs: 6px;
+  --shadow: 0 4px 24px rgba(0,0,0,0.4);
+  --sidebar-w: 200px;
+  --topbar-h: 52px;
+}
+[data-theme="catppuccin"] {
+  --bg-primary: #1e1e2e; --bg-surface: #252540; --bg-elevated: #2e2e4a;
+  --border: #363654; --accent: #cba6f7; --accent-secondary: #89dceb;
+  --success: #a6e3a1; --warning: #f9e2af; --error: #f38ba8;
+  --text-primary: #cdd6f4; --text-secondary: #a6adc8; --text-muted: #6c7086;
+}
+[data-theme="nord"] {
+  --bg-primary: #2e3440; --bg-surface: #3b4252; --bg-elevated: #434c5e;
+  --border: #4c566a; --accent: #88c0d0; --accent-secondary: #8fbcbb;
+  --success: #a3be8c; --warning: #ebcb8b; --error: #bf616a;
+  --text-primary: #eceff4; --text-secondary: #d8dee9; --text-muted: #7b88a1;
+}
+[data-theme="cyberpunk"] {
+  --bg-primary: #0a0a0f; --bg-surface: #14141f; --bg-elevated: #1c1c30;
+  --border: #2a2a45; --accent: #ff00ff; --accent-secondary: #00ffff;
+  --success: #00ff41; --warning: #ffff00; --error: #ff0040;
+  --text-primary: #e0e0ff; --text-secondary: #8888aa; --text-muted: #555577;
+}
+[data-theme="gruvbox"] {
+  --bg-primary: #1d2021; --bg-surface: #282828; --bg-elevated: #32302f;
+  --border: #3c3836; --accent: #d79921; --accent-secondary: #689d6a;
+  --success: #98971a; --warning: #d79921; --error: #cc241d;
+  --text-primary: #ebdbb2; --text-secondary: #a89984; --text-muted: #7c6f64;
+}
+[data-theme="light"] {
+  --bg-primary: #f5f5f5; --bg-surface: #ffffff; --bg-elevated: #f0f0f0;
+  --border: #ddd; --accent: #6c5ce7; --accent-secondary: #00cec9;
+  --success: #00b894; --warning: #fdcb6e; --error: #e17055;
+  --text-primary: #1a1a2e; --text-secondary: #555; --text-muted: #999;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: var(--font);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  display: flex;
+  flex-direction: column;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Top bar */
+.topbar {
+  height: var(--topbar-h);
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  gap: 16px;
+  flex-shrink: 0;
+  z-index: 10;
+}
+.topbar-logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.topbar-logo .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--success); transition: background 0.3s; }
+.topbar-logo .dot.error { background: var(--error); }
+.topbar-logo .dot.pulse { animation: pulse-dot 1.5s infinite; }
+@keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+.topbar-version { font-size: 11px; color: var(--text-muted); font-weight: 400; }
+.topbar-spacer { flex: 1; }
+.topbar-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.topbar-search input {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  padding: 6px 12px 6px 32px;
+  font-size: 13px;
+  width: 220px;
+  outline: none;
+  font-family: var(--font);
+  transition: border-color 0.2s, width 0.2s;
+}
+.topbar-search input:focus { border-color: var(--accent); width: 280px; }
+.topbar-search input::placeholder { color: var(--text-muted); }
+.topbar-search .icon { position: absolute; left: 10px; color: var(--text-muted); font-size: 14px; pointer-events: none; }
+.topbar-actions { display: flex; gap: 8px; align-items: center; }
+.theme-btn {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  border-radius: var(--radius-xs);
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: var(--font);
+}
+.theme-btn:hover { background: var(--bg-hover); color: var(--text-primary); border-color: var(--accent); }
+.help-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 18px;
+  padding: 4px;
+  border-radius: var(--radius-xs);
+  transition: color 0.15s;
+}
+.help-btn:hover { color: var(--text-primary); }
+
+/* Layout */
+.layout {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* Sidebar */
+.sidebar {
+  width: var(--sidebar-w);
+  background: var(--bg-surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow-y: auto;
+  padding: 12px 0;
+}
+.sidebar-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--text-muted);
+  padding: 16px 16px 8px;
+  font-weight: 600;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 13px;
+  border-left: 3px solid transparent;
+  transition: all 0.12s;
+  user-select: none;
+}
+.nav-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+.nav-item.active { background: var(--accent-glow); color: var(--accent); border-left-color: var(--accent); font-weight: 600; }
+.nav-item .icon { width: 18px; text-align: center; font-size: 14px; flex-shrink: 0; }
+.nav-item .badge {
+  margin-left: auto;
+  background: var(--accent);
+  color: var(--bg-primary);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 10px;
+  line-height: 1.4;
+}
+
+/* Main content */
+.main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+  background: var(--bg-primary);
+}
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+.tab-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  gap: 12px;
+}
+.tab-title { font-size: 18px; font-weight: 700; }
+.tab-actions { display: flex; gap: 8px; align-items: center; }
+
+/* Cards */
+.card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  transition: border-color 0.15s;
+}
+.card:hover { border-color: var(--border-light); }
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  gap: 8px;
+}
+.card-title { font-size: 13px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }
+
+/* Stats grid */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 20px; }
+.stat-card { background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+.stat-card .value { font-size: 28px; font-weight: 700; color: var(--text-primary); line-height: 1.2; }
+.stat-card .label { font-size: 12px; color: var(--text-muted); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+.stat-card .sub { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+.stat-card .accent { color: var(--accent); }
+.stat-card .success { color: var(--success); }
+.stat-card .warning { color: var(--warning); }
+.stat-card .error { color: var(--error); }
+
+/* Progress bars */
+.progress-bar {
+  display: flex;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+  margin-top: 8px;
+}
+.progress-bar .fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.3s;
+}
+.progress-bar .fill.success { background: var(--success); }
+.progress-bar .fill.warning { background: var(--warning); }
+.progress-bar .fill.error { background: var(--error); }
+
+/* Badges */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+.badge-default { background: var(--bg-elevated); color: var(--text-secondary); }
+.badge-accent { background: var(--accent-glow); color: var(--accent); }
+.badge-success { background: rgba(0,184,148,0.12); color: var(--success); }
+.badge-warning { background: rgba(253,203,110,0.12); color: var(--warning); }
+.badge-error { background: rgba(225,112,85,0.12); color: var(--error); }
+.badge-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.badge-dot.active { background: var(--success); }
+.badge-dot.idle { background: var(--warning); }
+.badge-dot.error { background: var(--error); }
+.badge-dot.pending { background: var(--text-muted); }
+
+/* Agent/Task cards list */
+.item-list { display: flex; flex-direction: column; gap: 8px; }
+.item-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.item-card:hover { border-color: var(--accent); background: var(--bg-hover); }
+.item-card .top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.item-card .id { font-family: var(--mono); font-size: 12px; color: var(--text-muted); }
+.item-card .title { font-weight: 600; font-size: 14px; flex: 1; }
+.item-card .meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+.item-card .meta span { display: flex; align-items: center; gap: 4px; }
+.item-card .detail {
+  display: none;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.item-card .detail.open { display: block; }
+.item-card .detail pre {
+  background: var(--bg-elevated);
+  border-radius: var(--radius-xs);
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-x: auto;
+  margin-top: 6px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Memory entries */
+.memory-list { display: flex; flex-direction: column; gap: 6px; }
+.memory-entry {
+  display: flex;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.memory-entry:last-child { border-bottom: none; }
+.memory-rail { width: 3px; border-radius: 2px; flex-shrink: 0; background: var(--accent); opacity: 0.4; }
+
+/* Chat */
+.chat-layout { display: flex; gap: 16px; height: calc(100vh - var(--topbar-h) - 80px); }
+.chat-rooms {
+  width: 200px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chat-room {
+  padding: 8px 12px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  transition: background 0.12s;
+}
+.chat-room:hover { background: var(--bg-hover); color: var(--text-primary); }
+.chat-room.active { background: var(--accent-glow); color: var(--accent); font-weight: 600; }
+.chat-room .count { font-size: 11px; color: var(--text-muted); background: var(--bg-elevated); padding: 1px 6px; border-radius: 8px; }
+.chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 10px;
+}
+.msg {
+  padding: 6px 10px;
+  border-radius: var(--radius-xs);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.msg .from { font-weight: 600; font-size: 12px; margin-bottom: 2px; }
+.msg .from.agent-os { color: var(--error); }
+.msg .from.mini, .msg .from.mini-participant { color: var(--accent-secondary); }
+.msg .from.notebookLM { color: var(--warning); }
+.msg .ts { font-size: 10px; color: var(--text-muted); float: right; margin-left: 8px; }
+.msg.system { background: var(--bg-elevated); border-left: 3px solid var(--text-muted); }
+.msg.system .from { color: var(--text-muted); }
+.chat-input-row {
+  display: flex;
+  gap: 8px;
+}
+.chat-input-row input {
+  flex: 1;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  padding: 8px 12px;
+  font-size: 13px;
+  outline: none;
+  font-family: var(--font);
+}
+.chat-input-row input:focus { border-color: var(--accent); }
+.chat-input-row button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 8px 18px;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+  font-family: var(--font);
+}
+.chat-input-row button:hover { opacity: 0.85; }
+
+/* Settings */
+.settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.setting-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--bg-elevated);
+  border-radius: var(--radius-xs);
+  gap: 12px;
+}
+.setting-row .label { font-size: 12px; color: var(--text-secondary); flex-shrink: 0; }
+.setting-row input {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: var(--mono);
+  width: 120px;
+  text-align: right;
+  outline: none;
+}
+.setting-row input:focus { border-color: var(--accent); }
+
+/* Safety */
+.safety-list { display: flex; flex-direction: column; gap: 8px; }
+.snapshot-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+}
+.snapshot-card .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.snapshot-card .hash { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+.snapshot-card .msg { font-size: 13px; }
+.snapshot-card .ts { font-size: 11px; color: var(--text-muted); }
+
+/* Proposal cards */
+.proposal-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+  margin-bottom: 6px;
+}
+.proposal-card .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; gap: 8px; }
+.proposal-card .id { font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
+.proposal-card .topic { font-weight: 600; }
+.proposal-card .src { font-size: 11px; color: var(--text-muted); }
+.proposal-card .text { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: var(--radius-xs);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: all 0.12s;
+  white-space: nowrap;
+}
+.btn:hover { background: var(--bg-hover); border-color: var(--accent); }
+.btn-accent { background: var(--accent); color: #fff; border-color: var(--accent); }
+.btn-accent:hover { opacity: 0.85; }
+.btn-success { background: var(--success); color: #fff; border-color: var(--success); }
+.btn-warning { background: var(--warning); color: #1a1a2e; border-color: var(--warning); }
+.btn-error { background: var(--error); color: #fff; border-color: var(--error); }
+.btn-sm { padding: 4px 10px; font-size: 11px; }
+
+/* Filter buttons group */
+.filter-group { display: flex; gap: 4px; }
+.filter-btn {
+  padding: 4px 12px;
+  border-radius: var(--radius-xs);
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.12s;
+  font-family: var(--font);
+}
+.filter-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.filter-btn.active { background: var(--accent-glow); color: var(--accent); border-color: var(--accent); }
+
+/* Project selector */
+.project-select {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--text-primary);
+  padding: 6px 10px;
+  font-size: 13px;
+  outline: none;
+  cursor: pointer;
+  font-family: var(--font);
+}
+.project-select:focus { border-color: var(--accent); }
+
+/* Toast */
+.toast-container {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 16px;
+  font-size: 13px;
+  color: var(--text-primary);
+  pointer-events: auto;
+  animation: slide-in 0.2s ease-out;
+  box-shadow: var(--shadow);
+  max-width: 360px;
+}
+.toast.error { border-left: 3px solid var(--error); }
+.toast.success { border-left: 3px solid var(--success); }
+@keyframes slide-in { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+/* Help modal */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 500;
+  align-items: center;
+  justify-content: center;
+}
+.modal-overlay.open { display: flex; }
+.modal {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  max-width: 480px;
+  width: 90%;
+  box-shadow: var(--shadow);
+}
+.modal h2 { font-size: 18px; margin-bottom: 16px; }
+.modal kbd {
+  display: inline-block;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 7px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-primary);
+  margin: 0 2px;
+}
+.modal .shortcut { display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; color: var(--text-secondary); }
+.modal .shortcut .key { color: var(--text-primary); }
+.modal-close {
+  float: right;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 20px;
+  padding: 0 4px;
+}
+.modal-close:hover { color: var(--text-primary); }
+
+/* Search results overlay */
+.search-overlay {
+  display: none;
+  position: fixed;
+  top: var(--topbar-h);
+  right: 20px;
+  width: 480px;
+  max-height: 400px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  z-index: 100;
+  overflow-y: auto;
+  padding: 12px;
+}
+.search-overlay.open { display: block; }
+.search-result {
+  padding: 8px 10px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  font-size: 13px;
+}
+.search-result:hover { background: var(--bg-hover); }
+.search-result .title { font-weight: 600; margin-bottom: 2px; }
+.search-result .summary { font-size: 12px; color: var(--text-secondary); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.search-result .tags { display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
+.search-result .tags span { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: var(--bg-elevated); color: var(--text-muted); }
+
+/* Empty state */
+.empty-state {
+  padding: 32px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+.empty-state .icon { font-size: 28px; margin-bottom: 8px; display: block; }
+
+/* Utility */
+.flex { display: flex; }
+.gap-2 { gap: 8px; }
+.gap-4 { gap: 16px; }
+.items-center { align-items: center; }
+.mt-2 { margin-top: 8px; }
+.mt-4 { margin-top: 16px; }
+.mb-2 { margin-bottom: 8px; }
+.mb-4 { margin-bottom: 16px; }
+.text-muted { color: var(--text-muted); }
+.text-secondary { color: var(--text-secondary); }
+.text-sm { font-size: 12px; }
+.w-full { width: 100%; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-light); }
+
+/* Responsive */
+@media (max-width: 768px) {
+  .sidebar { display: none; }
+  .sidebar.open { display: flex; position: fixed; inset: var(--topbar-h) auto 0 0; z-index: 50; width: 240px; }
+  .hamburger { display: flex !important; }
+  .main { padding: 16px; }
+  .stats-grid { grid-template-columns: 1fr 1fr; }
+  .chat-layout { flex-direction: column; }
+  .chat-rooms { width: 100%; flex-direction: row; overflow-x: auto; }
+  .settings-grid { grid-template-columns: 1fr; }
+  .search-overlay { width: calc(100% - 40px); right: 20px; }
+}
+.hamburger { display: none; background: none; border: none; color: var(--text-primary); font-size: 20px; cursor: pointer; padding: 4px; }
 </style>
 </head>
 <body>
-<h1>AgentOS <span style="font-size:14px;color:#8b949e;font-weight:400">orchestration dashboard</span>
-<a class="refresh" href="/" onclick="setTimeout(()=>location.reload(),200)">&#x21bb; refresh</a></h1>
-<div class="grid" id="health"></div>
-<h2>Active Agents</h2>
-<div id="agents"></div>
-<h2>Recent Tasks</h2>
-<div id="tasks"></div>
-<h2>Snapshots</h2>
-<div id="snapshots"></div>
-<script>
-async function load() {
-  try {
-    const [health, agents, tasks] = await Promise.all([
-      fetch('/health').then(r=>r.json()),
-      fetch('/agents').then(r=>r.json()),
-      fetch('/tasks').then(r=>r.json()),
-    ]);
-    document.getElementById('health').innerHTML = `
-      <div class="card"><h3>Server</h3>
-        <div class="stat"><span>Version</span><span>${health.memoria_version}</span></div>
-        <div class="stat"><span>Sessions Indexed</span><span>${health.sessions_indexed}</span></div>
-        <div class="stat"><span>DB Present</span><span>${health.db_exists ? '✓' : '✗'}</span></div>
-        <div class="stat"><span>Topics</span><span>${(health.topics||[]).join(', ') || 'none'}</span></div>
+
+<!-- Top Bar -->
+<div class="topbar">
+  <button class="hamburger" onclick="toggleSidebar()">☰</button>
+  <div class="topbar-logo">
+    <span class="dot" id="connDot"></span>
+    Memoria
+    <span class="topbar-version" id="versionLabel">v2.0.0</span>
+  </div>
+  <div class="topbar-spacer"></div>
+  <div class="topbar-search">
+    <span class="icon">🔍</span>
+    <input type="text" id="searchInput" placeholder="Search recall..." onkeydown="if(event.key==='Enter')doSearch()" onblur="setTimeout(()=>document.getElementById('searchOverlay').classList.remove('open'),200)">
+  </div>
+  <div class="topbar-actions">
+    <select class="theme-btn" id="themeSelect" onchange="setTheme(this.value)">
+      <option value="default">🌙 Memory</option>
+      <option value="catppuccin">🌺 Catppuccin</option>
+      <option value="nord">❄️ Nord</option>
+      <option value="cyberpunk">💿 Cyberpunk</option>
+      <option value="gruvbox">🪵 Gruvbox</option>
+      <option value="light">☀️ Light</option>
+    </select>
+    <button class="help-btn" onclick="toggleHelp()">?</button>
+  </div>
+</div>
+
+<div class="layout">
+  <!-- Sidebar -->
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-label">Dashboard</div>
+    <div class="nav-item active" data-tab="0" onclick="switchTab(0)"><span class="icon">◉</span> Overview</div>
+    <div class="nav-item" data-tab="1" onclick="switchTab(1)"><span class="icon">●</span> Agents <span class="badge" id="agentBadge">0</span></div>
+    <div class="nav-item" data-tab="2" onclick="switchTab(2)"><span class="icon">☰</span> Tasks <span class="badge" id="taskBadge">0</span></div>
+    <div class="nav-item" data-tab="3" onclick="switchTab(3)"><span class="icon">◈</span> Memory <span class="badge" id="memoryBadge">0</span></div>
+    <div class="nav-item" data-tab="4" onclick="switchTab(4)"><span class="icon">◎</span> Recall</div>
+    <div class="nav-item" data-tab="5" onclick="switchTab(5)"><span class="icon">💬</span> Chat <span class="badge" id="chatBadge">0</span></div>
+    <div class="nav-item" data-tab="6" onclick="switchTab(6)"><span class="icon">🛡</span> Safety</div>
+    <div class="nav-item" data-tab="7" onclick="switchTab(7)"><span class="icon">⚙</span> Settings</div>
+  </div>
+
+  <!-- Main Content -->
+  <div class="main" id="mainContent">
+    <!-- Tab 0: Overview -->
+    <div class="tab-content active" id="tab0">
+      <div class="tab-header"><div class="tab-title">Overview</div><div class="tab-actions"><span class="text-sm text-muted" id="overviewTs"></span></div></div>
+      <div class="stats-grid" id="overviewStats"></div>
+      <div class="card mb-4"><div class="card-title">Agents</div><div id="overviewAgents"></div></div>
+      <div class="card mb-4"><div class="card-title">Recent Tasks</div><div id="overviewTasks"></div></div>
+      <div class="card"><div class="card-title">Chitchat Rooms</div><div id="overviewRooms"></div></div>
+    </div>
+
+    <!-- Tab 1: Agents -->
+    <div class="tab-content" id="tab1">
+      <div class="tab-header">
+        <div class="tab-title">Agents</div>
+        <div class="tab-actions">
+          <div class="filter-group" id="agentFilters">
+            <button class="filter-btn active" data-filter="all" onclick="setAgentFilter('all')">All</button>
+            <button class="filter-btn" data-filter="active" onclick="setAgentFilter('active')">Active</button>
+            <button class="filter-btn" data-filter="idle" onclick="setAgentFilter('idle')">Idle</button>
+            <button class="filter-btn" data-filter="error" onclick="setAgentFilter('error')">Error</button>
+          </div>
+        </div>
       </div>
-      <div class="card"><h3>Agent Activity</h3>
-        <div class="stat"><span>Active Agents</span><span>${agents.count}</span></div>
-        <div class="stat"><span>Total Tasks</span><span>${tasks.count}</span></div>
-      </div>`;
-    const agentsEl = document.getElementById('agents');
-    agentsEl.innerHTML = (agents.agents || []).length
-      ? (agents.agents || []).map(a => `
-        <div class="card">
-          <div class="stat"><span>${a.id.slice(0,16)}...</span><span class="tag tag-${a.status}">${a.status}</span></div>
-          <div class="stat"><span>Project</span><span>${htmlEscape(a.project)}</span></div>
-          <div class="stat"><span>Task</span><span>${htmlEscape((a.task||'').slice(0,100))}</span></div>
-          <div class="stat"><span>Files</span><span>${(a.files||[]).length}</span></div>
-          <div class="stat"><span>Commits</span><span>${(a.commit_log||[]).length}</span></div>
-          <div class="meta">started ${new Date(a.started_at*1000).toLocaleString()}</div>
-          ${a.conflicts_warned && a.conflicts_warned.length
-            ? '<div class="error">⚠ ' + htmlEscape(a.conflicts_warned.join('; ')) + '</div>'
-            : ''}
-        </div>`).join('')
-      : '<div class="empty">No active agents</div>';
-    const tasksEl = document.getElementById('tasks');
-    tasksEl.innerHTML = (tasks.tasks || []).length
-      ? (tasks.tasks || []).slice(-10).reverse().map(t => `
-        <div class="card">
-          <div class="stat"><span>${htmlEscape(t.title)}</span><span class="tag tag-${t.status == 'pending' ? 'pending' : t.status == 'done' || t.status == 'completed' ? 'done' : 'active'}">${t.status}</span></div>
-          <div class="stat"><span>Project</span><span>${htmlEscape(t.project)}</span></div>
-          <div class="stat"><span>Assigned</span><span>${t.assigned_to || 'unassigned'}</span></div>
-          ${t.result ? '<pre>' + htmlEscape(t.result.slice(0,200)) + '</pre>' : ''}
-          ${t.error ? '<pre class="error">' + htmlEscape(t.error.slice(0,200)) + '</pre>' : ''}
-          <div class="meta">${new Date(t.created_at*1000).toLocaleString()}${t.rollback_commit ? ' | rollback: ' + t.rollback_commit.slice(0,12) : ''}</div>
-        </div>`).join('')
-      : '<div class="empty">No tasks</div>';
-    // Try to load snapshots
-    try {
-      const snaps = await fetch('/safety/' + ((health.topics||[])[0] || 'general') + '/snapshots').then(r=>r.json());
-      document.getElementById('snapshots').innerHTML = snaps.count
-        ? '<div class="card">' + snaps.snapshots.slice(0,10).map(s => `
-          <div class="stat"><span>${s.commit_hash.slice(0,12)}</span><span>${s.message.slice(0,60)}</span></div>
-          <div class="meta">${new Date(s.created_at*1000).toLocaleString()}${s.agent_id ? ' | by ' + s.agent_id.slice(0,16) : ''}</div>
-        `).join('') + '</div>'
-        : '<div class="empty">No snapshots yet</div>';
-    } catch(e) {
-      document.getElementById('snapshots').innerHTML = '<div class="empty">Snapshots not available for this project</div>';
+      <div class="item-list" id="agentList"></div>
+    </div>
+
+    <!-- Tab 2: Tasks -->
+    <div class="tab-content" id="tab2">
+      <div class="tab-header">
+        <div class="tab-title">Tasks</div>
+        <div class="tab-actions">
+          <div class="filter-group" id="taskFilters">
+            <button class="filter-btn active" data-filter="all" onclick="setTaskFilter('all')">All</button>
+            <button class="filter-btn" data-filter="pending" onclick="setTaskFilter('pending')">Pending</button>
+            <button class="filter-btn" data-filter="running" onclick="setTaskFilter('running')">Running</button>
+            <button class="filter-btn" data-filter="completed" onclick="setTaskFilter('completed')">Done</button>
+            <button class="filter-btn" data-filter="failed" onclick="setTaskFilter('failed')">Failed</button>
+          </div>
+        </div>
+      </div>
+      <div class="item-list" id="taskList"></div>
+    </div>
+
+    <!-- Tab 3: Memory -->
+    <div class="tab-content" id="tab3">
+      <div class="tab-header">
+        <div class="tab-title">Memory</div>
+        <div class="tab-actions flex gap-2 items-center">
+          <select class="project-select" id="memoryProject" onchange="loadMemory()"></select>
+          <button class="btn btn-sm" onclick="document.getElementById('memoryInput').style.display=document.getElementById('memoryInput').style.display==='none'?'flex':'none'">+ Add</button>
+        </div>
+      </div>
+      <div id="memoryInput" style="display:none;gap:8px;margin-bottom:16px;" class="flex">
+        <input type="text" id="memoryText" placeholder="Enter a fact to remember..." style="flex:1;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius-xs);color:var(--text-primary);padding:8px 12px;font-size:13px;outline:none;font-family:var(--font);">
+        <button class="btn btn-accent btn-sm" onclick="addMemory()">Save</button>
+      </div>
+      <div class="memory-list" id="memoryList"></div>
+    </div>
+
+    <!-- Tab 4: Recall -->
+    <div class="tab-content" id="tab4">
+      <div class="tab-header">
+        <div class="tab-title">Recall</div>
+        <div class="tab-actions flex gap-2 items-center">
+          <input type="text" id="recallInput" placeholder="Search memory..." style="background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius-xs);color:var(--text-primary);padding:6px 12px;font-size:13px;outline:none;width:250px;font-family:var(--font);" onkeydown="if(event.key==='Enter')doRecall()">
+          <button class="btn btn-accent btn-sm" onclick="doRecall()">Search</button>
+        </div>
+      </div>
+      <div id="recallResults"></div>
+    </div>
+
+    <!-- Tab 5: Chat -->
+    <div class="tab-content" id="tab5">
+      <div class="tab-header"><div class="tab-title">Chitchat</div></div>
+      <div class="chat-layout">
+        <div class="chat-rooms" id="chatRoomList"></div>
+        <div class="chat-main">
+          <div class="chat-messages" id="chatMessages"></div>
+          <div class="chat-input-row">
+            <input type="text" id="chatInput" placeholder="Type a message..." onkeydown="if(event.key==='Enter')sendChat()">
+            <button onclick="sendChat()">Send</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tab 6: Safety -->
+    <div class="tab-content" id="tab6">
+      <div class="tab-header">
+        <div class="tab-title">Safety</div>
+        <div class="tab-actions flex gap-2 items-center">
+          <select class="project-select" id="safetyProject" onchange="loadSafety()"></select>
+          <button class="btn btn-accent btn-sm" onclick="createSnapshot()">📸 Snapshot</button>
+        </div>
+      </div>
+      <div id="safetyContent"></div>
+    </div>
+
+    <!-- Tab 7: Settings -->
+    <div class="tab-content" id="tab7">
+      <div class="tab-header">
+        <div class="tab-title">Settings</div>
+        <div class="tab-actions">
+          <button class="btn btn-accent btn-sm" onclick="saveConfig()">💾 Save</button>
+        </div>
+      </div>
+      <div class="settings-grid" id="configGrid"></div>
+      <div class="card mt-4">
+        <div class="card-title">Actions</div>
+        <div class="flex gap-2 mt-2">
+          <button class="btn btn-warning btn-sm" onclick="consolidateChat()">🔄 Consolidate</button>
+          <button class="btn btn-error btn-sm" onclick="clearProposals()">🗑 Clear Proposals</button>
+        </div>
+      </div>
+      <div class="card mt-4">
+        <div class="card-title">Proposals</div>
+        <div id="proposalsList"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Search Overlay -->
+<div class="search-overlay" id="searchOverlay"></div>
+
+<!-- Help Modal -->
+<div class="modal-overlay" id="helpModal">
+  <div class="modal">
+    <button class="modal-close" onclick="toggleHelp()">×</button>
+    <h2>Keyboard Shortcuts</h2>
+    <div class="shortcut"><span>Switch tab</span><span class="key"><kbd>1</kbd>–<kbd>8</kbd></span></div>
+    <div class="shortcut"><span>Search recall</span><span class="key"><kbd>/</kbd></span></div>
+    <div class="shortcut"><span>Close modal / blur</span><span class="key"><kbd>Esc</kbd></span></div>
+    <div class="shortcut"><span>Toggle help</span><span class="key"><kbd>?</kbd></span></div>
+    <div class="shortcut"><span>Select next nav</span><span class="key"><kbd>↓</kbd> <kbd>↑</kbd></span></div>
+    <div class="shortcut"><span>Expand detail</span><span class="key"><kbd>Enter</kbd> on card</span></div>
+  </div>
+</div>
+
+<!-- Toast Container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+// -- State --
+const BASE = '';
+const state = {
+  theme: localStorage.getItem('memoria-theme') || 'default',
+  tab: 0,
+  chatRooms: [],
+  chatRoom: 'general',
+  projects: [],
+  agentFilter: 'all',
+  taskFilter: 'all',
+  config: {},
+  proposals: []
+};
+
+// -- Theme --
+function setTheme(name) {
+  state.theme = name;
+  document.documentElement.setAttribute('data-theme', name === 'default' ? '' : name);
+  localStorage.setItem('memoria-theme', name);
+  document.getElementById('themeSelect').value = name;
+}
+(function() {
+  const t = localStorage.getItem('memoria-theme') || 'default';
+  if (t !== 'default') document.documentElement.setAttribute('data-theme', t);
+  document.getElementById('themeSelect').value = t;
+})();
+
+// -- Sidebar --
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('open');
+}
+
+// -- Tab Switching --
+function switchTab(n) {
+  state.tab = n;
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab' + n).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  document.querySelector('.nav-item[data-tab="' + n + '"]')?.classList.add('active');
+  document.getElementById('sidebar').classList.remove('open');
+  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, null, null, loadSafety, loadSettings];
+  if (loaders[n]) loaders[n]();
+}
+
+// -- Help Modal --
+function toggleHelp() {
+  document.getElementById('helpModal').classList.toggle('open');
+}
+
+// -- Toast --
+function toast(msg, type) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (type ? ' ' + type : '');
+  el.textContent = msg;
+  document.getElementById('toastContainer').appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity 0.3s'; setTimeout(() => el.remove(), 300); }, 3000);
+}
+
+// -- HTML Escape --
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+
+// -- Time Helpers --
+function fmtTime(ts) {
+  if (!ts) return '';
+  const d = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts);
+  return d.toLocaleString();
+}
+function ago(ts) {
+  if (!ts) return '';
+  const sec = Math.floor((Date.now() - (typeof ts === 'number' ? ts * 1000 : new Date(ts).getTime())) / 1000);
+  if (sec < 5) return 'just now';
+  if (sec < 60) return sec + 's ago';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm ago';
+  if (sec < 86400) return Math.floor(sec / 3600) + 'h ago';
+  return Math.floor(sec / 86400) + 'd ago';
+}
+
+// -- Fetch Wrapper --
+async function api(path) {
+  const r = await fetch(BASE + path);
+  if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+  return r.json();
+}
+
+// -- Progress Bar --
+function renderBar(pct, cls) {
+  const c = Math.min(100, Math.max(0, pct));
+  return '<div class="progress-bar"><div class="fill' + (cls ? ' ' + cls : '') + '" style="width:' + c + '%"></div></div>';
+}
+
+// -- Status Dot --
+function dot(status) {
+  return '<span class="badge-dot ' + (status || 'pending') + '"></span>';
+}
+
+// -- Badge --
+function tag(text, cls) {
+  return '<span class="badge badge-' + (cls || 'default') + '">' + esc(text) + '</span>';
+}
+
+// -- Keyboard Shortcuts --
+document.addEventListener('keydown', function(e) {
+  if (e.key >= '1' && e.key <= '8' && !e.ctrlKey && !e.metaKey) {
+    switchTab(parseInt(e.key) - 1);
+    return;
+  }
+  if (e.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
+    e.preventDefault();
+    document.getElementById('searchInput').focus();
+    return;
+  }
+  if (e.key === '?' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) {
+    toggleHelp();
+    return;
+  }
+  if (e.key === 'Escape') {
+    document.getElementById('helpModal').classList.remove('open');
+    document.getElementById('searchOverlay').classList.remove('open');
+    document.activeElement?.blur();
+  }
+});
+
+// -- Search --
+async function doSearch() {
+  const q = document.getElementById('searchInput').value.trim();
+  if (!q) return;
+  try {
+    const data = await api('/recall?q=' + encodeURIComponent(q));
+    const el = document.getElementById('searchOverlay');
+    const results = data.results || [];
+    if (!results.length) {
+      el.innerHTML = '<div class="empty-state">No results for "' + esc(q) + '"</div>';
+    } else {
+      el.innerHTML = results.map(r => '<div class="search-result" onclick="switchTab(0);document.getElementById(\'searchOverlay\').classList.remove(\'open\')">' +
+        '<div class="title">' + esc(r.title || r.id || 'Result') + '</div>' +
+        '<div class="summary">' + esc(r.summary || r.text || '').slice(0, 200) + '</div>' +
+        '<div class="tags">' +
+          (r.project ? '<span>' + esc(r.project) + '</span>' : '') +
+          (r.room ? '<span>' + esc(r.room) + '</span>' : '') +
+          (r.source ? '<span>' + esc(r.source).slice(0, 20) + '</span>' : '') +
+        '</div></div>').join('');
     }
+    el.classList.add('open');
   } catch(e) {
-    document.body.innerHTML = '<div class="error">Failed to load dashboard: ' + e.message + '</div>';
+    toast('Search failed: ' + e.message, 'error');
   }
 }
-function htmlEscape(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
-load();
+
+// -- Connection Indicator --
+let connOk = true;
+function setConn(ok) {
+  const dot = el('connDot');
+  if (ok) {
+    dot.className = 'dot';
+    connOk = true;
+  } else {
+    dot.className = 'dot error pulse';
+    connOk = false;
+  }
+}
+
+// ============================================
+// TAB 0: OVERVIEW
+// ============================================
+async function loadOverview() {
+  try {
+    const [health, agents, tasks, rooms] = await Promise.all([
+      api('/health'),
+      api('/agents'),
+      api('/tasks'),
+      api('/chitchat/rooms').catch(() => ({ rooms: [] }))
+    ]);
+    el('overviewTs').textContent = 'updated ' + ago(Date.now());
+
+    const agentCount = agents.agents ? agents.agents.length : 0;
+    const taskTotal = tasks.tasks ? tasks.tasks.length : 0;
+    const taskDone = tasks.tasks ? tasks.tasks.filter(t => t.status === 'completed' || t.status === 'done').length : 0;
+    const roomCount = rooms.rooms ? rooms.rooms.length : 0;
+    const memCount = health.sessions_indexed || 0;
+
+    el('overviewStats').innerHTML =
+      '<div class="stat-card"><div class="value accent">' + agentCount + '</div><div class="label">Agents</div><div class="sub">' + dot('active') + ' active</div></div>' +
+      '<div class="stat-card"><div class="value">' + taskTotal + '</div><div class="label">Tasks</div><div class="sub success">' + taskDone + ' done</div>' + renderBar(taskTotal ? (taskDone / taskTotal * 100) : 0, 'success') + '</div>' +
+      '<div class="stat-card"><div class="value success">' + memCount + '</div><div class="label">Sessions</div><div class="sub"><span class="success">&check;</span> DB ready</div></div>' +
+      '<div class="stat-card"><div class="value warning">' + roomCount + '</div><div class="label">Rooms</div><div class="sub">' + (health.memoria_version || '') + '</div></div>';
+
+    const agentsEl = el('overviewAgents');
+    if (agentCount === 0) {
+      agentsEl.innerHTML = '<div class="empty-state">No agents running</div>';
+    } else {
+      agentsEl.innerHTML = agents.agents.map(a => '<div class="item-card">' +
+        '<div class="top">' + dot(a.status) + '<span class="id">' + esc(a.id).slice(0, 20) + '</span>' + tag(a.project, 'accent') + tag(a.status, a.status === 'active' ? 'success' : a.status === 'idle' ? 'warning' : 'error') + '</div>' +
+        '<div class="meta"><span>&#128193; ' + (a.files || []).length + ' files</span><span>&#10084;&#65039; ' + ago(a.last_heartbeat) + '</span></div>' +
+        '</div>').join('');
+    }
+
+    const tasksEl = el('overviewTasks');
+    if (taskTotal === 0) {
+      tasksEl.innerHTML = '<div class="empty-state">No tasks</div>';
+    } else {
+      const recent = tasks.tasks.slice(-5).reverse();
+      tasksEl.innerHTML = recent.map(t => '<div class="item-card">' +
+        '<div class="top">' + dot(t.status === 'completed' || t.status === 'done' ? 'active' : t.status === 'running' ? 'active' : t.status === 'failed' ? 'error' : 'pending') +
+        '<span class="title">' + esc(t.title).slice(0, 60) + '</span>' + tag(t.status, t.status === 'completed' || t.status === 'done' ? 'success' : t.status === 'running' ? 'accent' : t.status === 'failed' ? 'error' : 'warning') + '</div>' +
+        '<div class="meta"><span>&#128230; ' + esc(t.project) + '</span><span>' + ago(t.created_at) + '</span></div>' +
+        '</div>').join('');
+    }
+
+    const roomsEl = el('overviewRooms');
+    if (roomCount === 0) {
+      roomsEl.innerHTML = '<div class="empty-state">No rooms</div>';
+    } else {
+      roomsEl.innerHTML = '<div class="flex gap-2" style="flex-wrap:wrap">' +
+        rooms.rooms.map(r => '<span class="badge badge-accent"># ' + esc(r.room) + ' <span class="text-muted">(' + r.messages + ')</span></span>').join('') +
+        '</div>';
+    }
+
+    setConn(true);
+    el('agentBadge').textContent = agentCount;
+    el('taskBadge').textContent = taskTotal;
+    el('chatBadge').textContent = roomCount;
+  } catch(e) {
+    setConn(false);
+    el('overviewStats').innerHTML = '<div class="stat-card"><div class="value error">!</div><div class="label">Connection Error</div><div class="sub">' + esc(e.message) + '</div></div>';
+  }
+}
+
+// ============================================
+// TAB 1: AGENTS
+// ============================================
+let agentsData = [];
+
+async function loadAgents() {
+  try {
+    agentsData = (await api('/agents')).agents || [];
+    renderAgents();
+    setConn(true);
+  } catch(e) {
+    setConn(false);
+    el('agentList').innerHTML = '<div class="empty-state error">Failed to load agents: ' + esc(e.message) + '</div>';
+  }
+}
+
+function setAgentFilter(f) {
+  state.agentFilter = f;
+  document.querySelectorAll('#agentFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
+  renderAgents();
+}
+
+function renderAgents() {
+  const list = state.agentFilter === 'all' ? agentsData : agentsData.filter(a => a.status === state.agentFilter);
+  const container = el('agentList');
+  if (!list.length) {
+    container.innerHTML = '<div class="empty-state"><span class="icon">&#9679;</span>No ' + (state.agentFilter === 'all' ? '' : state.agentFilter + ' ') + 'agents</div>';
+    return;
+  }
+  container.innerHTML = list.map(a => '<div class="item-card" onclick="toggleDetail(this)">' +
+    '<div class="top">' + dot(a.status) + '<span class="id">' + esc(a.id) + '</span>' + tag(a.project, 'accent') + tag(a.status, a.status === 'active' ? 'success' : a.status === 'idle' ? 'warning' : 'error') + '</div>' +
+    '<div class="title">' + esc(a.task || (a.chitchat_name || '')) + '</div>' +
+    '<div class="meta">' +
+      '<span>&#128193; ' + (a.files || []).length + ' files</span>' +
+      '<span>&#128190; ' + (a.commit_log || []).length + ' commits</span>' +
+      '<span>&#10084;&#65039; ' + ago(a.last_heartbeat) + '</span>' +
+      '<span>&#9654; ' + ago(a.started_at) + '</span>' +
+    '</div>' +
+    '<div class="detail">' +
+      '<div><strong>PID:</strong> ' + (a.pid || '-') + '</div>' +
+      '<div><strong>Chitchat:</strong> ' + esc(a.chitchat_name || '-') + '</div>' +
+      '<div><strong>Started:</strong> ' + fmtTime(a.started_at) + '</div>' +
+      '<div><strong>Heartbeat:</strong> ' + fmtTime(a.last_heartbeat) + '</div>' +
+      (a.conflicts_warned && a.conflicts_warned.length ? '<div class="mt-2"><strong>&#9888; Conflicts:</strong> ' + esc(a.conflicts_warned.join('; ')) + '</div>' : '') +
+      (a.commit_log && a.commit_log.length ? '<div class="mt-2"><strong>Recent Commits:</strong></div><pre>' + esc(a.commit_log.slice(-5).join(String.fromCharCode(10))) + '</pre>' : '') +
+    '</div>' +
+    '</div>').join('');
+}
+
+// ============================================
+// TAB 2: TASKS
+// ============================================
+let tasksData = [];
+
+async function loadTasks() {
+  try {
+    tasksData = (await api('/tasks')).tasks || [];
+    renderTasks();
+    setConn(true);
+  } catch(e) {
+    setConn(false);
+    el('taskList').innerHTML = '<div class="empty-state error">Failed to load tasks: ' + esc(e.message) + '</div>';
+  }
+}
+
+function setTaskFilter(f) {
+  state.taskFilter = f;
+  document.querySelectorAll('#taskFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
+  renderTasks();
+}
+
+function renderTasks() {
+  let list = tasksData;
+  if (state.taskFilter !== 'all') {
+    list = list.filter(t => t.status === state.taskFilter || (state.taskFilter === 'completed' && (t.status === 'done' || t.status === 'completed')));
+  }
+  const container = el('taskList');
+  if (!list.length) {
+    container.innerHTML = '<div class="empty-state"><span class="icon">&#9776;</span>No tasks</div>';
+    return;
+  }
+  const order = { running: 0, pending: 1, active: 0, completed: 2, done: 2, failed: 3 };
+  list.sort((a, b) => (order[a.status] || 9) - (order[b.status] || 9));
+
+  container.innerHTML = list.map(t => {
+    const s = t.status === 'completed' || t.status === 'done' ? 'active' : t.status === 'failed' ? 'error' : t.status === 'running' ? 'active' : 'pending';
+    return '<div class="item-card" onclick="toggleDetail(this)">' +
+      '<div class="top">' + dot(s) + '<span class="title">' + esc(t.title) + '</span>' + tag(t.status, t.status === 'completed' || t.status === 'done' ? 'success' : t.status === 'running' ? 'accent' : t.status === 'failed' ? 'error' : 'warning') + '</div>' +
+      '<div class="meta">' +
+        '<span>&#128230; ' + esc(t.project) + '</span>' +
+        (t.assigned_to ? '<span>&#128100; ' + esc(t.assigned_to).slice(0, 20) + '</span>' : '') +
+        '<span>&#128197; ' + ago(t.created_at) + '</span>' +
+      '</div>' +
+      '<div class="detail">' +
+        '<div><strong>ID:</strong> ' + esc(t.id) + '</div>' +
+        (t.description ? '<div class="mt-2"><strong>Description:</strong><pre>' + esc(t.description) + '</pre></div>' : '') +
+        (t.result ? '<div class="mt-2"><strong>Result:</strong><pre>' + esc(t.result).slice(0, 500) + '</pre></div>' : '') +
+        (t.error ? '<div class="mt-2"><strong style="color:var(--error)">Error:</strong><pre style="color:var(--error)">' + esc(t.error).slice(0, 500) + '</pre></div>' : '') +
+        (t.rollback_commit ? '<div class="mt-2"><strong>Rollback:</strong> ' + esc(t.rollback_commit).slice(0, 16) + '</div>' : '') +
+        '<div class="mt-2"><strong>Created:</strong> ' + fmtTime(t.created_at) + '</div>' +
+        (t.assigned_at ? '<div><strong>Assigned:</strong> ' + fmtTime(t.assigned_at) + '</div>' : '') +
+      '</div>' +
+      '</div>';
+  }).join('');
+}
+
+// -- Toggle Detail --
+function toggleDetail(el) {
+  const d = el.querySelector('.detail');
+  if (d) d.classList.toggle('open');
+}
+
+// ============================================
+// TAB 3: MEMORY
+// ============================================
+async function loadMemory() {
+  try {
+    const projects = await getProjects();
+    const sel = el('memoryProject');
+    const current = sel.value || projects[0] || 'memoria';
+    sel.innerHTML = projects.map(p => '<option value="' + esc(p) + '"' + (p === current ? ' selected' : '') + '>' + esc(p) + '</option>').join('');
+
+    const data = await api('/memory/' + encodeURIComponent(current));
+    const entries = data.entries || [];
+    el('memoryBadge').textContent = entries.length;
+    const container = el('memoryList');
+    if (!entries.length) {
+      container.innerHTML = '<div class="empty-state"><span class="icon">&#9672;</span>No memory entries for <strong>' + esc(current) + '</strong></div>';
+    } else {
+      container.innerHTML = entries.map(e => '<div class="memory-entry"><div class="memory-rail"></div><div>' + esc(e.content || e) + '</div></div>').join('');
+    }
+    setConn(true);
+  } catch(e) {
+    setConn(false);
+    el('memoryList').innerHTML = '<div class="empty-state error">' + esc(e.message) + '</div>';
+  }
+}
+
+async function addMemory() {
+  const project = el('memoryProject').value;
+  const text = el('memoryText').value.trim();
+  if (!text) return;
+  try {
+    await fetch(BASE + '/memory/' + encodeURIComponent(project), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: text })
+    });
+    el('memoryText').value = '';
+    el('memoryInput').style.display = 'none';
+    toast('Memory saved', 'success');
+    loadMemory();
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+async function getProjects() {
+  try {
+    const agents = (await api('/agents')).agents || [];
+    const projects = new Set();
+    agents.forEach(a => { if (a.project) projects.add(a.project); });
+    const health = await api('/health');
+    if (health.topics) health.topics.forEach(t => projects.add(t));
+    projects.add('memoria');
+    return Array.from(projects).sort();
+  } catch(e) {
+    return ['memoria'];
+  }
+}
+
+// ============================================
+// TAB 4: RECALL
+// ============================================
+async function doRecall() {
+  const q = el('recallInput').value.trim();
+  if (!q) return;
+  try {
+    const data = await api('/recall?q=' + encodeURIComponent(q));
+    const results = data.results || [];
+    const container = el('recallResults');
+    if (!results.length) {
+      container.innerHTML = '<div class="empty-state">No results for "' + esc(q) + '"</div>';
+    } else {
+      container.innerHTML = '<div class="text-sm text-muted mb-2">' + results.length + ' result' + (results.length > 1 ? 's' : '') + ' for "' + esc(q) + '"</div>' +
+        '<div class="item-list">' +
+        results.map(r => '<div class="item-card">' +
+          '<div class="top">' + tag(r.source || r.project || 'memoria', 'accent') + (r.room ? tag('# ' + r.room, 'default') : '') + (r.from ? tag(r.from, 'success') : '') + '</div>' +
+          '<div class="title">' + esc(r.title || r.id || 'Entry') + '</div>' +
+          (r.summary ? '<div class="text-sm text-secondary mt-2">' + esc(r.summary).slice(0, 300) + '</div>' : '') +
+          (r.text ? '<div class="text-sm text-secondary mt-2">' + esc(r.text).slice(0, 300) + '</div>' : '') +
+          '<div class="meta"><span>&#128368; ' + ago(r.ts) + '</span></div>' +
+          '</div>').join('') +
+        '</div>';
+    }
+    setConn(true);
+  } catch(e) {
+    setConn(false);
+    el('recallResults').innerHTML = '<div class="empty-state error">' + esc(e.message) + '</div>';
+  }
+}
+
+// ============================================
+// TAB 5: CHAT
+// ============================================
+let chatPollTimer = null;
+
+async function loadChat() {
+  try {
+    const data = await api('/chitchat/rooms');
+    state.chatRooms = (data.rooms || []).map(r => r.room);
+    const sel = el('chatRoomList');
+    if (!state.chatRooms.length) {
+      sel.innerHTML = '<div class="text-muted text-sm" style="padding:8px">No rooms</div>';
+      return;
+    }
+    if (!state.chatRooms.includes(state.chatRoom)) state.chatRoom = state.chatRooms[0];
+    sel.innerHTML = state.chatRooms.map(r =>
+      '<div class="chat-room' + (r === state.chatRoom ? ' active' : '') + '" onclick="switchChatRoom(\'' + esc(r) + '\')">' +
+        esc(r) + ' <span class="count">' + (data.rooms.find(rr => rr.room === r)?.messages || 0) + '</span>' +
+      '</div>'
+    ).join('');
+    setConn(true);
+    loadChatMessages();
+  } catch(e) {
+    setConn(false);
+    el('chatRoomList').innerHTML = '<div class="text-muted text-sm" style="padding:8px">Error loading rooms</div>';
+  }
+}
+
+function switchChatRoom(room) {
+  state.chatRoom = room;
+  loadChat();
+}
+
+async function loadChatMessages() {
+  if (!state.chatRoom) return;
+  try {
+    const data = await api('/chitchat/' + encodeURIComponent(state.chatRoom));
+    const msgs = data.messages || [];
+    const container = el('chatMessages');
+    container.innerHTML = msgs.slice(-100).map(m => {
+      const from = m.from || 'system';
+      const isSys = m.type === 'system' || from === 'agent-os' || from === 'system';
+      const cls = isSys ? ' system' : '';
+      const fromCls = from === 'agent-os' ? 'agent-os' : from === 'mini' || from === 'mini-participant' ? 'mini' : from === 'notebookLM' ? 'notebookLM' : '';
+      const prefix = isSys ? '\u25c9' : from === 'user' || from === 'you' ? '\u25b6' : '\u25c8';
+      return '<div class="msg' + cls + '">' +
+        '<div class="from' + (fromCls ? ' ' + fromCls : '') + '">' + prefix + ' ' + esc(from) + ' <span class="ts">' + fmtTime(m.ts) + '</span></div>' +
+        esc(m.text || '') +
+        '</div>';
+    }).join('');
+    container.scrollTop = container.scrollHeight;
+    setConn(true);
+  } catch(e) {
+  }
+}
+
+async function sendChat() {
+  const text = el('chatInput').value.trim();
+  if (!text || !state.chatRoom) return;
+  try {
+    const chUrl = state.config.chitchat_url || 'http://localhost:19999';
+    await fetch(chUrl + '/' + encodeURIComponent(state.chatRoom) + '/say', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, from_name: 'dashboard' })
+    });
+    el('chatInput').value = '';
+    setTimeout(loadChatMessages, 500);
+  } catch(e) {
+    toast('Send failed: ' + e.message, 'error');
+  }
+}
+
+// ============================================
+// TAB 6: SAFETY
+// ============================================
+async function loadSafety() {
+  try {
+    const projects = await getProjects();
+    const sel = el('safetyProject');
+    const current = sel.value || projects[0] || 'memoria';
+    sel.innerHTML = projects.map(p => '<option value="' + esc(p) + '"' + (p === current ? ' selected' : '') + '>' + esc(p) + '</option>').join('');
+
+    const data = await api('/safety/' + encodeURIComponent(current) + '/snapshots');
+    const snaps = data.snapshots || [];
+    const container = el('safetyContent');
+    if (!snaps.length) {
+      container.innerHTML = '<div class="empty-state"><span class="icon">&#x1f6e1;</span>No snapshots for <strong>' + esc(current) + '</strong></div>';
+    } else {
+      container.innerHTML = '<div class="text-sm text-muted mb-2">' + snaps.length + ' snapshot' + (snaps.length > 1 ? 's' : '') + '</div>' +
+        '<div class="safety-list">' +
+        snaps.map(s => '<div class="snapshot-card">' +
+          '<div class="top"><span class="hash">' + esc(s.commit_hash || '').slice(0, 16) + '</span>' + tag(ago(s.created_at), 'default') + '</div>' +
+          '<div class="msg">' + esc(s.message || 'Snapshot') + '</div>' +
+          '<div class="ts">' + (s.agent_id ? 'by ' + esc(s.agent_id).slice(0, 20) + ' &middot; ' : '') + fmtTime(s.created_at) + '</div>' +
+          '</div>').join('') +
+        '</div>';
+    }
+    setConn(true);
+  } catch(e) {
+    setConn(false);
+    el('safetyContent').innerHTML = '<div class="empty-state error">' + esc(e.message) + '</div>';
+  }
+}
+
+async function createSnapshot() {
+  const project = el('safetyProject').value;
+  try {
+    await fetch(BASE + '/safety/snapshot/' + encodeURIComponent(project), { method: 'POST' });
+    toast('Snapshot created', 'success');
+    loadSafety();
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+// ============================================
+// TAB 7: SETTINGS
+// ============================================
+async function loadSettings() {
+  try {
+    state.config = await api('/config');
+    renderConfig();
+    setConn(true);
+    loadProposals();
+  } catch(e) {
+    setConn(false);
+    el('configGrid').innerHTML = '<div class="empty-state error">' + esc(e.message) + '</div>';
+  }
+}
+
+function renderConfig() {
+  const container = el('configGrid');
+  const fields = [
+    ['memory_limit', 'Memory Limit', 'number'],
+    ['poll_interval', 'Poll Interval (s)', 'number'],
+    ['agent_stale_sec', 'Agent Stale (s)', 'number'],
+    ['chitchat_poll_interval', 'Chat Poll (s)', 'number'],
+    ['chitchat_consolidate_threshold', 'Consolidate Threshold', 'number'],
+    ['chitchat_max_messages', 'Max Messages', 'number'],
+    ['sleep_cycle_hours', 'Sleep Cycle (h)', 'number'],
+    ['session_max_records', 'Max Records', 'number'],
+    ['auto_accept_threshold', 'Auto Accept', 'number'],
+    ['port', 'Port', 'number'],
+  ];
+  container.innerHTML = fields.map(([key, label, type]) =>
+    '<div class="setting-row">' +
+      '<span class="label">' + esc(label) + '</span>' +
+      '<input type="' + type + '" id="cfg_' + key + '" value="' + esc(state.config[key] ?? '') + '" data-key="' + key + '">' +
+    '</div>'
+  ).join('');
+}
+
+async function saveConfig() {
+  const updates = {};
+  document.querySelectorAll('#configGrid input[data-key]').forEach(inp => {
+    const key = inp.dataset.key;
+    const val = inp.value;
+    if (val !== '' && !isNaN(val)) updates[key] = parseFloat(val);
+    else updates[key] = val;
+  });
+  try {
+    await fetch(BASE + '/config', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates)
+    });
+    toast('Config saved', 'success');
+  } catch(e) {
+    toast('Save failed: ' + e.message, 'error');
+  }
+}
+
+async function loadProposals() {
+  try {
+    const data = await api('/proposals');
+    state.proposals = data.proposals || [];
+    const container = el('proposalsList');
+    if (!state.proposals.length) {
+      container.innerHTML = '<div class="text-muted text-sm">No pending proposals</div>';
+    } else {
+      container.innerHTML = state.proposals.map(p =>
+        '<div class="proposal-card">' +
+          '<div class="top"><span class="id">' + esc(p.id).slice(0, 30) + '</span><span class="topic">' + tag(p.topic, 'warning') + '</span><span class="src">' + esc(p.source || '') + '</span></div>' +
+          '<div class="text">' + esc(p.text || '').slice(0, 200) + '</div>' +
+          '<div class="flex gap-2 mt-2">' +
+            '<button class="btn btn-sm btn-success" onclick="acceptProposal(\'' + esc(p.id) + '\')">Accept</button>' +
+            '<button class="btn btn-sm btn-error" onclick="deleteProposal(\'' + esc(p.id) + '\')">Delete</button>' +
+          '</div>' +
+        '</div>'
+      ).join('');
+    }
+  } catch(e) {
+    el('proposalsList').innerHTML = '<div class="text-muted text-sm">Error: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function acceptProposal(id) {
+  try {
+    await fetch(BASE + '/proposals/' + encodeURIComponent(id) + '/accept', { method: 'POST' });
+    toast('Proposal accepted', 'success');
+    loadProposals();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function deleteProposal(id) {
+  try {
+    await fetch(BASE + '/proposals/' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('Proposal deleted', 'success');
+    loadProposals();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function consolidateChat() {
+  try {
+    await fetch(BASE + '/chitchat/consolidate', { method: 'POST' });
+    toast('Consolidation triggered', 'success');
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function clearProposals() {
+  try {
+    await fetch(BASE + '/proposals', { method: 'DELETE' });
+    toast('Proposals cleared', 'success');
+    loadProposals();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+// -- Helper: document.getElementById shorthand --
+function el(id) { return document.getElementById(id); }
+
+// ============================================
+// INIT
+// ============================================
+loadOverview();
+
+setInterval(() => {
+  if (state.tab === 0) loadOverview();
+  else if (state.tab === 1) loadAgents();
+  else if (state.tab === 2) loadTasks();
+  else if (state.tab === 3) loadMemory();
+  else if (state.tab === 5) { loadChat(); }
+  else if (state.tab === 6) loadSafety();
+  else if (state.tab === 7) { loadSettings(); }
+}, 5000);
+
+setInterval(() => {
+  if (state.tab === 5 && state.chatRoom) loadChatMessages();
+}, 3000);
 </script>
 </body>
 </html>"""
+
 
 
 @app.get("/", response_class=HTMLResponse)

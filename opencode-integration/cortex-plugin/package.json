@@ -1,0 +1,13 @@
+{
+  "name": "cortex-plugin",
+  "version": "1.0.0",
+  "description": "CORTEX - Coordinated Orchestration via Reinforcement-learning Task Execution",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    "./server": "./index.mjs",
+    "./gating": "./gating.mjs",
+    "./bidding": "./bidding.mjs",
+    "./memory": "./memory.mjs"
+  }
+}

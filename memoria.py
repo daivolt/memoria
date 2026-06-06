@@ -42,6 +42,14 @@ Clients:
   memoria client <name> <host> [key] [user]  Register client
   memoria client remove <name>         Remove client
   memoria push-clients                 Push updates to all clients
+
+CORTEX (autonomous agent task allocation):
+  memoria cortex status                Show Q-table, reputation, epsilon
+  memoria cortex learnings [n]         Show last N task outcomes
+  memoria cortex bid                   Trigger scan + bid on pending tasks
+  memoria cortex assign <title> [type] [complexity]  Create + auto-assign task
+  memoria cortex complete <task-id> [reward]         Mark done with reward signal
+  memoria cortex policy                Show learned Q-values per state
 """
 
 import json
@@ -457,6 +465,104 @@ def cmd_rollback(project: str, snapshot_id: str | None = None):
     print(f"rolled back to {r['rolled_back_to'][:12]} ({r.get('message', '?')})")
 
 
+def cmd_cortex_status():
+    r = _req("GET", f"/topics/cortex_state?project={urllib.parse.quote(project_name())}")
+    if "error" in r or not r.get("facts"):
+        print("No CORTEX state found")
+        return
+    raw = r["facts"][-1] if isinstance(r["facts"], list) else r.get("text", "")
+    try:
+        data = json.loads(raw if isinstance(raw, str) else raw)
+    except (json.JSONDecodeError, TypeError):
+        print("Could not parse CORTEX state")
+        return
+    g = data.get("gating", {})
+    b = data.get("bidding", {})
+    m = data.get("memory", {})
+    q = g.get("Q", {})
+    eps = g.get("epsilon", "?")
+    rep = b.get("reputation", "?")
+    episodes = len(m.get("episodes", []))
+    print(f"epsilon:     {eps}")
+    print(f"reputation:  {rep}")
+    print(f"episodes:    {episodes}")
+    print(f"Q-table:     {len(q)} states")
+    for state, vals in sorted(q.items())[:10]:
+        best = max(vals, key=vals.get) if vals else "?"
+        print(f"  {state}: best={best} Q={vals.get(best, 0):.3f}")
+    if len(q) > 10:
+        print(f"  ... and {len(q) - 10} more states")
+
+
+def cmd_cortex_learnings(n: int = 5):
+    r = _req("GET", f"/topics/cortex_state?project={urllib.parse.quote(project_name())}")
+    if "error" in r or not r.get("facts"):
+        print("No CORTEX state found")
+        return
+    raw = r["facts"][-1] if isinstance(r["facts"], list) else r.get("text", "")
+    try:
+        data = json.loads(raw if isinstance(raw, str) else raw)
+    except (json.JSONDecodeError, TypeError):
+        print("Could not parse CORTEX state")
+        return
+    episodes = data.get("memory", {}).get("episodes", [])
+    if not episodes:
+        print("No episodes yet")
+        return
+    for e in episodes[-n:]:
+        ts = time.strftime("%H:%M:%S", time.localtime(e.get("timestamp", 0) / 1000))
+        print(f"  [{ts}] {e.get('taskTitle', '?')[:40]:40s} agent={e.get('agentId', '?')[:12]} reward={e.get('reward', 0.5):.2f} outcome={e.get('outcome', '?')}")
+
+
+def cmd_cortex_bid():
+    print("Trigger CORTEX bid scan via plugin tool: !cortex_bid")
+
+
+def cmd_cortex_assign(title: str, task_type: str = "generic", complexity: int = 5):
+    r = _req("POST", "/tasks", {
+        "project": project_name(),
+        "title": title,
+        "description": "",
+        "payload": {"type": task_type, "complexity": complexity, "threshold": 0.3},
+    })
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"task created: {r['task_id']}")
+    print("Use !cortex_bid tool in opencode to auto-assign")
+
+
+def cmd_cortex_complete(task_id: str, reward: str = "0.8"):
+    reward_f = float(reward)
+    r = _req("PATCH", f"/tasks/{task_id}", {"status": "completed", "payload": {"cortex_reward": reward_f}})
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"{task_id} completed with reward {reward_f}")
+
+
+def cmd_cortex_policy():
+    r = _req("GET", f"/topics/cortex_state?project={urllib.parse.quote(project_name())}")
+    if "error" in r or not r.get("facts"):
+        print("No CORTEX state found")
+        return
+    raw = r["facts"][-1] if isinstance(r["facts"], list) else r.get("text", "")
+    try:
+        data = json.loads(raw if isinstance(raw, str) else raw)
+    except (json.JSONDecodeError, TypeError):
+        print("Could not parse CORTEX state")
+        return
+    q = data.get("gating", {}).get("Q", {})
+    if not q:
+        print("No learned policy yet")
+        return
+    print("Learned Q-values (state → action → value):")
+    for state, vals in sorted(q.items()):
+        sorted_actions = sorted(vals.items(), key=lambda x: -x[1])
+        actions_str = ", ".join(f"{a}={v:.3f}" for a, v in sorted_actions)
+        print(f"  {state:20s}  →  {actions_str}")
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
@@ -638,6 +744,35 @@ def main():
             else:
                 print(f"  {name}: {status.upper()} — {result.get('error', '')}")
         print(f"Pushed {r.get('pushed', 0)}/{r.get('total', 0)} clients")
+    elif cmd == "cortex":
+        if len(args) < 2:
+            print("usage: memoria cortex <status|learnings|bid|assign|complete|policy> [...]", file=sys.stderr)
+            sys.exit(1)
+        sub = args[1]
+        if sub == "status":
+            cmd_cortex_status()
+        elif sub == "learnings":
+            cmd_cortex_learnings(int(args[2]) if len(args) > 2 else 5)
+        elif sub == "bid":
+            cmd_cortex_bid()
+        elif sub == "assign":
+            if len(args) < 3:
+                print("usage: memoria cortex assign <title> [type] [complexity]", file=sys.stderr)
+                sys.exit(1)
+            t = args[2]
+            typ = args[3] if len(args) > 3 else "generic"
+            comp = int(args[4]) if len(args) > 4 else 5
+            cmd_cortex_assign(t, typ, comp)
+        elif sub == "complete":
+            if len(args) < 3:
+                print("usage: memoria cortex complete <task-id> [reward]", file=sys.stderr)
+                sys.exit(1)
+            cmd_cortex_complete(args[2], args[3] if len(args) > 3 else "0.8")
+        elif sub == "policy":
+            cmd_cortex_policy()
+        else:
+            print(f"unknown cortex subcommand: {sub}", file=sys.stderr)
+            sys.exit(1)
     else:
         print(f"unknown: {cmd}", file=sys.stderr)
         sys.exit(1)
