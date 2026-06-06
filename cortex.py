@@ -485,6 +485,47 @@ class HippocampalReplay:
             })
         return updates
 
+    def signal_weighted_replay(self, signals: dict | None = None, batch_size: int = 8):
+        """Event-driven replay with signal-modulated priority sampling.
+
+        Signals dict can contain:
+          - rpe_magnitude:  float (0-1) — recent RPE intensity
+          - acc_surprise:   float (0-1) — Bayesian surprise from ACC
+          - conflict_score: float (0-1) — Socratic dialectic conflict
+          - efferent_div:   float (0-1) — Go/NoGo divergence
+
+        Higher signal values → more replay steps + wider sampling.
+        If signals is None or empty, falls back to standard replay_step.
+        """
+        if not signals:
+            return self.replay_step(lr_multiplier=0.5)
+
+        urgency = sum(signals.values()) / max(len(signals), 1)
+        if urgency < 0.1:
+            return []
+
+        steps = max(1, int(urgency * 5))
+        lr = 0.3 + 0.4 * urgency
+        all_updates = []
+        for _ in range(steps):
+            batch = self.sample_prioritized(batch_size)
+            if not batch:
+                break
+            for exp in batch:
+                old_q = self.gating.get_q(exp["state"], exp["action"])
+                self.gating.update(exp["state"], exp["action"], exp["reward"])
+                new_q = self.gating.get_q(exp["state"], exp["action"])
+                all_updates.append({
+                    "state": exp["state"],
+                    "action": exp["action"],
+                    "old_q": round(old_q, 3),
+                    "new_q": round(new_q, 3),
+                    "evb": exp["evb"],
+                    "signal_urgency": round(urgency, 3),
+                    "learning_rate": round(lr, 3),
+                })
+        return all_updates
+
 
 # ── Auction Coordinator (Basal Ganglia gating) ────────────────
 

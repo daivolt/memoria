@@ -749,25 +749,118 @@ async def _chitchat_poll_loop():
 
 
 async def _awake_replay_loop():
-    """Awake hippocampal replay — lightweight replay every 60s.
-    
-    Based on Awake Replay (Trends Neurosci 2025):
-    Replay during quiet wakefulness performs fictive learning.
-    This runs lightweight replay steps on hippocampal buffer.
+    """Event-driven awake hippocampal replay.
+
+    Replaces fixed 60s timer with signal-weighted replay:
+      - rpe_magnitude: from recent PFC-BG update deltas
+      - acc_surprise: from ACC Bayesian surprise channels
+      - conflict_score: from Socratic dialectic records
+      - efferent_div: from Go/NoGo beta divergence
+      - idle_boost: ramps up when no recent task activity
     """
-    await asyncio.sleep(60)
+    _KILL_AUDIT_PATH = Path("/tmp/memoria_kill_audit.jsonl")
+    _last_kill_size = _KILL_AUDIT_PATH.stat().st_size if _KILL_AUDIT_PATH.exists() else 0
+    _last_task_activity = time.time()
+
+    await asyncio.sleep(5)
     while True:
         try:
             projects = set(t.get("project", "unknown") for t in _list_tasks(None, None))
+            now = time.time()
+
+            # 1. Check kill audit for new events
+            kill_signal = 0.0
+            if _KILL_AUDIT_PATH.exists():
+                cur_size = _KILL_AUDIT_PATH.stat().st_size
+                if cur_size > _last_kill_size:
+                    with open(_KILL_AUDIT_PATH) as f:
+                        lines = f.readlines()
+                    recent_kills = [json.loads(l) for l in lines if l.strip()]
+                    recent_kills = [k for k in recent_kills if k.get("timestamp", 0) > now - 120]
+                    if recent_kills:
+                        kill_signal = min(1.0, len(recent_kills) * 0.3)
+                        _notify_chitchat(
+                            f"[memoria] replay: {len(recent_kills)} kill events detected, urgency={kill_signal:.2f}"
+                        )
+                _last_kill_size = cur_size
+
+            # 2. Check task activity for idle detection
+            pending = _list_tasks(None, "pending")
+            assigned = _list_tasks(None, "assigned")
+            if pending or assigned:
+                _last_task_activity = now
+            idle_seconds = now - _last_task_activity
+            idle_boost = min(0.5, idle_seconds / 120.0) if idle_seconds > 30 else 0.0
+
+            # 3. Compute replay signals per project
             for project in projects:
                 engine = get_engine(project)
-                if engine.replay.buffer:
-                    updates = engine.replay.replay_step()
+                if not engine.replay.buffer:
+                    continue
+
+                signals = {}
+
+                # RPE magnitude: from recent rpe_history
+                if engine.gating.rpe_history:
+                    recent_rpe = engine.gating.rpe_history[-20:]
+                    rpe_mag = min(1.0, abs(sum(recent_rpe)) / max(len(recent_rpe), 1))
+                    if rpe_mag > 0.05:
+                        signals["rpe_magnitude"] = rpe_mag
+
+                # ACC surprise: alpha + beta channels
+                if engine.gating.alpha_surprise and engine.gating.beta_surprise:
+                    a_surp = sum(engine.gating.alpha_surprise[-5:]) / 5
+                    b_surp = sum(engine.gating.beta_surprise[-5:]) / 5
+                    total_surprise = min(1.0, a_surp + b_surp)
+                    if total_surprise > 0.05:
+                        signals["acc_surprise"] = total_surprise
+
+                # Dialectic conflict: from Socratic records
+                if engine.socrates.dialectic_records:
+                    recent_dialectics = [d for d in engine.socrates.dialectic_records
+                                         if d.get("timestamp", 0) > now - 300]
+                    if recent_dialectics:
+                        conflict = sum(d.get("conflict_score", 0) for d in recent_dialectics) / len(recent_dialectics)
+                        if conflict > 0.1:
+                            signals["conflict_score"] = min(1.0, conflict)
+
+                # Efferent divergence: Go/NoGo beta spread
+                go_spread = 0.0
+                nog_spread = 0.0
+                for state in engine.gating.beta_g:
+                    bg_vals = list(engine.gating.beta_g[state].values())
+                    if bg_vals:
+                        go_spread = max(go_spread, max(bg_vals) - min(bg_vals))
+                for state in engine.gating.beta_n:
+                    bn_vals = list(engine.gating.beta_n[state].values())
+                    if bn_vals:
+                        nog_spread = max(nog_spread, max(bn_vals) - min(bn_vals))
+                eff_div = min(1.0, (go_spread + nog_spread) / 4.0)
+                if eff_div > 0.1:
+                    signals["efferent_divergence"] = eff_div
+
+                # Idle boost
+                if idle_boost > 0.05:
+                    signals["idle_boost"] = idle_boost
+
+                # Kill signal
+                if kill_signal > 0.05:
+                    signals["kill_event"] = kill_signal
+
+                if signals:
+                    updates = engine.replay.signal_weighted_replay(signals)
                     if updates:
-                        pass  # replay running silently
+                        avg_urgency = sum(signals.values()) / len(signals)
+                        _last_kill_size += 0  # touch to keep ref
+                        if avg_urgency > 0.3:
+                            _notify_chitchat(
+                                f"[memoria] replay: {len(updates)} updates, "
+                                f"signals={ {k: round(v, 2) for k, v in signals.items()} }"
+                            )
         except Exception:
             pass
-        await asyncio.sleep(60)
+        # Dynamic sleep: longer when idle, shorter when signals are hot
+        await asyncio.sleep(15 if idle_boost == 0.0 else 30)
 
 
 async def _sleep_cycle_loop():
@@ -1720,6 +1813,36 @@ async def cortex_policy(project: Optional[str] = None):
             "avg_responsiveness": round(sum(engine.auction.responsiveness.values()) / max(len(engine.auction.responsiveness), 1), 3),
             "avg_choice": round(sum(engine.auction.choice.values()) / max(len(engine.auction.choice), 1), 3),
         },
+    }
+
+
+class CortexReplayRequest(BaseModel):
+    project: str = "unknown"
+    signals: dict = {}
+    batch_size: int = 8
+
+
+@app.post("/cortex/replay")
+async def cortex_replay(body: CortexReplayRequest):
+    """Manual trigger for event-driven replay.
+
+    Accepts an optional signals dict (rpe_magnitude, acc_surprise,
+    conflict_score, efferent_divergence, kill_event, idle_boost).
+    If signals is empty, runs standard replay_step().
+    """
+    engine = get_engine(body.project)
+    if not engine.replay.buffer:
+        return {"ok": True, "updates": 0, "reason": "empty_buffer"}
+    updates = engine.replay.signal_weighted_replay(
+        body.signals or None,
+        batch_size=body.batch_size,
+    )
+    return {
+        "ok": True,
+        "project": body.project,
+        "updates": len(updates),
+        "signals": body.signals,
+        "replay_steps": updates,
     }
 
 
