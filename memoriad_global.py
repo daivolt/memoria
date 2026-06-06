@@ -42,7 +42,7 @@ OPENCODE_DB = Path.home() / ".local/share/opencode/opencode.db"
 MEMORY_LIMIT = 5000
 POLL_INTERVAL = 30
 AGENT_STALE_SEC = 300
-CHITCHAT_URL = "http://localhost:19999"
+CHITCHAT_URL = os.environ.get("CHITCHAT_URL", "http://100.121.245.69:19999")
 CHITCHAT_POLL_INTERVAL = 3
 CHITCHAT_CONSOLIDATE_THRESHOLD = 20
 CHITCHAT_DIR = WORKDIR / "chitchat"
@@ -60,6 +60,7 @@ _poll_task: asyncio.Task | None = None
 _chitchat_poll_task: asyncio.Task | None = None
 _sleep_cycle_task: asyncio.Task | None = None
 _cortex_task: asyncio.Task | None = None
+_skill_watch_task: asyncio.Task | None = None
 
 # ── Shared modules for session extraction ────────────────────
 
@@ -595,8 +596,14 @@ def _prune_sessions():
 
 
 def _deep_consolidate():
-    """Cross-layer consolidation: sessions → topics + chat → topics."""
-    # 0. Prune old sessions first
+    """Cross-layer consolidation: sessions → topics + chat → topics.
+    
+    Enhanced with:
+      - Hippocampal episode consolidation with similarity clustering
+      - Offline Q-learning via replay
+      - Reward-based pruning (keep episodes with reward >= 0.2)
+      - Episode → topic extraction bridge
+    """
     _prune_sessions()
 
     # 1. Force chitchat consolidation
@@ -604,7 +611,67 @@ def _deep_consolidate():
     _chitchat_unconsolidated = CHITCHAT_CONSOLIDATE_THRESHOLD
     _consolidate_chitchat()
 
-    # 2. Pull recent sessions and check if any new topic patterns emerge
+    # 2. Consolidate hippocampal episodes: cluster by similarity
+    try:
+        from cortex import get_engine
+        projects = set()
+        tasks = _list_tasks(None, None)
+        for t in tasks:
+            p = t.get("project", "")
+            if p:
+                projects.add(p)
+        for project in projects:
+            engine = get_engine(project)
+            episodes = engine.hippocampus.episodes
+            if len(episodes) < 3:
+                continue
+            # Simple k-means-like clustering by task_type
+            clusters: dict[str, list[dict]] = {}
+            for ep in episodes:
+                meta = ep.get("meta", {}) or {}
+                ttype = meta.get("type", "generic")
+                clusters.setdefault(ttype, []).append(ep)
+            # Offline Q-learning: for each cluster, run replay steps
+            for ttype, cluster in clusters.items():
+                for _ in range(min(len(cluster), 10)):
+                    engine.replay.replay_step(lr_multiplier=0.3)
+            # Reward-based pruning: remove episodes with reward < 0.2
+            before = len(episodes)
+            engine.hippocampus.episodes = [e for e in episodes if e.get("reward", 0) >= 0.2]
+            pruned = before - len(engine.hippocampus.episodes)
+            if pruned:
+                engine.hippocampus.save()
+            # Episodic → semantic: extract topic proposals from high-value clusters
+            for ttype, cluster in clusters.items():
+                high_val = [e for e in cluster if e.get("reward", 0) >= 0.7]
+                if len(high_val) >= 3:
+                    kw = Counter()
+                    for e in high_val:
+                        title = e.get("task_title", "")
+                        for w in title.split():
+                            if len(w) >= 4:
+                                kw[w.lower()] += 1
+                    top_kw = [w for w, c in kw.most_common(3)]
+                    if top_kw:
+                        existing = _load_existing_topic_names()
+                        if not _find_matching_topic(top_kw, existing):
+                            prop_text = (f"[hippocampal consolidation] Cluster '{ttype}': "
+                                         f"{len(high_val)} high-reward episodes, "
+                                         f"keywords: {', '.join(top_kw)}")
+                            prop_path = WORKDIR / "proposals.jsonl"
+                            record = {
+                                "id": f"hip_consolidate_{int(time.time())}",
+                                "text": prop_text,
+                                "topic": top_kw[0][:50],
+                                "proposed_at": time.time(),
+                                "source": "hippocampal_consolidation",
+                            }
+                            with open(prop_path, "a") as f:
+                                f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+    # 3. Pull recent sessions and check if any new topic patterns emerge
     path = WORKDIR / "sessions.jsonl"
     if path.exists():
         lines = path.read_text().strip().splitlines()
@@ -643,18 +710,21 @@ def _deep_consolidate():
 _poll_task: asyncio.Task | None = None
 _chitchat_poll_task: asyncio.Task | None = None
 _sleep_cycle_task: asyncio.Task | None = None
+_cortex_task: asyncio.Task | None = None
+_skill_watch_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_index()
-    global _poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task
+    global _poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task
     _poll_task = asyncio.create_task(_poll_loop())
     _chitchat_poll_task = asyncio.create_task(_chitchat_poll_loop())
     _sleep_cycle_task = asyncio.create_task(_sleep_cycle_loop())
     _cortex_task = asyncio.create_task(_cortex_auction_loop())
+    _skill_watch_task = asyncio.create_task(_skill_watch_loop())
     yield
-    for t in (_poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task):
+    for t in (_poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task):
         if t:
             t.cancel()
             try:
@@ -1252,6 +1322,7 @@ class RegisterAgent(BaseModel):
 
 class AgentHeartbeat(BaseModel):
     status: str = "active"
+    activity: str = ""
     commit_log: list[str] = []
 
 
@@ -1302,6 +1373,8 @@ async def heartbeat(agent_id: str, body: AgentHeartbeat):
         raise HTTPException(404, "agent not found")
     a["last_heartbeat"] = time.time()
     a["status"] = body.status
+    if body.activity:
+        a["activity"] = body.activity
     if body.commit_log:
         a["commit_log"].extend(body.commit_log)
     _save_agent(a)
@@ -1537,7 +1610,7 @@ async def cortex_complete(body: CortexCompleteRequest):
     payload["cortex_reward"] = body.reward
     t["payload"] = payload
     _save_task(t)
-    rpe = engine.record_outcome(
+    da_signals = engine.record_outcome(
         body.task_id, body.agent_id,
         t.get("title", "?"),
         body.task_type, body.complexity, body.reward,
@@ -1546,7 +1619,7 @@ async def cortex_complete(body: CortexCompleteRequest):
         "ok": True,
         "task_id": body.task_id,
         "reward": body.reward,
-        "rpe": round(rpe, 4),
+        "da_signals": {k: round(v, 4) for k, v in da_signals.items()} if isinstance(da_signals, dict) else {"rpe": round(da_signals, 4)},
         "status": "completed",
     }
 
@@ -1569,14 +1642,29 @@ async def cortex_policy(project: Optional[str] = None):
     p = project or "unknown"
     engine = get_engine(p)
     policy = {}
-    for state, vals in engine.gating.Q.items():
-        sorted_actions = sorted(vals.items(), key=lambda x: -x[1])
-        policy[state] = {a: round(v, 3) for a, v in sorted_actions}
+    for state in engine.gating.Go:
+        go_vals = engine.gating.Go.get(state, {})
+        nogo_vals = engine.gating.NoGo.get(state, {})
+        all_a = set(go_vals) | set(nogo_vals)
+        net = {}
+        for a in all_a:
+            bg = engine.gating.beta_g.get(state, {}).get(a, 1.0)
+            bn = engine.gating.beta_n.get(state, {}).get(a, 1.0)
+            gv = go_vals.get(a, 0.5)
+            nv = nogo_vals.get(a, 0.5)
+            net[a] = round(bg * gv - bn * nv, 3)
+        sorted_a = sorted(net.items(), key=lambda x: -x[1])
+        policy[state] = dict(sorted_a)
     return {
         "ok": True,
         "project": p,
         "epsilon": engine.gating.epsilon,
         "policy": policy,
+        "ensembles": {
+            "agents": len(engine.auction.reputation),
+            "avg_responsiveness": round(sum(engine.auction.responsiveness.values()) / max(len(engine.auction.responsiveness), 1), 3),
+            "avg_choice": round(sum(engine.auction.choice.values()) / max(len(engine.auction.choice), 1), 3),
+        },
     }
 
 
@@ -1601,6 +1689,37 @@ async def _cortex_auction_loop():
         except Exception:
             pass
         await asyncio.sleep(15)
+
+
+async def _skill_watch_loop():
+    """Background task: watch skills dir for changes, auto-push to clients."""
+    skills_dir = CLIENTS_CONF.parent / "skills"
+    if not skills_dir.exists():
+        return
+    last_mtimes: dict[str, float] = {}
+    debounce = 0.0
+    print(f"[skill-watch] watching {skills_dir} for changes")
+    while True:
+        await asyncio.sleep(10)
+        try:
+            changed = False
+            for f in skills_dir.rglob("SKILL.md"):
+                mtime = f.stat().st_mtime
+                prev = last_mtimes.get(str(f))
+                if prev is not None and mtime != prev:
+                    changed = True
+                last_mtimes[str(f)] = mtime
+            if not last_mtimes:
+                for f in skills_dir.rglob("SKILL.md"):
+                    last_mtimes[str(f)] = f.stat().st_mtime
+                continue
+            now = time.time()
+            if changed and now - debounce > 30:
+                debounce = now
+                print(f"[skill-watch] change detected in skills/, pushing to clients")
+                await asyncio.to_thread(_push_to_clients)
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1845,6 +1964,24 @@ async def update_config(updates: ConfigUpdate):
     return {"ok": True, "updated": list(data.keys())}
 
 
+class ChitchatSay(BaseModel):
+    text: str
+    from_name: str = "dashboard"
+
+
+@app.post("/chitchat/{room}/say")
+async def chitchat_say(room: str, body: ChitchatSay):
+    url = f"{CHITCHAT_URL}/{urllib.parse.quote(room)}/say"
+    payload = {"text": body.text, "from_name": body.from_name}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        raise HTTPException(502, f"chitchat proxy error: {e}")
+
+
 @app.post("/chitchat/consolidate")
 async def trigger_consolidation():
     global _chitchat_unconsolidated
@@ -1926,8 +2063,8 @@ async def remove_client(name: str):
     return {"ok": True, "removed": name}
 
 
-@app.post("/clients/push")
-async def push_to_clients():
+def _push_to_clients() -> dict:
+    """Sync push to all registered clients. Returns result dict."""
     clients = _load_clients()
     if not clients:
         return {"ok": True, "pushed": 0, "message": "no clients registered"}
@@ -1973,6 +2110,11 @@ async def push_to_clients():
 
     ok_count = sum(1 for r in results if r["status"] == "ok")
     return {"ok": True, "pushed": ok_count, "total": len(clients), "results": results}
+
+
+@app.post("/clients/push")
+async def push_to_clients():
+    return await asyncio.to_thread(_push_to_clients)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2644,6 +2786,10 @@ body {
 .text-secondary { color: var(--text-secondary); }
 .text-sm { font-size: 12px; }
 .w-full { width: 100%; }
+.color-accent { color: var(--accent); }
+.color-success { color: var(--success); }
+.color-warning { color: var(--warning); }
+.color-error { color: var(--error); }
 
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -2664,6 +2810,57 @@ body {
   .search-overlay { width: calc(100% - 40px); right: 20px; }
 }
 .hamburger { display: none; background: none; border: none; color: var(--text-primary); font-size: 20px; cursor: pointer; padding: 4px; }
+
+/* Markdown in chat */
+.msg .body { white-space: pre-wrap; word-break: break-word; font-family: var(--font); line-height: 1.6; }
+.msg .body strong { font-weight: 700; color: var(--text-primary); }
+.msg .body em { font-style: italic; }
+.msg .body code {
+  background: var(--bg-elevated);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent);
+}
+.msg .body pre {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  padding: 8px 12px;
+  margin: 6px 0;
+  overflow-x: auto;
+}
+.msg .body pre code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+.msg .body a { color: var(--accent); text-decoration: underline; }
+.msg .body a:hover { opacity: 0.8; }
+
+/* Agent activity spinner */
+.activity-indicator {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; color: var(--text-muted); margin-left: 6px;
+}
+.activity-indicator .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+.activity-indicator .dot.thinking { background: var(--warning); }
+.activity-indicator .dot.writing { background: var(--accent); }
+.activity-indicator .dot.reading { background: var(--info, #5dade2); }
+.activity-indicator .dot.researching { background: var(--warning); }
+.activity-indicator .dot.idle { background: var(--text-muted); animation: none; }
+.activity-indicator .dot.error { background: var(--error); animation: none; }
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.4; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
 </style>
 </head>
 <body>
@@ -2892,7 +3089,7 @@ function switchTab(n) {
   document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
   document.querySelector('.nav-item[data-tab="' + n + '"]')?.classList.add('active');
   document.getElementById('sidebar').classList.remove('open');
-  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, null, null, loadSafety, loadSettings];
+  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, null, loadChat, loadSafety, loadSettings];
   if (loaders[n]) loaders[n]();
 }
 
@@ -2989,7 +3186,7 @@ async function doSearch() {
     if (!results.length) {
       el.innerHTML = '<div class="empty-state">No results for "' + esc(q) + '"</div>';
     } else {
-      el.innerHTML = results.map(r => '<div class="search-result" onclick="switchTab(0);document.getElementById(\'searchOverlay\').classList.remove(\'open\')">' +
+      el.innerHTML = results.map(r => '<div class="search-result">' +
         '<div class="title">' + esc(r.title || r.id || 'Result') + '</div>' +
         '<div class="summary">' + esc(r.summary || r.text || '').slice(0, 200) + '</div>' +
         '<div class="tags">' +
@@ -2997,6 +3194,12 @@ async function doSearch() {
           (r.room ? '<span>' + esc(r.room) + '</span>' : '') +
           (r.source ? '<span>' + esc(r.source).slice(0, 20) + '</span>' : '') +
         '</div></div>').join('');
+      el.onclick = function(e) {
+        if (e.target.closest('.search-result')) {
+          switchTab(0);
+          document.getElementById('searchOverlay').classList.remove('open');
+        }
+      };
     }
     el.classList.add('open');
   } catch(e) {
@@ -3114,7 +3317,9 @@ function renderAgents() {
   }
   container.innerHTML = list.map(a => '<div class="item-card" onclick="toggleDetail(this)">' +
     '<div class="top">' + dot(a.status) + '<span class="id">' + esc(a.id) + '</span>' + tag(a.project, 'accent') + tag(a.status, a.status === 'active' ? 'success' : a.status === 'idle' ? 'warning' : 'error') + '</div>' +
-    '<div class="title">' + esc(a.task || (a.chitchat_name || '')) + '</div>' +
+    '<div class="title">' + esc(a.task || (a.chitchat_name || '')) +
+      (a.activity ? '<span class="activity-indicator"><span class="dot ' + esc(a.activity) + '"></span>' + esc(a.activity) + '</span>' : '') +
+    '</div>' +
     '<div class="meta">' +
       '<span>&#128193; ' + (a.files || []).length + ' files</span>' +
       '<span>&#128190; ' + (a.commit_log || []).length + ' commits</span>' +
@@ -3124,6 +3329,7 @@ function renderAgents() {
     '<div class="detail">' +
       '<div><strong>PID:</strong> ' + (a.pid || '-') + '</div>' +
       '<div><strong>Chitchat:</strong> ' + esc(a.chitchat_name || '-') + '</div>' +
+      '<div><strong>Activity:</strong> ' + esc(a.activity || '-') + '</div>' +
       '<div><strong>Started:</strong> ' + fmtTime(a.started_at) + '</div>' +
       '<div><strong>Heartbeat:</strong> ' + fmtTime(a.last_heartbeat) + '</div>' +
       (a.conflicts_warned && a.conflicts_warned.length ? '<div class="mt-2"><strong>&#9888; Conflicts:</strong> ' + esc(a.conflicts_warned.join('; ')) + '</div>' : '') +
@@ -3229,7 +3435,7 @@ async function addMemory() {
     await fetch(BASE + '/memory/' + encodeURIComponent(project), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: text })
+      body: JSON.stringify({ text: text })
     });
     el('memoryText').value = '';
     el('memoryInput').style.display = 'none';
@@ -3288,7 +3494,6 @@ async function doRecall() {
 // ============================================
 // TAB 5: CHAT
 // ============================================
-let chatPollTimer = null;
 
 async function loadChat() {
   try {
@@ -3301,10 +3506,14 @@ async function loadChat() {
     }
     if (!state.chatRooms.includes(state.chatRoom)) state.chatRoom = state.chatRooms[0];
     sel.innerHTML = state.chatRooms.map(r =>
-      '<div class="chat-room' + (r === state.chatRoom ? ' active' : '') + '" onclick="switchChatRoom(\'' + esc(r) + '\')">' +
+      '<div class="chat-room' + (r === state.chatRoom ? ' active' : '') + '" data-room="' + esc(r) + '">' +
         esc(r) + ' <span class="count">' + (data.rooms.find(rr => rr.room === r)?.messages || 0) + '</span>' +
       '</div>'
     ).join('');
+    sel.onclick = function(e) {
+      const room = e.target.closest('.chat-room');
+      if (room) switchChatRoom(room.dataset.room);
+    };
     setConn(true);
     loadChatMessages();
   } catch(e) {
@@ -3318,10 +3527,23 @@ function switchChatRoom(room) {
   loadChat();
 }
 
+function renderMarkdown(text) {
+  if (!text) return '';
+  let s = text.replace(/<script\\b[^<]*(?:(?!<\\/script>)<[^<]*)*<\\/script>/gi, '');
+  s = s.replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  s = s.replace(/\\n/g, '<br>');
+  return s;
+}
+
 async function loadChatMessages() {
   if (!state.chatRoom) return;
   try {
-    const data = await api('/chitchat/' + encodeURIComponent(state.chatRoom));
+    const limit = window.__memoriaMaxMessages || 100;
+    const data = await api('/chitchat/' + encodeURIComponent(state.chatRoom) + '?limit=' + limit);
     const msgs = data.messages || [];
     const container = el('chatMessages');
     container.innerHTML = msgs.slice(-100).map(m => {
@@ -3332,12 +3554,13 @@ async function loadChatMessages() {
       const prefix = isSys ? '\u25c9' : from === 'user' || from === 'you' ? '\u25b6' : '\u25c8';
       return '<div class="msg' + cls + '">' +
         '<div class="from' + (fromCls ? ' ' + fromCls : '') + '">' + prefix + ' ' + esc(from) + ' <span class="ts">' + fmtTime(m.ts) + '</span></div>' +
-        esc(m.text || '') +
+        '<div class="body">' + renderMarkdown(m.text) + '</div>' +
         '</div>';
     }).join('');
     container.scrollTop = container.scrollHeight;
     setConn(true);
   } catch(e) {
+    setConn(false);
   }
 }
 
@@ -3345,8 +3568,7 @@ async function sendChat() {
   const text = el('chatInput').value.trim();
   if (!text || !state.chatRoom) return;
   try {
-    const chUrl = state.config.chitchat_url || 'http://localhost:19999';
-    await fetch(chUrl + '/' + encodeURIComponent(state.chatRoom) + '/say', {
+    await fetch(BASE + '/chitchat/' + encodeURIComponent(state.chatRoom) + '/say', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, from_name: 'dashboard' })
@@ -3471,11 +3693,17 @@ async function loadProposals() {
           '<div class="top"><span class="id">' + esc(p.id).slice(0, 30) + '</span><span class="topic">' + tag(p.topic, 'warning') + '</span><span class="src">' + esc(p.source || '') + '</span></div>' +
           '<div class="text">' + esc(p.text || '').slice(0, 200) + '</div>' +
           '<div class="flex gap-2 mt-2">' +
-            '<button class="btn btn-sm btn-success" onclick="acceptProposal(\'' + esc(p.id) + '\')">Accept</button>' +
-            '<button class="btn btn-sm btn-error" onclick="deleteProposal(\'' + esc(p.id) + '\')">Delete</button>' +
+            '<button class="btn btn-sm btn-success proposal-accept" data-id="' + esc(p.id) + '">Accept</button>' +
+            '<button class="btn btn-sm btn-error proposal-delete" data-id="' + esc(p.id) + '">Delete</button>' +
           '</div>' +
         '</div>'
       ).join('');
+      container.onclick = function(e) {
+        const accept = e.target.closest('.proposal-accept');
+        if (accept) acceptProposal(accept.dataset.id);
+        const del = e.target.closest('.proposal-delete');
+        if (del) deleteProposal(del.dataset.id);
+      };
     }
   } catch(e) {
     el('proposalsList').innerHTML = '<div class="text-muted text-sm">Error: ' + esc(e.message) + '</div>';
@@ -3507,7 +3735,7 @@ async function consolidateChat() {
 
 async function clearProposals() {
   try {
-    await fetch(BASE + '/proposals', { method: 'DELETE' });
+    await fetch(BASE + '/proposals?confirm=true', { method: 'DELETE' });
     toast('Proposals cleared', 'success');
     loadProposals();
   } catch(e) { toast('Failed: ' + e.message, 'error'); }
