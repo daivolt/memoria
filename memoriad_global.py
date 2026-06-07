@@ -931,11 +931,21 @@ async def _stale_task_reaper_loop():
                 continue
             agents = _list_agents()
             active_ids = {a["id"] for a in agents}
+            agent_map = {a["id"]: a for a in agents}
             for t in assigned:
                 aid = t.get("assigned_to", "")
-                if aid and aid not in active_ids:
+                if not aid:
+                    continue
+                stale_reason = None
+                if aid not in active_ids:
+                    stale_reason = f"agent {aid} no longer active"
+                else:
+                    ag = agent_map.get(aid, {})
+                    if not ag.get("task", "").strip():
+                        stale_reason = f"agent {aid} has no task context (generic session)"
+                if stale_reason:
                     t["status"] = "failed"
-                    t["error"] = f"stale: agent {aid} no longer active"
+                    t["error"] = f"stale: {stale_reason}"
                     t["failed_at"] = time.time()
                     _save_task(t)
                     await _events.broadcast("task_failed", {
@@ -2093,6 +2103,7 @@ async def _cortex_auction_loop():
             projects = set(t.get("project", "unknown") for t in pending)
             for project in projects:
                 agents = _list_agents(project)
+                agents = [a for a in agents if a.get("task", "").strip()]
                 if not agents:
                     continue
                 engine = get_engine(project)
