@@ -31,6 +31,7 @@ from pydantic import BaseModel
 from compress import compress
 from context import current_state, write_state, release_state, claim_file
 from cortex import get_engine, CortexEngine
+import federation
 
 # ── Paths ──────────────────────────────────────────────────────
 
@@ -42,17 +43,21 @@ OPENCODE_DB = Path.home() / ".local/share/opencode/opencode.db"
 MEMORY_LIMIT = 5000
 POLL_INTERVAL = 30
 AGENT_STALE_SEC = 300
+STALE_TASK_INTERVAL = 60  # auto-reap assigned tasks whose agent is gone
 CHITCHAT_URL = os.environ.get("CHITCHAT_URL", "http://100.121.245.69:19999")
+CHITCHAT_LOGS_ROOM = os.environ.get("CHITCHAT_LOGS_ROOM", "logs")
 CHITCHAT_POLL_INTERVAL = 3
 CHITCHAT_CONSOLIDATE_THRESHOLD = 20
 CHITCHAT_DIR = WORKDIR / "chitchat"
 CHITCHAT_MAX_MESSAGES = 10000          # per-room slot limit (hippocampal capacity)
-CHITCHAT_ROOMS = [r.strip() for r in os.environ.get("CHITCHAT_ROOMS", "general").split(",")]
+CHITCHAT_ROOMS = [r.strip() for r in os.environ.get("CHITCHAT_ROOMS", "general,logs").split(",")]
 SLEEP_CYCLE_HOURS = int(os.environ.get("SLEEP_CYCLE_HOURS", "6"))
 SESSION_MAX_RECORDS = int(os.environ.get("SESSION_MAX_RECORDS", "5000"))  # total session slot limit
 AUTO_ACCEPT_THRESHOLD = int(os.environ.get("AUTO_ACCEPT_THRESHOLD", "3"))
 CLIENTS_DIR = WORKDIR / "clients"
 CLIENTS_CONF = Path(os.environ.get("MEMORIA_CLIENTS_CONF", "/mnt/external-drive/code/memoria/opencode-integration/clients.conf"))
+FEDERATION_SYNC_INTERVAL = int(os.environ.get("FEDERATION_SYNC_INTERVAL", "300"))  # 5 min default
+FEDERATION_AUTO_SYNC = os.environ.get("FEDERATION_AUTO_SYNC", "true").lower() == "true"
 
 # ── Background task references ────────────────────────────────
 
@@ -62,6 +67,7 @@ _sleep_cycle_task: asyncio.Task | None = None
 _cortex_task: asyncio.Task | None = None
 _skill_watch_task: asyncio.Task | None = None
 _awake_replay_task: asyncio.Task | None = None
+_federation_sync_task: asyncio.Task | None = None
 # (duplicate declarations at lines ~710 are intentional module-level re-decl)
 
 # ── Shared modules for session extraction ────────────────────
@@ -534,7 +540,7 @@ def _consolidate_chitchat():
             existing_facts.append(proposal_text)
             content = "\n§\n".join(existing_facts) + "\n"
             (WORKDIR / "topics" / f"{match}.md").write_text(content)
-            _notify_chitchat(
+            _notify_chitchat_logs(
                 f"[memoria] pattern '{suggested_topic}' appended to existing topic '{match}'"
                 f" ({len(all_messages)} msgs)"
             )
@@ -548,13 +554,13 @@ def _consolidate_chitchat():
                 _add_fact_to_topic(existing["topic"], existing["text"])
                 existing_proposals = [p for p in existing_proposals if p.get("id") != existing["id"]]
                 _save_proposals(existing_proposals)
-                _notify_chitchat(
+                _notify_chitchat_logs(
                     f"[memoria] pattern '{suggested_topic}' auto-accepted"
                     f" (hits={existing['hits']}, msgs={len(all_messages)})"
                 )
             else:
                 _save_proposals(existing_proposals)
-                _notify_chitchat(
+                _notify_chitchat_logs(
                     f"[memoria] pattern '{suggested_topic}' hit {existing['hits']}/{AUTO_ACCEPT_THRESHOLD}"
                 )
         else:
@@ -569,7 +575,7 @@ def _consolidate_chitchat():
             }
             with open(path, "a") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            _notify_chitchat(
+            _notify_chitchat_logs(
                 f"[memoria] pattern '{suggested_topic}' from chat "
                 f"({len(all_messages)} msgs, {len(room_counts)} rooms) → proposed"
             )
@@ -726,15 +732,19 @@ def _deep_consolidate():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_index()
-    global _poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task, _awake_replay_task
+    federation._init_federation(WORKDIR)
+    global _poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task, _awake_replay_task, _federation_sync_task, _stale_task_reaper_task, _task_healer_task
     _poll_task = asyncio.create_task(_poll_loop())
     _chitchat_poll_task = asyncio.create_task(_chitchat_poll_loop())
     _sleep_cycle_task = asyncio.create_task(_sleep_cycle_loop())
     _cortex_task = asyncio.create_task(_cortex_auction_loop())
     _skill_watch_task = asyncio.create_task(_skill_watch_loop())
     _awake_replay_task = asyncio.create_task(_awake_replay_loop())
+    _federation_sync_task = asyncio.create_task(_federation_sync_loop())
+    _stale_task_reaper_task = asyncio.create_task(_stale_task_reaper_loop())
+    _task_healer_task = asyncio.create_task(_task_healer_loop())
     yield
-    for t in (_poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task, _awake_replay_task):
+    for t in (_poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task, _awake_replay_task, _federation_sync_task, _stale_task_reaper_task, _task_healer_task):
         if t:
             t.cancel()
             try:
@@ -794,7 +804,7 @@ async def _awake_replay_loop():
                     recent_kills = [k for k in recent_kills if k.get("timestamp", 0) > now - 120]
                     if recent_kills:
                         kill_signal = min(1.0, len(recent_kills) * 0.3)
-                        _notify_chitchat(
+                        _notify_chitchat_logs(
                             f"[memoria] replay: {len(recent_kills)} kill events detected, urgency={kill_signal:.2f}"
                         )
                 _last_kill_size = cur_size
@@ -874,7 +884,7 @@ async def _awake_replay_loop():
                         avg_urgency = sum(signals.values()) / len(signals)
                         _last_kill_size += 0  # touch to keep ref
                         if avg_urgency > 0.3:
-                            _notify_chitchat(
+                            _notify_chitchat_logs(
                                 f"[memoria] replay: {len(updates)} updates, "
                                 f"signals={ {k: round(v, 2) for k, v in signals.items()} }"
                             )
@@ -892,6 +902,84 @@ async def _sleep_cycle_loop():
         except Exception:
             pass
         await asyncio.sleep(SLEEP_CYCLE_HOURS * 3600)
+
+
+async def _federation_sync_loop():
+    """Periodically sync with all configured peers."""
+    await asyncio.sleep(60)  # initial delay to let server warm up
+    while True:
+        if not FEDERATION_AUTO_SYNC:
+            await asyncio.sleep(FEDERATION_SYNC_INTERVAL)
+            continue
+        try:
+            peers = federation.list_peers()
+            if peers:
+                federation.sync_all()
+        except Exception:
+            pass
+        await asyncio.sleep(FEDERATION_SYNC_INTERVAL)
+
+
+async def _stale_task_reaper_loop():
+    """Auto-fail assigned tasks whose assigned agent no longer exists."""
+    await asyncio.sleep(STALE_TASK_INTERVAL)
+    while True:
+        try:
+            assigned = _list_tasks(None, "assigned")
+            if not assigned:
+                await asyncio.sleep(STALE_TASK_INTERVAL)
+                continue
+            agents = _list_agents()
+            active_ids = {a["id"] for a in agents}
+            for t in assigned:
+                aid = t.get("assigned_to", "")
+                if aid and aid not in active_ids:
+                    t["status"] = "failed"
+                    t["error"] = f"stale: agent {aid} no longer active"
+                    t["failed_at"] = time.time()
+                    _save_task(t)
+                    await _events.broadcast("task_failed", {
+                        "task_id": t["id"],
+                        "project": t.get("project", "unknown"),
+                        "title": t.get("title", "")[:100],
+                        "agent_id": aid,
+                        "error": t["error"],
+                    })
+        except Exception:
+            pass
+        await asyncio.sleep(STALE_TASK_INTERVAL)
+
+
+TASK_HEAL_COOLDOWN = 30  # seconds before a stale-failed task is retried
+
+
+async def _task_healer_loop():
+    """Re-queue stale-failed tasks as pending after cooldown so CORTEX can reassign."""
+    await asyncio.sleep(TASK_HEAL_COOLDOWN)
+    while True:
+        try:
+            failed = _list_tasks(None, "failed")
+            now = time.time()
+            for t in failed:
+                err = t.get("error", "")
+                if not err.startswith("stale:"):
+                    continue
+                failed_at = t.get("failed_at", 0)
+                if now - failed_at < TASK_HEAL_COOLDOWN:
+                    continue
+                t["status"] = "pending"
+                t["error"] = f"retry: previous agent {t.get('assigned_to','?')} was stale"
+                t["assigned_to"] = ""
+                t["failed_at"] = None
+                _save_task(t)
+                await _events.broadcast("task_requeued", {
+                    "task_id": t["id"],
+                    "project": t.get("project", "unknown"),
+                    "title": t.get("title", "")[:100],
+                })
+        except Exception:
+            pass
+        await asyncio.sleep(TASK_HEAL_COOLDOWN)
 
 
 app = FastAPI(title="memoria", version="2.0.0", lifespan=lifespan)
@@ -1450,7 +1538,7 @@ def _list_agents(project: str | None = None) -> list[dict]:
             except OSError:
                 _delete_agent(a["id"])
                 continue
-        if project and a.get("project") != project:
+        if project and a.get("project") != project and a.get("project") != "unknown":
             continue
         agents.append(a)
     return agents
@@ -1476,6 +1564,20 @@ def _notify_chitchat(text: str):
         req = urllib.request.Request(
             f"{CHITCHAT_URL}/general/say",
             data=json.dumps({"text": text[:1000], "from_name": "agent-os"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass
+
+
+def _notify_chitchat_logs(text: str):
+    """Post agent-internal messages to the dedicated logs room."""
+    try:
+        req = urllib.request.Request(
+            f"{CHITCHAT_URL}/{CHITCHAT_LOGS_ROOM}/say",
+            data=json.dumps({"text": text[:1500], "from_name": "agent-os"}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -1517,7 +1619,7 @@ async def register_agent(body: RegisterAgent):
         "capabilities": body.capabilities,
     }
     _save_agent(agent)
-    _notify_chitchat(
+    _notify_chitchat_logs(
         f"agent {agent_id[:12]} started on project '{body.project}': {body.task[:200]}"
         + (f" — conflicts: {'; '.join(conflicts)}" if conflicts else "")
     )
@@ -1572,7 +1674,7 @@ async def deregister_agent(agent_id: str):
         raise HTTPException(404, "agent not found")
     project = a.get("project", "unknown")
     _delete_agent(agent_id)
-    _notify_chitchat(
+    _notify_chitchat_logs(
         f"agent {agent_id[:12]} finished: {a.get('task', '?')[:200]}"
         + f" — {len(a.get('commit_log', []))} commits"
     )
@@ -1710,6 +1812,9 @@ async def update_task(task_id: str, body: UpdateTask):
         if body.status == "assigned":
             t["assigned_at"] = time.time()
             t["assigned_to"] = body.assigned_to or t.get("assigned_to", "")
+            t["error"] = ""
+        if body.status in ("pending", "completed"):
+            t["error"] = ""
     if body.assigned_to:
         t["assigned_to"] = body.assigned_to
         t["assigned_at"] = time.time()
@@ -1772,6 +1877,7 @@ async def cortex_bid(body: CortexBidRequest):
             task["status"] = "assigned"
             task["assigned_to"] = assignment["winner"]["agent_id"]
             task["assigned_at"] = time.time()
+            task["error"] = ""
             payload = task.get("payload", {}) or {}
             if isinstance(payload, str):
                 try:
@@ -1997,6 +2103,7 @@ async def _cortex_auction_loop():
                         task["status"] = "assigned"
                         task["assigned_to"] = assignment["winner"]["agent_id"]
                         task["assigned_at"] = time.time()
+                        task["error"] = ""
                         _save_task(task)
                         await _events.broadcast("task_assigned", {
                             "task_id": task["id"],
@@ -2191,7 +2298,7 @@ async def rollback_snapshot(project: str, body: RollbackRequest):
     if code != 0:
         raise HTTPException(500, f"rollback failed: {stderr}")
     _run_git(["clean", "-fd"], cwd=prj_dir)
-    _notify_chitchat(
+    _notify_chitchat_logs(
         f"rollback on '{project}' to {target['commit_hash'][:12]} "
         f"({target.get('message', '?')})"
     )
@@ -2201,6 +2308,88 @@ async def rollback_snapshot(project: str, body: RollbackRequest):
         "snapshot_id": target["id"],
         "message": target.get("message", ""),
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Federation — Multi-Server Sync
+# ═══════════════════════════════════════════════════════════════
+
+
+class RegisterPeer(BaseModel):
+    name: str
+    url: str
+    api_key: str = ""
+
+
+class SyncRequest(BaseModel):
+    peer: str
+    types: list[str] = []
+    full: bool = False
+
+
+@app.get("/federation/peers")
+async def federation_list_peers():
+    peers = federation.list_peers()
+    return {"peers": peers, "count": len(peers)}
+
+
+@app.post("/federation/peers")
+async def federation_register_peer(body: RegisterPeer):
+    return federation.register_peer(body.name, body.url, body.api_key)
+
+
+@app.delete("/federation/peers/{name}")
+async def federation_remove_peer(name: str):
+    ok = federation.remove_peer(name)
+    if not ok:
+        raise HTTPException(404, f"peer '{name}' not found")
+    return {"ok": True, "removed": name}
+
+
+@app.post("/sync/pull")
+async def sync_pull(body: SyncRequest):
+    result = federation.pull_from_peer(body.peer, body.types or None)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.post("/sync/push")
+async def sync_push(body: SyncRequest):
+    result = federation.push_to_peer(body.peer, body.types or None)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.post("/sync/full")
+async def sync_full(body: SyncRequest):
+    result = federation.sync_full(body.peer, body.types or None)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@app.post("/sync/all")
+async def sync_all(body: SyncRequest):
+    results = federation.sync_all(body.types or None)
+    return {"ok": True, "results": results}
+
+
+@app.get("/sync/changelog")
+async def sync_changelog(since: float = 0.0, types: Optional[str] = None):
+    type_list = types.split(",") if types else None
+    result = federation.get_changelog(since=since, types=type_list)
+    if "error" in result:
+        raise HTTPException(500, result["error"])
+    return result
+
+
+@app.post("/sync/incoming")
+async def sync_incoming(body: dict):
+    """Accept incoming push from a peer."""
+    counts = federation.apply_changelog(body)
+    return {"ok": True, "applied": counts}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3299,7 +3488,15 @@ body {
 
     <!-- Tab 5: Chat -->
     <div class="tab-content" id="tab5">
-      <div class="tab-header"><div class="tab-title">Chitchat</div></div>
+      <div class="tab-header">
+        <div class="tab-title">Chitchat</div>
+        <div class="filter-group" id="chatFilters" style="margin-left:12px">
+          <button class="filter-btn active" data-filter="all" onclick="setChatFilter('all')">All</button>
+          <button class="filter-btn" data-filter="human" onclick="setChatFilter('human')">Human</button>
+          <button class="filter-btn" data-filter="agent-os" onclick="setChatFilter('agent-os')">Agent-OS</button>
+        </div>
+        <div class="text-muted text-sm" style="margin-left:auto">← → switch rooms</div>
+      </div>
       <div class="chat-layout">
         <div class="chat-rooms" id="chatRoomList"></div>
         <div class="chat-main">
@@ -3406,6 +3603,7 @@ const state = {
   projects: [],
   agentFilter: 'all',
   taskFilter: 'all',
+  chatFilter: 'all',
   config: {},
   proposals: []
 };
@@ -3522,6 +3720,14 @@ document.addEventListener('keydown', function(e) {
     document.getElementById('helpModal').classList.remove('open');
     document.getElementById('searchOverlay').classList.remove('open');
     document.activeElement?.blur();
+  }
+  if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && state.tab === 5 && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) {
+    e.preventDefault();
+    const rooms = state.chatRooms;
+    if (rooms.length < 2) return;
+    const cur = rooms.indexOf(state.chatRoom);
+    const next = e.key === 'ArrowLeft' ? (cur - 1 + rooms.length) % rooms.length : (cur + 1) % rooms.length;
+    if (next !== cur) switchChatRoom(rooms[next]);
   }
 });
 
@@ -3710,6 +3916,12 @@ function setTaskFilter(f) {
   renderTasks();
 }
 
+function setChatFilter(f) {
+  state.chatFilter = f;
+  document.querySelectorAll('#chatFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
+  loadChatMessages();
+}
+
 function renderTasks() {
   let list = tasksData;
   if (state.taskFilter !== 'all') {
@@ -3896,7 +4108,8 @@ async function loadChatMessages() {
     const data = await api('/chitchat/' + encodeURIComponent(state.chatRoom) + '?limit=' + limit);
     const msgs = data.messages || [];
     const container = el('chatMessages');
-    container.innerHTML = msgs.slice(-100).map(m => {
+    const filtered = state.chatFilter === 'all' ? msgs : state.chatFilter === 'human' ? msgs.filter(m => m.from !== 'agent-os' && m.from !== 'system') : msgs.filter(m => m.from === state.chatFilter);
+    container.innerHTML = filtered.slice(-100).map(m => {
       const from = m.from || 'system';
       const isSys = m.type === 'system' || from === 'agent-os' || from === 'system';
       const cls = isSys ? ' system' : '';
@@ -4126,6 +4339,9 @@ function loadBrainDelayed() {
   setTimeout(loadBrain, 100);
 }
 
+let brainTaskData = { pending: 0, assigned: 0, completed: 0, failed: 0 };
+let brainAgentData = [];
+
 function loadBrain() {
   const canvas = document.getElementById('brainCanvas');
   const debug = document.getElementById('brainDebug');
@@ -4140,14 +4356,24 @@ function loadBrain() {
   canvas.height = H;
   const ctx = canvas.getContext('2d');
 
-  fetch(BASE + '/cortex/status')
-    .then(r => r.json())
-    .then(data => {
-      const cortex = data.cortex || {};
-      document.getElementById('brainTs').textContent = new Date().toLocaleTimeString();
-      drawBrain(ctx, W, H, cortex, canvas);
-    })
-    .catch(() => drawBrain(ctx, W, H, {}, canvas));
+  Promise.all([
+    fetch(BASE + '/cortex/status').then(r => r.json()).catch(() => ({})),
+    fetch(BASE + '/tasks').then(r => r.json()).catch(() => ({ tasks: [] })),
+    fetch(BASE + '/agents').then(r => r.json()).catch(() => ({ agents: [] })),
+  ]).then(([cortexData, tasksData, agentsData]) => {
+    const cortex = cortexData.cortex || {};
+    const tasks = tasksData.tasks || [];
+    const agents = agentsData.agents || [];
+    brainTaskData = {
+      pending: tasks.filter(t => t.status === 'pending').length,
+      assigned: tasks.filter(t => t.status === 'assigned').length,
+      completed: tasks.filter(t => t.status === 'completed').length,
+      failed: tasks.filter(t => t.status === 'failed').length,
+    };
+    brainAgentData = agents;
+    document.getElementById('brainTs').textContent = new Date().toLocaleTimeString();
+    drawBrain(ctx, W, H, cortex, canvas);
+  }).catch(() => drawBrain(ctx, W, H, {}, canvas));
 }
 
 function drawBrain(ctx, W, H, cortex, canvas) {
@@ -4227,25 +4453,28 @@ function drawBrain(ctx, W, H, cortex, canvas) {
     });
   });
 
-  // Agent nodes (dynamic from cortex data)
-  const agents = cortex.agents_tracked || 0;
+  // Agent nodes (from real agent registry)
   const reputations = cortex.avg_reputations || {};
   let ai = 0;
-  for (const [agentId, rep] of Object.entries(reputations)) {
-    const ax = 0.08 * W + ai * 50;
+  for (const agent of brainAgentData) {
+    const aid = agent.id || '?';
+    const rep = reputations[aid] || 0.5;
+    const hbAge = Date.now() / 1000 - (agent.last_heartbeat || 0);
+    const isAlive = hbAge < 300;
+    const ax = 0.08 * W + ai * 60;
     const ay = H - 40;
     ctx.beginPath();
     ctx.arc(ax, ay, 6, 0, Math.PI * 2);
-    ctx.fillStyle = rep > 0.6 ? '#00b894' : rep > 0.3 ? '#fdcb6e' : '#e17055';
+    ctx.fillStyle = !isAlive ? '#e17055' : rep > 0.6 ? '#00b894' : rep > 0.3 ? '#fdcb6e' : '#e17055';
     ctx.fill();
     ctx.fillStyle = '#8b8da0';
     ctx.font = '8px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(agentId.slice(0, 8), ax, ay + 18);
+    ctx.fillText(aid.slice(0, 8), ax, ay + 18);
     ai++;
   }
 
-  // Stats overlay
+  // Stats overlay (CORTEX + real task/agent data)
   ctx.fillStyle = 'rgba(139,141,160,0.6)';
   ctx.font = '11px monospace';
   ctx.textAlign = 'left';
@@ -4254,8 +4483,9 @@ function drawBrain(ctx, W, H, cortex, canvas) {
     `Q-states=${cortex.q_table_size || 0}`,
     `episodes=${cortex.episodes || 0}`,
     `replay=${cortex.replay_buffer || 0}`,
-    `agents=${agents}`,
+    `agents=${brainAgentData.length}`,
     `wm=${cortex.wm_stack_depth || 0}`,
+    `tasks: ${brainTaskData.pending}P ${brainTaskData.assigned}A ${brainTaskData.completed}D ${brainTaskData.failed}F`,
   ];
   stats.forEach((s, i) => {
     ctx.fillText(s, 12, 20 + i * 16);
@@ -4303,6 +4533,9 @@ function drawBrain(ctx, W, H, cortex, canvas) {
       `Episodic: ${cortex.episodes || 0} stored`,
       `Working Mem: depth ${cortex.wm_stack_depth || 0}`,
       `Surprise α: ${(cortex.alpha_surprise || 0)} β: ${(cortex.beta_surprise || 0)}`,
+      `Tasks: ${brainTaskData.pending} pending, ${brainTaskData.assigned} assigned`,
+      `      ${brainTaskData.completed} done, ${brainTaskData.failed} failed`,
+      `Agents: ${brainAgentData.length} active`,
     ];
     signalsEl.innerHTML = items.map(s => `<div>${s}</div>`).join('');
   }

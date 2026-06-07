@@ -703,8 +703,19 @@ type memoryLoadedMsg struct {
 }
 
 func (m *model) refreshChat() tea.Cmd {
+	rooms, err := m.chitchat.Rooms()
+	if err == nil {
+		var names []string
+		for _, r := range rooms {
+			names = append(names, r.Name)
+		}
+		m.rooms = names
+		if m.activeRoom >= len(m.rooms) {
+			m.activeRoom = 0
+		}
+	}
 	room := m.rooms[m.activeRoom]
-	_, err := m.chitchat.History(room, historyLimit)
+	_, err = m.chitchat.History(room, historyLimit)
 	if err != nil {
 		return func() tea.Msg { return errMsg{err} }
 	}

@@ -7,6 +7,7 @@ module.exports = {
 
     const getProjectName = () => {
       if (project && project.name) return project.name;
+      if (process.env.MEMORIA_PROJECT) return process.env.MEMORIA_PROJECT;
       if (directory) {
         const parts = directory.replace(/\/+$/, "").split("/");
         return parts[parts.length - 1] || "unknown";

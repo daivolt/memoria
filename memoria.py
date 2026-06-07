@@ -43,6 +43,15 @@ Clients:
   memoria client remove <name>         Remove client
   memoria push-clients                 Push updates to all clients
 
+Federation:
+  memoria peers                        List federation peers
+  memoria peer <name> <url> [key]      Register a federation peer
+  memoria peer remove <name>           Remove a federation peer
+  memoria sync pull <peer> [types]     Pull changes from peer
+  memoria sync push <peer> [types]     Push changes to peer
+  memoria sync full <peer> [types]     Bidirectional sync with peer
+  memoria sync all [types]             Sync with all peers
+
 CORTEX (autonomous agent task allocation):
   memoria cortex status                Show Q-table, reputation, epsilon
   memoria cortex learnings [n]         Show last N task outcomes
@@ -744,6 +753,74 @@ def main():
             else:
                 print(f"  {name}: {status.upper()} — {result.get('error', '')}")
         print(f"Pushed {r.get('pushed', 0)}/{r.get('total', 0)} clients")
+    elif cmd == "peers":
+        r = _req("GET", "/federation/peers")
+        if "error" in r:
+            print(r["error"], file=sys.stderr)
+            sys.exit(1)
+        peers = r.get("peers", [])
+        if not peers:
+            print("No federation peers registered")
+            return
+        for p in peers:
+            key = " (key)" if p.get("api_key") else ""
+            print(f"  {p['name']:<15} {p['url']:<30}{key}")
+    elif cmd == "peer":
+        if len(args) < 2:
+            print("usage: memoria peer <name> <url> [api_key]", file=sys.stderr)
+            print("       memoria peer remove <name>", file=sys.stderr)
+            sys.exit(1)
+        if args[1] == "remove":
+            if len(args) < 3:
+                print("usage: memoria peer remove <name>", file=sys.stderr)
+                sys.exit(1)
+            r = _req("DELETE", f"/federation/peers/{urllib.parse.quote(args[2])}")
+            if "error" in r:
+                print(r["error"], file=sys.stderr)
+                sys.exit(1)
+            print(f"peer '{args[2]}' removed")
+        else:
+            name = args[1]
+            url = args[2] if len(args) > 2 else ""
+            api_key = args[3] if len(args) > 3 else ""
+            r = _req("POST", "/federation/peers", {"name": name, "url": url, "api_key": api_key})
+            if "error" in r:
+                print(r["error"], file=sys.stderr)
+                sys.exit(1)
+            print(f"peer '{name}' {r.get('action', 'registered')}")
+    elif cmd == "sync":
+        if len(args) < 3:
+            print("usage: memoria sync <pull|push|full|all> [peer] [types]", file=sys.stderr)
+            sys.exit(1)
+        sub = args[1]
+        peer_name = args[2] if len(args) > 2 else ""
+        types = args[3].split(",") if len(args) > 3 else []
+        if sub == "all":
+            r = _req("POST", "/sync/all", {"peer": "", "types": types})
+        elif sub in ("pull", "push", "full"):
+            if not peer_name:
+                print(f"usage: memoria sync {sub} <peer> [types]", file=sys.stderr)
+                sys.exit(1)
+            r = _req("POST", f"/sync/{sub}", {"peer": peer_name, "types": types, "full": sub == "full"})
+        else:
+            print(f"unknown sync subcommand: {sub}", file=sys.stderr)
+            sys.exit(1)
+        if "error" in r:
+            print(r["error"], file=sys.stderr)
+            sys.exit(1)
+        if sub == "all":
+            for res in r.get("results", []):
+                peer_res = res.get("result", {})
+                status = "OK" if peer_res.get("ok") else "FAIL"
+                print(f"  {res['peer']}: {status}")
+            print(f"Synced with {len(r.get('results', []))} peers")
+        elif sub == "full":
+            print(f"Sync with '{peer_name}' complete")
+            print(f"  pulled: {r.get('pull', {})}")
+            print(f"  pushed: {r.get('push', {})}")
+        else:
+            print(f"{sub.capitalize()} from '{peer_name}' complete")
+            print(f"  applied: {r.get('applied', {})}")
     elif cmd == "cortex":
         if len(args) < 2:
             print("usage: memoria cortex <status|learnings|bid|assign|complete|policy> [...]", file=sys.stderr)
