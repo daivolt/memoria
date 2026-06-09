@@ -28,10 +28,34 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+import numpy as np
+
 from compress import compress
 from context import current_state, write_state, release_state, claim_file
 from cortex import get_engine, CortexEngine
+from social_learning import (
+    Lesson,
+    save_lesson,
+    load_lesson,
+    delete_lesson,
+    list_lessons,
+    find_lessons_for_topic,
+    create_lesson_from_agent,
+    record_student_outcome,
+    get_student_outcomes,
+    get_cultural_memory,
+    get_evolution_engine,
+    consolidate_cultural_knowledge,
+    get_agent_curriculum,
+)
 import federation
+
+try:
+    import asyncpg
+except ImportError:
+    asyncpg = None
+
+import stats
 
 # ── Paths ──────────────────────────────────────────────────────
 
@@ -49,14 +73,25 @@ CHITCHAT_LOGS_ROOM = os.environ.get("CHITCHAT_LOGS_ROOM", "logs")
 CHITCHAT_POLL_INTERVAL = 3
 CHITCHAT_CONSOLIDATE_THRESHOLD = 20
 CHITCHAT_DIR = WORKDIR / "chitchat"
-CHITCHAT_MAX_MESSAGES = 10000          # per-room slot limit (hippocampal capacity)
-CHITCHAT_ROOMS = [r.strip() for r in os.environ.get("CHITCHAT_ROOMS", "general,logs").split(",")]
+CHITCHAT_MAX_MESSAGES = 10000  # per-room slot limit (hippocampal capacity)
+CHITCHAT_ROOMS = [
+    r.strip() for r in os.environ.get("CHITCHAT_ROOMS", "general,logs").split(",")
+]
 SLEEP_CYCLE_HOURS = int(os.environ.get("SLEEP_CYCLE_HOURS", "6"))
-SESSION_MAX_RECORDS = int(os.environ.get("SESSION_MAX_RECORDS", "5000"))  # total session slot limit
+SESSION_MAX_RECORDS = int(
+    os.environ.get("SESSION_MAX_RECORDS", "5000")
+)  # total session slot limit
 AUTO_ACCEPT_THRESHOLD = int(os.environ.get("AUTO_ACCEPT_THRESHOLD", "3"))
 CLIENTS_DIR = WORKDIR / "clients"
-CLIENTS_CONF = Path(os.environ.get("MEMORIA_CLIENTS_CONF", "/mnt/external-drive/code/memoria/opencode-integration/clients.conf"))
-FEDERATION_SYNC_INTERVAL = int(os.environ.get("FEDERATION_SYNC_INTERVAL", "300"))  # 5 min default
+CLIENTS_CONF = Path(
+    os.environ.get(
+        "MEMORIA_CLIENTS_CONF",
+        "/mnt/external-drive/code/memoria/opencode-integration/clients.conf",
+    )
+)
+FEDERATION_SYNC_INTERVAL = int(
+    os.environ.get("FEDERATION_SYNC_INTERVAL", "300")
+)  # 5 min default
 FEDERATION_AUTO_SYNC = os.environ.get("FEDERATION_AUTO_SYNC", "true").lower() == "true"
 
 # ── Background task references ────────────────────────────────
@@ -246,7 +281,9 @@ _last_id: str | None = None
 
 _chitchat_cursors: dict[str, str] = {}
 _chitchat_unconsolidated: int = 0
-_chitchat_consolidated_through: dict[str, float] = {}  # newest ingested_at processed per room
+_chitchat_consolidated_through: dict[
+    str, float
+] = {}  # newest ingested_at processed per room
 _recent_chat_texts: dict[str, deque[str]] = {}  # per-room sliding window for dedup
 
 
@@ -294,7 +331,9 @@ def _chitchat_rooms() -> list[dict]:
 
 def _chitchat_history(room: str) -> list[dict]:
     try:
-        req = urllib.request.Request(f"{CHITCHAT_URL}/{urllib.parse.quote(room)}/history")
+        req = urllib.request.Request(
+            f"{CHITCHAT_URL}/{urllib.parse.quote(room)}/history"
+        )
         with urllib.request.urlopen(req, timeout=3) as resp:
             return json.loads(resp.read()).get("messages", [])
     except Exception:
@@ -428,12 +467,12 @@ def _prune_chitchat():
         consolidated.sort(key=lambda x: x[0])  # oldest first
         slot_remaining = CHITCHAT_MAX_MESSAGES - len(unconsolidated)
         if slot_remaining < 0:
-            unconsolidated = unconsolidated[-(CHITCHAT_MAX_MESSAGES // 2):]
+            unconsolidated = unconsolidated[-(CHITCHAT_MAX_MESSAGES // 2) :]
             slot_remaining = CHITCHAT_MAX_MESSAGES - len(unconsolidated)
         kept_consolidated = consolidated[-slot_remaining:] if slot_remaining > 0 else []
         kept = unconsolidated + [line for _, line in kept_consolidated]
         if len(kept) < len(lines):
-            pruned = consolidated[:max(0, len(consolidated) - slot_remaining)]
+            pruned = consolidated[: max(0, len(consolidated) - slot_remaining)]
             for _, line in pruned:
                 try:
                     pruned_ids.append(json.loads(line).get("id", ""))
@@ -501,9 +540,12 @@ def _consolidate_chitchat():
     if not top_keywords:
         _chitchat_unconsolidated = 0
         return
-    
+
     # Skip overly generic single-keyword patterns (e.g. just "agent" from system messages)
-    if len(top_keywords) <= 2 and all(kw in ("agent", "task", "server", "project", "message", "started", "pattern") for kw in top_keywords):
+    if len(top_keywords) <= 2 and all(
+        kw in ("agent", "task", "server", "project", "message", "started", "pattern")
+        for kw in top_keywords
+    ):
         _chitchat_unconsolidated = 0
         return
 
@@ -519,7 +561,9 @@ def _consolidate_chitchat():
             return
 
     summary_parts = []
-    summary_parts.append(f"Pattern across {len(room_counts)} room(s): {', '.join(sorted(room_counts))}")
+    summary_parts.append(
+        f"Pattern across {len(room_counts)} room(s): {', '.join(sorted(room_counts))}"
+    )
     summary_parts.append(f"Participants: {', '.join(sorted(from_counts))}")
     summary_parts.append(f"Keywords: {', '.join(top_keywords)}")
     summary = " | ".join(summary_parts)
@@ -547,12 +591,17 @@ def _consolidate_chitchat():
     else:
         # Auto-accept flow: check if same topic already proposed
         existing_proposals = _load_proposals()
-        existing = next((p for p in existing_proposals if p.get("topic") == suggested_topic[:50]), None)
+        existing = next(
+            (p for p in existing_proposals if p.get("topic") == suggested_topic[:50]),
+            None,
+        )
         if existing:
             existing["hits"] = existing.get("hits", 1) + 1
             if existing["hits"] >= AUTO_ACCEPT_THRESHOLD:
                 _add_fact_to_topic(existing["topic"], existing["text"])
-                existing_proposals = [p for p in existing_proposals if p.get("id") != existing["id"]]
+                existing_proposals = [
+                    p for p in existing_proposals if p.get("id") != existing["id"]
+                ]
                 _save_proposals(existing_proposals)
                 _notify_chitchat_logs(
                     f"[memoria] pattern '{suggested_topic}' auto-accepted"
@@ -620,7 +669,7 @@ def _prune_sessions():
 
 def _deep_consolidate():
     """Cross-layer consolidation: sessions → topics + chat → topics.
-    
+
     Enhanced with:
       - Hippocampal episode consolidation with similarity clustering
       - Offline Q-learning via replay
@@ -659,7 +708,9 @@ def _deep_consolidate():
                     engine.replay.replay_step(lr_multiplier=0.3)
             # Reward-based pruning: remove episodes with reward < 0.2
             before = len(episodes)
-            engine.hippocampus.episodes = [e for e in episodes if e.get("reward", 0) >= 0.2]
+            engine.hippocampus.episodes = [
+                e for e in episodes if e.get("reward", 0) >= 0.2
+            ]
             pruned = before - len(engine.hippocampus.episodes)
             if pruned:
                 engine.hippocampus.save()
@@ -677,9 +728,11 @@ def _deep_consolidate():
                     if top_kw:
                         existing = _load_existing_topic_names()
                         if not _find_matching_topic(top_kw, existing):
-                            prop_text = (f"[hippocampal consolidation] Cluster '{ttype}': "
-                                         f"{len(high_val)} high-reward episodes, "
-                                         f"keywords: {', '.join(top_kw)}")
+                            prop_text = (
+                                f"[hippocampal consolidation] Cluster '{ttype}': "
+                                f"{len(high_val)} high-reward episodes, "
+                                f"keywords: {', '.join(top_kw)}"
+                            )
                             prop_path = WORKDIR / "proposals.jsonl"
                             record = {
                                 "id": f"hip_consolidate_{int(time.time())}",
@@ -713,7 +766,9 @@ def _deep_consolidate():
         if top:
             existing = _load_existing_topic_names()
             if not _find_matching_topic(top, existing):
-                prop_text = f"[deep consolidation] Recent session keywords: {', '.join(top)}"
+                prop_text = (
+                    f"[deep consolidation] Recent session keywords: {', '.join(top)}"
+                )
                 prop_path = WORKDIR / "proposals.jsonl"
                 record = {
                     "id": f"deep_consolidate_{int(time.time())}",
@@ -733,7 +788,30 @@ def _deep_consolidate():
 async def lifespan(app: FastAPI):
     _init_index()
     federation._init_federation(WORKDIR)
-    global _poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task, _awake_replay_task, _federation_sync_task, _stale_task_reaper_task, _task_healer_task
+    global \
+        _pool, \
+        _poll_task, \
+        _chitchat_poll_task, \
+        _sleep_cycle_task, \
+        _cortex_task, \
+        _skill_watch_task, \
+        _awake_replay_task, \
+        _federation_sync_task, \
+        _stale_task_reaper_task, \
+        _task_healer_task
+    _pool = None
+    if asyncpg is not None:
+        try:
+            _pool = await asyncpg.create_pool(
+                dsn="postgresql://postgres@localhost/bloom_terminal",
+                min_size=1,
+                max_size=5,
+            )
+            stats.init_pool(_pool)
+            await stats.ensure_tables()
+        except Exception as exc:
+            print(f"[stats] PostgreSQL pool init failed: {exc}", flush=True)
+            _pool = None
     _poll_task = asyncio.create_task(_poll_loop())
     _chitchat_poll_task = asyncio.create_task(_chitchat_poll_loop())
     _sleep_cycle_task = asyncio.create_task(_sleep_cycle_loop())
@@ -744,7 +822,22 @@ async def lifespan(app: FastAPI):
     _stale_task_reaper_task = asyncio.create_task(_stale_task_reaper_loop())
     _task_healer_task = asyncio.create_task(_task_healer_loop())
     yield
-    for t in (_poll_task, _chitchat_poll_task, _sleep_cycle_task, _cortex_task, _skill_watch_task, _awake_replay_task, _federation_sync_task, _stale_task_reaper_task, _task_healer_task):
+    if _pool is not None:
+        try:
+            await _pool.close()
+        except Exception:
+            pass
+    for t in (
+        _poll_task,
+        _chitchat_poll_task,
+        _sleep_cycle_task,
+        _cortex_task,
+        _skill_watch_task,
+        _awake_replay_task,
+        _federation_sync_task,
+        _stale_task_reaper_task,
+        _task_healer_task,
+    ):
         if t:
             t.cancel()
             try:
@@ -784,7 +877,9 @@ async def _awake_replay_loop():
       - idle_boost: ramps up when no recent task activity
     """
     _KILL_AUDIT_PATH = Path("/tmp/memoria_kill_audit.jsonl")
-    _last_kill_size = _KILL_AUDIT_PATH.stat().st_size if _KILL_AUDIT_PATH.exists() else 0
+    _last_kill_size = (
+        _KILL_AUDIT_PATH.stat().st_size if _KILL_AUDIT_PATH.exists() else 0
+    )
     _last_task_activity = time.time()
 
     await asyncio.sleep(5)
@@ -801,7 +896,9 @@ async def _awake_replay_loop():
                     with open(_KILL_AUDIT_PATH) as f:
                         lines = f.readlines()
                     recent_kills = [json.loads(l) for l in lines if l.strip()]
-                    recent_kills = [k for k in recent_kills if k.get("timestamp", 0) > now - 120]
+                    recent_kills = [
+                        k for k in recent_kills if k.get("timestamp", 0) > now - 120
+                    ]
                     if recent_kills:
                         kill_signal = min(1.0, len(recent_kills) * 0.3)
                         _notify_chitchat_logs(
@@ -842,10 +939,15 @@ async def _awake_replay_loop():
 
                 # Dialectic conflict: from Socratic records
                 if engine.socrates.dialectic_records:
-                    recent_dialectics = [d for d in engine.socrates.dialectic_records
-                                         if d.get("timestamp", 0) > now - 300]
+                    recent_dialectics = [
+                        d
+                        for d in engine.socrates.dialectic_records
+                        if d.get("timestamp", 0) > now - 300
+                    ]
                     if recent_dialectics:
-                        conflict = sum(d.get("conflict_score", 0) for d in recent_dialectics) / len(recent_dialectics)
+                        conflict = sum(
+                            d.get("conflict_score", 0) for d in recent_dialectics
+                        ) / len(recent_dialectics)
                         if conflict > 0.1:
                             signals["conflict_score"] = min(1.0, conflict)
 
@@ -874,8 +976,13 @@ async def _awake_replay_loop():
 
                 # Manual trigger signal (from POST /replay/trigger or agent_join)
                 global _manual_replay_signal
-                if _manual_replay_signal and _manual_replay_signal.get("project") in ("", project):
-                    signals["manual_trigger"] = _manual_replay_signal.get("urgency", 0.5)
+                if _manual_replay_signal and _manual_replay_signal.get("project") in (
+                    "",
+                    project,
+                ):
+                    signals["manual_trigger"] = _manual_replay_signal.get(
+                        "urgency", 0.5
+                    )
                     _manual_replay_signal = None
 
                 if signals:
@@ -942,19 +1049,24 @@ async def _stale_task_reaper_loop():
                 else:
                     ag = agent_map.get(aid, {})
                     if not ag.get("task", "").strip():
-                        stale_reason = f"agent {aid} has no task context (generic session)"
+                        stale_reason = (
+                            f"agent {aid} has no task context (generic session)"
+                        )
                 if stale_reason:
                     t["status"] = "failed"
                     t["error"] = f"stale: {stale_reason}"
                     t["failed_at"] = time.time()
                     _save_task(t)
-                    await _events.broadcast("task_failed", {
-                        "task_id": t["id"],
-                        "project": t.get("project", "unknown"),
-                        "title": t.get("title", "")[:100],
-                        "agent_id": aid,
-                        "error": t["error"],
-                    })
+                    await _events.broadcast(
+                        "task_failed",
+                        {
+                            "task_id": t["id"],
+                            "project": t.get("project", "unknown"),
+                            "title": t.get("title", "")[:100],
+                            "agent_id": aid,
+                            "error": t["error"],
+                        },
+                    )
         except Exception:
             pass
         await asyncio.sleep(STALE_TASK_INTERVAL)
@@ -978,15 +1090,20 @@ async def _task_healer_loop():
                 if now - failed_at < TASK_HEAL_COOLDOWN:
                     continue
                 t["status"] = "pending"
-                t["error"] = f"retry: previous agent {t.get('assigned_to','?')} was stale"
+                t["error"] = (
+                    f"retry: previous agent {t.get('assigned_to', '?')} was stale"
+                )
                 t["assigned_to"] = ""
                 t["failed_at"] = None
                 _save_task(t)
-                await _events.broadcast("task_requeued", {
-                    "task_id": t["id"],
-                    "project": t.get("project", "unknown"),
-                    "title": t.get("title", "")[:100],
-                })
+                await _events.broadcast(
+                    "task_requeued",
+                    {
+                        "task_id": t["id"],
+                        "project": t.get("project", "unknown"),
+                        "title": t.get("title", "")[:100],
+                    },
+                )
         except Exception:
             pass
         await asyncio.sleep(TASK_HEAL_COOLDOWN)
@@ -1000,11 +1117,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(stats.router)
 
 # ── WebSocket Event Bus ────────────────────────────────────────
 
+
 class EventBroadcaster:
     """Push event notifications to all connected WebSocket clients."""
+
     def __init__(self):
         self._connections: set[WebSocket] = set()
 
@@ -1024,6 +1144,7 @@ class EventBroadcaster:
             except Exception:
                 stale.add(ws)
         self._connections -= stale
+
 
 _events = EventBroadcaster()
 
@@ -1050,7 +1171,21 @@ async def health():
         if topics_dir.exists()
         else []
     )
-    chitchat_rooms_list = sorted(d.name for d in CHITCHAT_DIR.iterdir() if d.is_dir()) if CHITCHAT_DIR.exists() else []
+    chitchat_rooms_list = (
+        sorted(d.name for d in CHITCHAT_DIR.iterdir() if d.is_dir())
+        if CHITCHAT_DIR.exists()
+        else []
+    )
+    grounded_dir = Path("/var/tmp/memoria/visual")
+    grounded_concepts = (
+        sorted(
+            d.name
+            for d in grounded_dir.iterdir()
+            if d.is_dir() and (d / "index.json").exists()
+        )
+        if grounded_dir.exists()
+        else []
+    )
     return {
         "ok": True,
         "sessions_indexed": count,
@@ -1061,6 +1196,8 @@ async def health():
         "sleep_cycle_hours": SLEEP_CYCLE_HOURS,
         "session_max_records": SESSION_MAX_RECORDS,
         "chitchat_max_messages": CHITCHAT_MAX_MESSAGES,
+        "grounded_concepts": grounded_concepts,
+        "grounded_cognition": "active",
     }
 
 
@@ -1089,12 +1226,14 @@ async def recall(
                 (qs, limit),
             ).fetchall()
             for r in rows:
-                results.append({
-                    "id": r[0],
-                    "title": r[1],
-                    "summary": (r[2] or "")[:300],
-                    "source": "session",
-                })
+                results.append(
+                    {
+                        "id": r[0],
+                        "title": r[1],
+                        "summary": (r[2] or "")[:300],
+                        "source": "session",
+                    }
+                )
         except sqlite3.OperationalError:
             pass
 
@@ -1106,14 +1245,16 @@ async def recall(
                 (qs, limit),
             ).fetchall()
             for r in rows:
-                results.append({
-                    "id": r[0],
-                    "title": f"[{r[1]}] {r[2]}",
-                    "summary": (r[3] or "")[:300],
-                    "source": "chat",
-                    "room": r[1],
-                    "from": r[2],
-                })
+                results.append(
+                    {
+                        "id": r[0],
+                        "title": f"[{r[1]}] {r[2]}",
+                        "summary": (r[3] or "")[:300],
+                        "source": "chat",
+                        "room": r[1],
+                        "from": r[2],
+                    }
+                )
         except sqlite3.OperationalError:
             pass
 
@@ -1639,12 +1780,15 @@ async def register_agent(body: RegisterAgent):
             eng.replay.signal_weighted_replay({"agent_join": 0.5})
     except Exception:
         pass
-    await _events.broadcast("agent_registered", {
-        "agent_id": agent_id,
-        "project": body.project,
-        "capabilities": body.capabilities,
-        "task": body.task[:100],
-    })
+    await _events.broadcast(
+        "agent_registered",
+        {
+            "agent_id": agent_id,
+            "project": body.project,
+            "capabilities": body.capabilities,
+            "task": body.task[:100],
+        },
+    )
     return {"ok": True, "agent_id": agent_id, "conflicts": conflicts}
 
 
@@ -1694,11 +1838,14 @@ async def deregister_agent(agent_id: str):
             eng.replay.signal_weighted_replay({"agent_leave": 0.4})
     except Exception:
         pass
-    await _events.broadcast("agent_deregistered", {
-        "agent_id": agent_id,
-        "project": project,
-        "task": a.get("task", "")[:100],
-    })
+    await _events.broadcast(
+        "agent_deregistered",
+        {
+            "agent_id": agent_id,
+            "project": project,
+            "task": a.get("task", "")[:100],
+        },
+    )
     return {"ok": True, "commits": len(a.get("commit_log", []))}
 
 
@@ -1788,10 +1935,17 @@ async def create_task(body: CreateTask):
         _notify_chitchat(
             f"@{body.assigned_to} task assigned: {body.task[:200]} on '{body.project}'"
         )
-    asyncio.ensure_future(_events.broadcast("task_created", {
-        "task_id": task_id, "project": body.project,
-        "title": body.title[:100], "assigned_to": body.assigned_to,
-    }))
+    asyncio.ensure_future(
+        _events.broadcast(
+            "task_created",
+            {
+                "task_id": task_id,
+                "project": body.project,
+                "title": body.title[:100],
+                "assigned_to": body.assigned_to,
+            },
+        )
+    )
     return {"ok": True, "task_id": task_id}
 
 
@@ -1926,15 +2080,20 @@ async def cortex_complete(body: CortexCompleteRequest):
     t["payload"] = payload
     _save_task(t)
     da_signals = engine.record_outcome(
-        body.task_id, body.agent_id,
+        body.task_id,
+        body.agent_id,
         t.get("title", "?"),
-        body.task_type, body.complexity, body.reward,
+        body.task_type,
+        body.complexity,
+        body.reward,
     )
     return {
         "ok": True,
         "task_id": body.task_id,
         "reward": body.reward,
-        "da_signals": {k: round(v, 4) for k, v in da_signals.items()} if isinstance(da_signals, dict) else {"rpe": round(da_signals, 4)},
+        "da_signals": {k: round(v, 4) for k, v in da_signals.items()}
+        if isinstance(da_signals, dict)
+        else {"rpe": round(da_signals, 4)},
         "status": "completed",
     }
 
@@ -1948,7 +2107,7 @@ class ReplayTriggerRequest(BaseModel):
 @app.post("/replay/trigger")
 async def trigger_replay(body: ReplayTriggerRequest):
     """Manual replay trigger — injects a signal into the next awake replay cycle.
-    
+
     The signal is stored globally and consumed by _awake_replay_loop()
     on its next iteration. This provides the MANUAL trigger from the spec.
     """
@@ -1976,7 +2135,7 @@ _manual_replay_signal: dict | None = None
 @app.post("/cortex/context")
 async def cortex_context(body: CortexBidRequest):
     """Automatic context retrieval for a task — hippocampal pattern completion.
-    
+
     Given a task description, finds the most similar past episodes and returns
     them as structured context. No manual query needed — the task itself IS the query.
     """
@@ -1988,8 +2147,10 @@ async def cortex_context(body: CortexBidRequest):
     task = pending[0]
     meta = task.get("payload", {}) or {}
     if isinstance(meta, str):
-        try: meta = json.loads(meta)
-        except: meta = {}
+        try:
+            meta = json.loads(meta)
+        except:
+            meta = {}
     similar = engine.hippocampus.context_for_task(
         task.get("title", ""),
         meta.get("type", "generic"),
@@ -1997,13 +2158,15 @@ async def cortex_context(body: CortexBidRequest):
     )
     context_list = []
     for ep in similar:
-        context_list.append({
-            "task_title": ep.get("task_title", ""),
-            "outcome": ep.get("outcome", ""),
-            "reward": ep.get("reward", 0.5),
-            "agent_id": ep.get("agent_id", ""),
-            "age_sec": int(time.time() - ep.get("timestamp", 0)),
-        })
+        context_list.append(
+            {
+                "task_title": ep.get("task_title", ""),
+                "outcome": ep.get("outcome", ""),
+                "reward": ep.get("reward", 0.5),
+                "agent_id": ep.get("agent_id", ""),
+                "age_sec": int(time.time() - ep.get("timestamp", 0)),
+            }
+        )
     return {
         "ok": True,
         "task_id": task["id"],
@@ -2050,8 +2213,16 @@ async def cortex_policy(project: Optional[str] = None):
         "policy": policy,
         "ensembles": {
             "agents": len(engine.auction.reputation),
-            "avg_responsiveness": round(sum(engine.auction.responsiveness.values()) / max(len(engine.auction.responsiveness), 1), 3),
-            "avg_choice": round(sum(engine.auction.choice.values()) / max(len(engine.auction.choice), 1), 3),
+            "avg_responsiveness": round(
+                sum(engine.auction.responsiveness.values())
+                / max(len(engine.auction.responsiveness), 1),
+                3,
+            ),
+            "avg_choice": round(
+                sum(engine.auction.choice.values())
+                / max(len(engine.auction.choice), 1),
+                3,
+            ),
         },
     }
 
@@ -2077,11 +2248,14 @@ async def cortex_replay(body: CortexReplayRequest):
         body.signals or None,
         batch_size=body.batch_size,
     )
-    await _events.broadcast("replay_triggered", {
-        "project": body.project,
-        "updates": len(updates),
-        "signals": body.signals,
-    })
+    await _events.broadcast(
+        "replay_triggered",
+        {
+            "project": body.project,
+            "updates": len(updates),
+            "signals": body.signals,
+        },
+    )
     return {
         "ok": True,
         "project": body.project,
@@ -2116,13 +2290,16 @@ async def _cortex_auction_loop():
                         task["assigned_at"] = time.time()
                         task["error"] = ""
                         _save_task(task)
-                        await _events.broadcast("task_assigned", {
-                            "task_id": task["id"],
-                            "project": project,
-                            "title": task.get("title", "")[:100],
-                            "agent_id": assignment["winner"]["agent_id"],
-                            "winner": assignment,
-                        })
+                        await _events.broadcast(
+                            "task_assigned",
+                            {
+                                "task_id": task["id"],
+                                "project": project,
+                                "title": task.get("title", "")[:100],
+                                "agent_id": assignment["winner"]["agent_id"],
+                                "winner": assignment,
+                            },
+                        )
         except Exception:
             pass
         await asyncio.sleep(15)
@@ -2135,7 +2312,6 @@ async def _skill_watch_loop():
         return
     last_mtimes: dict[str, float] = {}
     debounce = 0.0
-    print(f"[skill-watch] watching {skills_dir} for changes")
     while True:
         await asyncio.sleep(10)
         try:
@@ -2153,10 +2329,181 @@ async def _skill_watch_loop():
             now = time.time()
             if changed and now - debounce > 30:
                 debounce = now
-                print(f"[skill-watch] change detected in skills/, pushing to clients")
                 await asyncio.to_thread(_push_to_clients)
         except Exception:
             pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Social / Cultural Learning — Tomasello (1999) Teaching Protocol
+# ═══════════════════════════════════════════════════════════════
+
+
+class CreateLesson(BaseModel):
+    teacher_agent: str
+    project: str
+    title: str
+    topic: str
+    facts: list[str] = []
+    examples: list[str] = []
+    exercises: list[str] = []
+    prerequisites: list[str] = []
+
+
+class RecordOutcome(BaseModel):
+    student_agent: str
+    success: bool = True
+    score_delta: float | None = None
+
+
+class EvolveRequest(BaseModel):
+    topic: str = ""
+    project: str = "unknown"
+
+
+class ConsolidateCulture(BaseModel):
+    project: str = "unknown"
+
+
+@app.post("/teach/lesson")
+async def api_create_lesson(body: CreateLesson):
+    """Create a structured lesson from an agent's knowledge."""
+    lesson = create_lesson_from_agent(
+        teacher_agent=body.teacher_agent,
+        project=body.project,
+        title=body.title,
+        topic=body.topic,
+        facts=body.facts,
+        examples=body.examples,
+        exercises=body.exercises,
+        prerequisites=body.prerequisites,
+    )
+    _notify_chitchat_logs(
+        f"[teach] agent {body.teacher_agent[:12]} created lesson "
+        f"'{body.title}' (topic={body.topic}, {len(body.facts)} facts)"
+    )
+    return {"ok": True, "lesson": lesson.to_dict()}
+
+
+@app.get("/teach/lessons")
+async def api_list_lessons(
+    topic: str = "",
+    project: str = "",
+    min_score: float = 0.0,
+):
+    """List available lessons, optionally filtered."""
+    lessons = list_lessons(
+        topic=topic or None,
+        project=project or None,
+        min_score=min_score,
+    )
+    return {
+        "ok": True,
+        "lessons": [l.to_dict() for l in lessons],
+        "count": len(lessons),
+    }
+
+
+@app.get("/teach/lessons/{lesson_id}")
+async def api_get_lesson(lesson_id: str):
+    """Get a single lesson by ID."""
+    lesson = load_lesson(lesson_id)
+    if lesson is None:
+        raise HTTPException(404, f"lesson '{lesson_id}' not found")
+    return {"ok": True, "lesson": lesson.to_dict()}
+
+
+@app.delete("/teach/lessons/{lesson_id}")
+async def api_delete_lesson(lesson_id: str):
+    """Delete a lesson."""
+    lesson = load_lesson(lesson_id)
+    if lesson is None:
+        raise HTTPException(404, f"lesson '{lesson_id}' not found")
+    delete_lesson(lesson_id)
+    return {"ok": True, "deleted": lesson_id}
+
+
+@app.post("/teach/lessons/{lesson_id}/outcome")
+async def api_record_outcome(lesson_id: str, body: RecordOutcome):
+    """Record a student's outcome for a lesson."""
+    result = record_student_outcome(
+        lesson_id=lesson_id,
+        student_agent=body.student_agent,
+        success=body.success,
+        score_delta=body.score_delta,
+    )
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return {"ok": True, **result}
+
+
+@app.get("/teach/outcomes")
+async def api_student_outcomes(student_agent: str = "", limit: int = 20):
+    """Get outcomes for a student agent."""
+    if not student_agent:
+        return {"ok": True, "outcomes": [], "count": 0}
+    outcomes = get_student_outcomes(student_agent, limit)
+    return {"ok": True, "outcomes": outcomes, "count": len(outcomes)}
+
+
+@app.get("/teach/curriculum")
+async def api_get_curriculum(project: str, capabilities: str = ""):
+    """Build a curriculum for a new agent based on cultural memory."""
+    caps = (
+        [c.strip() for c in capabilities.split(",") if c.strip()]
+        if capabilities
+        else ["general"]
+    )
+    curriculum = get_agent_curriculum(project, caps)
+    return {
+        "ok": True,
+        "project": project,
+        "curriculum": [l.to_dict() for l in curriculum],
+        "count": len(curriculum),
+        "inherited_facts": get_cultural_memory(project).inherit(),
+    }
+
+
+@app.get("/culture/memory")
+async def api_cultural_memory(project: str = "unknown"):
+    """Get the cultural memory for a project."""
+    memory = get_cultural_memory(project)
+    return {
+        "ok": True,
+        "project": project,
+        "generation": memory.generation,
+        "facts": memory.facts,
+        "count": len(memory.facts),
+    }
+
+
+@app.post("/culture/consolidate")
+async def api_consolidate_culture(body: ConsolidateCulture):
+    """Consolidate high-reward task outcomes into cultural memory and evolve lessons."""
+    result = consolidate_cultural_knowledge(body.project)
+    _notify_chitchat_logs(
+        f"[culture] consolidated {body.project}: "
+        f"{result['facts_added']} facts, "
+        f"{result['variations']} variations, "
+        f"{result['emerged']} emerged topics"
+    )
+    return {"ok": True, **result}
+
+
+@app.post("/culture/evolve")
+async def api_evolve_culture(body: EvolveRequest):
+    """Run one generation of cultural evolution (variation + selection)."""
+    engine = get_evolution_engine(body.project)
+    result = engine.evolve_generation(topic=body.topic or None)
+    return {"ok": True, **result}
+
+
+@app.get("/culture/diversity")
+async def api_culture_diversity(project: str = "unknown"):
+    """Return diversity metrics for the cultural corpus."""
+    engine = get_evolution_engine(project)
+    diversity = engine.topic_diversity()
+    return {"ok": True, "project": project, **diversity}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2513,6 +2860,7 @@ async def trigger_consolidation():
 #  Client Registry
 # ═══════════════════════════════════════════════════════════════
 
+
 class RegisterClient(BaseModel):
     name: str
     host: str
@@ -2534,13 +2882,15 @@ def _load_clients() -> list[dict]:
             parts = line.strip().split()
             if not parts or parts[0].startswith("#"):
                 continue
-            clients.append({
-                "name": parts[0],
-                "host": parts[1] if len(parts) > 1 else "",
-                "ssh_key": parts[2] if len(parts) > 2 else "~/.ssh/id_memoria",
-                "user": parts[3] if len(parts) > 3 else "daivolt",
-                "source": "conf",
-            })
+            clients.append(
+                {
+                    "name": parts[0],
+                    "host": parts[1] if len(parts) > 1 else "",
+                    "ssh_key": parts[2] if len(parts) > 2 else "~/.ssh/id_memoria",
+                    "user": parts[3] if len(parts) > 3 else "daivolt",
+                    "source": "conf",
+                }
+            )
         clients_file.write_text(json.dumps(clients, ensure_ascii=False, indent=2))
         return clients
     return []
@@ -2548,7 +2898,9 @@ def _load_clients() -> list[dict]:
 
 def _save_clients(clients: list[dict]):
     CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
-    (CLIENTS_DIR / "clients.json").write_text(json.dumps(clients, ensure_ascii=False, indent=2))
+    (CLIENTS_DIR / "clients.json").write_text(
+        json.dumps(clients, ensure_ascii=False, indent=2)
+    )
 
 
 @app.get("/clients")
@@ -2568,7 +2920,11 @@ async def register_client(body: RegisterClient):
     else:
         clients.append(body.model_dump())
     _save_clients(clients)
-    return {"ok": True, "name": body.name, "action": "updated" if existing else "registered"}
+    return {
+        "ok": True,
+        "name": body.name,
+        "action": "updated" if existing else "registered",
+    }
 
 
 @app.delete("/clients/{name}")
@@ -2603,23 +2959,45 @@ def _push_to_clients() -> dict:
 
         try:
             r_sync = subprocess.run(
-                ["rsync", "-avz", "--delete",
-                 "-e", f"ssh -i {key} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5",
-                 f"{source_dir}/", f"{user}@{host}:/tmp/memoria-update/"],
-                capture_output=True, text=True, timeout=30,
+                [
+                    "rsync",
+                    "-avz",
+                    "--delete",
+                    "-e",
+                    f"ssh -i {key} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5",
+                    f"{source_dir}/",
+                    f"{user}@{host}:/tmp/memoria-update/",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             if r_sync.returncode != 0:
-                results.append({"name": name, "status": "fail", "error": r_sync.stderr[:200]})
+                results.append(
+                    {"name": name, "status": "fail", "error": r_sync.stderr[:200]}
+                )
                 continue
 
             r_install = subprocess.run(
-                ["ssh", "-i", key, "-o", "StrictHostKeyChecking=accept-new",
-                 "-o", "ConnectTimeout=5",
-                 f"{user}@{host}", "bash /tmp/memoria-update/install.sh"],
-                capture_output=True, text=True, timeout=30,
+                [
+                    "ssh",
+                    "-i",
+                    key,
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    "ConnectTimeout=5",
+                    f"{user}@{host}",
+                    "bash /tmp/memoria-update/install.sh",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             if r_install.returncode != 0:
-                results.append({"name": name, "status": "fail", "error": r_install.stderr[:200]})
+                results.append(
+                    {"name": name, "status": "fail", "error": r_install.stderr[:200]}
+                )
             else:
                 results.append({"name": name, "status": "ok"})
         except subprocess.TimeoutExpired:
@@ -3561,9 +3939,9 @@ body {
            <button class="btn btn-sm" onclick="resetBrainZoom()">⟲ Reset</button>
          </div>
        </div>
-       <div id="brainWrap" style="position:relative;width:100%;height:calc(100vh - 140px);min-height:400px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius);">
-         <div id="brainDebug" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#ff0000;font-size:24px;font-weight:bold;">LOADING BRAIN...</div>
-         <canvas id="brainCanvas" style="display:block;width:100%;height:100%;"></canvas>
+<div id="brainWrap" style="position:relative;width:100%;height:calc(100vh - 160px);min-height:300px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;">
+          <div id="brainDebug" style="display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:var(--text-muted);font-size:16px;">Loading brain network...</div>
+          <canvas id="brainCanvas" style="display:block;width:100%;height:100%;"></canvas>
          <div id="brainTooltip" style="display:none;position:absolute;background:var(--bg-elevated);border:1px solid var(--accent);border-radius:var(--radius-xs);padding:8px 12px;font-size:12px;pointer-events:none;z-index:10;max-width:280px;color:var(--text-primary);"></div>
          <div style="position:absolute;top:8px;right:8px;width:260px;display:flex;flex-direction:column;gap:8px;">
            <div class="card"><div class="card-title">Signals</div><div id="brainSignals" style="font-size:12px;font-family:var(--mono);"></div></div>
@@ -3591,7 +3969,7 @@ body {
   <div class="modal">
     <button class="modal-close" onclick="toggleHelp()">×</button>
     <h2>Keyboard Shortcuts</h2>
-    <div class="shortcut"><span>Switch tab</span><span class="key"><kbd>1</kbd>–<kbd>9</kbd></span></div>
+    <div class="shortcut"><span>Switch tab</span><span class="key"><kbd>1</kbd>–<kbd>9</kbd></span> <span style="font-size:10px;color:var(--text-muted);">(except in inputs)</span></div>
     <div class="shortcut"><span>Search recall</span><span class="key"><kbd>/</kbd></span></div>
     <div class="shortcut"><span>Close modal / blur</span><span class="key"><kbd>Esc</kbd></span></div>
     <div class="shortcut"><span>Toggle help</span><span class="key"><kbd>?</kbd></span></div>
@@ -3645,8 +4023,18 @@ function switchTab(n) {
   document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
   document.querySelector('.nav-item[data-tab="' + n + '"]')?.classList.add('active');
   document.getElementById('sidebar').classList.remove('open');
+  location.hash = 'tab=' + n;
   const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, null, loadChat, loadSafety, loadSettings, loadBrainDelayed];
   if (loaders[n]) loaders[n]();
+}
+
+function initTabFromHash() {
+  const m = location.hash.match(/tab=(\d)/);
+  if (m) {
+    const n = parseInt(m[1]);
+    if (n >= 0 && n <= 8) { switchTab(n); return; }
+  }
+  loadOverview();
 }
 
 // -- Help Modal --
@@ -3714,16 +4102,19 @@ function tag(text, cls) {
 
 // -- Keyboard Shortcuts --
 document.addEventListener('keydown', function(e) {
-  if (e.key >= '1' && e.key <= '8' && !e.ctrlKey && !e.metaKey) {
+  const tag = e.target.tagName;
+  const isInput = ['INPUT', 'TEXTAREA', 'SELECT'].includes(tag);
+  if (e.key >= '1' && e.key <= '9' && !e.ctrlKey && !e.metaKey && !isInput) {
+    e.preventDefault();
     switchTab(parseInt(e.key) - 1);
     return;
   }
-  if (e.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) {
+  if (e.key === '/' && !isInput) {
     e.preventDefault();
     document.getElementById('searchInput').focus();
     return;
   }
-  if (e.key === '?' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) {
+  if (e.key === '?' && !isInput) {
     toggleHelp();
     return;
   }
@@ -4347,21 +4738,26 @@ var brainAnim = [];
 var brainTimer = 0;
 
 function loadBrainDelayed() {
-  setTimeout(loadBrain, 100);
+  requestAnimationFrame(() => requestAnimationFrame(() => loadBrain()));
 }
 
 let brainTaskData = { pending: 0, assigned: 0, completed: 0, failed: 0 };
 let brainAgentData = [];
 
+let _brainRetries = 0;
 function loadBrain() {
   const canvas = document.getElementById('brainCanvas');
   const debug = document.getElementById('brainDebug');
-  if (!canvas) { if (debug) debug.textContent = 'ERROR: canvas not found'; return; }
+  if (!canvas) return;
   const wrap = document.getElementById('brainWrap');
-  const W = wrap ? wrap.clientWidth : (window.innerWidth - 280);
-  const H = wrap ? wrap.clientHeight : (window.innerHeight - 140);
-  if (debug) debug.textContent = 'W=' + W + ' H=' + H;
-  if (W < 50 || H < 50) { if (debug) debug.textContent = 'TOO SMALL: W=' + W + ' H=' + H; return; }
+  const rect = wrap ? wrap.getBoundingClientRect() : null;
+  const W = rect && rect.width > 0 ? rect.width : (window.innerWidth - 280);
+  const H = rect && rect.height > 0 ? rect.height : (window.innerHeight - 160);
+  if (W < 50 || H < 50) {
+    if (++_brainRetries < 5) { setTimeout(loadBrainDelayed, 500); }
+    return;
+  }
+  _brainRetries = 0;
   if (debug) debug.style.display = 'none';
   canvas.width = W;
   canvas.height = H;
@@ -4557,7 +4953,12 @@ function resetBrainZoom() { loadBrain(); }
 // ============================================
 // INIT
 // ============================================
-loadOverview();
+initTabFromHash();
+
+window.addEventListener('hashchange', function() {
+  const m = location.hash.match(/tab=(\d)/);
+  if (m) { const n = parseInt(m[1]); if (n >= 0 && n <= 8 && n !== state.tab) switchTab(n); }
+});
 
 setInterval(() => {
   if (state.tab === 0) loadOverview();
@@ -4578,7 +4979,6 @@ setInterval(() => {
 </html>"""
 
 
-
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     return HTMLResponse(DASHBOARD_HTML)
@@ -4593,5 +4993,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("MEMORIA_PORT", "19998"))
     host = os.environ.get("MEMORIA_HOST", "0.0.0.0")
     uvicorn.run(
-        "memoriad_global:app", host=host, port=port, log_level="info", reload=False
+        "memoriad_global:app", host=host, port=port, log_level="warning", reload=False
     )
