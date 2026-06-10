@@ -1,0 +1,17 @@
+#!/bin/bash
+# git pre-push hook — runs ci_check.sh --fast before every push
+# Installed by: ln -sf ../../ci_check.sh .git/hooks/pre-push
+#
+# Bypass: git push --no-verify
+
+set -euo pipefail
+
+echo "═══ git pre-push: ci_check.sh --fast ═══"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+if [ -x "$SCRIPT_DIR/ci_check.sh" ]; then
+  exec "$SCRIPT_DIR/ci_check.sh" --fast
+else
+  echo "⚠️  ci_check.sh not found at $SCRIPT_DIR — skipping"
+  exit 0
+fi
