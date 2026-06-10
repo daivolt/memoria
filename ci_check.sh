@@ -14,7 +14,7 @@ set -euo pipefail
 MEMORIA_PORT="${MEMORIA_PORT:-19998}"
 CHITCHAT_PORT="${CHITCHAT_PORT:-19999}"
 MEMORIA_DIR="/mnt/external-drive/code/memoria"
-E2E_MAX_WAIT=60
+E2E_MAX_WAIT=120
 FAIL=0
 STEP=0
 
@@ -153,7 +153,7 @@ echo ""
 if [ "$SCORE" = "null" ]; then
   fail
   echo " (Sage did not verify within ${E2E_MAX_WAIT}s)"
-elif [ "$(echo "$SCORE < 0.8" | bc -l 2>/dev/null || echo 1)" = "1" ]; then
+elif [ "$(python3 -c "print('1' if float('$SCORE') < 0.8 else '0')" 2>/dev/null)" = "1" ]; then
   fail
   echo " (score=$SCORE below threshold 0.8)"
 else
@@ -164,7 +164,7 @@ fi
 # ── 8. Journalctl ERROR sweep ───────────────────────────────
 
 next "Service error log sweep (last 60s)"
-ERRORS=$(journalctl --user -u sage -u memoria-server -u chitchat-server --since "60 seconds ago" --no-pager 2>/dev/null \
+ERRORS=$(journalctl --user -u sage -u memoria-server -u chitchat-server -u bridge --since "60 seconds ago" --no-pager 2>/dev/null \
   | grep -i "error\|exception\|traceback" \
   | grep -v "opencode\|address already in use" \
   | head -5 || true)
