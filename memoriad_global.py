@@ -70,7 +70,7 @@ MEMORY_LIMIT = 5000
 POLL_INTERVAL = 30
 AGENT_STALE_SEC = 300
 STALE_TASK_INTERVAL = 60  # auto-reap assigned tasks whose agent is gone
-CHITCHAT_URL = os.environ.get("CHITCHAT_URL", "http://100.126.64.13:19999")
+CHITCHAT_URL = os.environ.get("CHITCHAT_URL", "http://100.121.245.69:19999")
 CHITCHAT_LOGS_ROOM = os.environ.get("CHITCHAT_LOGS_ROOM", "logs")
 CHITCHAT_POLL_INTERVAL = 3
 CHITCHAT_CONSOLIDATE_THRESHOLD = 20
@@ -4998,7 +4998,7 @@ function switchChatRoom(room) {
 
 function renderMarkdown(text) {
   if (!text) return '';
-  let s = text.replace(/<script\\b[^<]*(?:(?!<\\/script>)<[^<]*)*<\\/script>/gi, '');
+  let s = text.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
   s = s.replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
   s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
   s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
