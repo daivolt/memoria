@@ -56,11 +56,12 @@ All commands use the `memoria` CLI: `!memoria <command> [args]`
 | `!memoria replace <old> <new>` | Replace a matching fact |
 | `!memoria learnings` | Show accumulated knowledge from recent sessions |
 
-### Recall (Layer 3 — FTS5 full-text search across all past sessions)
+### Recall (Layer 3 — SIRA-enriched session search across all past sessions)
 | Command | Action |
 |---------|--------|
-| `!memoria recall <query>` | Search past sessions (titles + summaries) |
+| `!memoria recall <query>` | Search past sessions (SIRA-enriched: LLM expands query, DF-filtered, weighted similarity) |
 | `!memoria review [N]` | Show last N session summaries (default: 3) |
+| `!memoria context <query>` | Unified search across ALL surfaces: sessions, topics, memory, chitchat, papers, cortex |
 
 ### Topics (Layer 2 — cross-project global knowledge)
 | Command | Action |
@@ -119,12 +120,13 @@ These are injected automatically by the plugin — you generally don't need to s
 ### On start:
 1. `!memoria status` — verify connectivity + check project memory
 2. `!memoria list` — load this project's durable facts
-3. `!memoria recall <topic>` — search past sessions for relevant context
+3. `!memoria context <topic>` — search ALL surfaces (sessions, topics, papers, memory, chats) for relevant context (SIRA-powered)
 4. `!memoria tasks` — check for pending tasks assigned to this project
 
 ### During session:
 1. `!memoria add <fact>` — save any important findings or decisions
-2. `!memoria recall <query>` — look up past work when needed
+2. `!memoria recall <query>` — look up past work when needed (SIRA-enriched)
+3. `!memoria context <query>` — multi-surface retrieval when you need broad context
 
 ### On end (before finishing):
 1. `!memoria add <fact>` — save final facts or decisions
@@ -139,10 +141,12 @@ For direct HTTP access (e.g., from plugin or scripts):
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/health` | Server status, session count, topics |
-| `GET` | `/recall?q=<query>` | FTS5 session search |
+| `GET` | `/recall?q=<query>` | SIRA-enriched session + chat search |
+| `POST` | `/context` | Unified multi-surface search (sessions, topics, memory, papers, cortex) |
 | `GET` | `/review?n=N` | Recent session summaries |
 | `GET/POST` | `/memory/{project}` | Read/add per-project facts |
 | `PUT` | `/memory/{project}` | Replace a fact |
+| `GET` | `/topics/search?q=<query>` | SIRA-enriched topic search |
 | `GET/POST` | `/topics/{name}` | Read/add cross-project topic facts |
 | `GET/POST` | `/proposals` | List/propose new facts |
 | `POST` | `/proposals/{id}/accept` | Accept proposal |
@@ -157,13 +161,16 @@ For direct HTTP access (e.g., from plugin or scripts):
 | `POST` | `/safety/snapshot/{project}` | Create git snapshot |
 | `POST` | `/safety/rollback/{project}` | Rollback |
 | `GET` | `/compress` | Compress tool output |
+| `GET` | `/enrichment/stats` | Enrichment queue status (pending, done, errors) |
+| `POST` | `/enrichment/reindex` | Re-enqueue all records for LLM enrichment |
+| `POST` | `/papers/rescan` | Force rescan of papers/ directory |
 
 ## TUI Dashboard
 
 An SSH-accessible terminal UI is available on port 23234:
 
 ```bash
-ssh -p 23234 daivolt@100.121.245.69
+ssh -p 23234 daivolt@100.126.64.13
 ```
 
 Shows chat (left pane) and agents/tasks/memory/recall (right pane). Also runs locally:

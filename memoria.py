@@ -6,10 +6,13 @@ Memory:
   memoria add <text>            Save durable fact to MEMORY.md
   memoria list                  Show all facts
   memoria replace <old> <new>   Replace matching entry
-  memoria recall <query>        Search past sessions via FTS5
-  memoria review [N]            Summarize last N sessions
-  memoria learnings             Show accumulated project knowledge
-  memoria compress              Compress tool outputs (stdin) via REST
+   memoria recall <query>        Search past sessions (SIRA-enriched)
+   memoria review [N]            Summarize last N sessions
+   memoria learnings             Show accumulated project knowledge
+   memoria context <query>       Unified search across ALL surfaces (sessions, topics, memory, papers, cortex)
+   memoria reindex               Re-enqueue all records for LLM search enrichment
+   memoria papers rescan         Force rescan of papers/ directory
+   memoria compress              Compress tool outputs (stdin) via REST
   memoria status                Server health + project memory
    memoria topics                List cross-project topics
    memoria topic <name> [text]   Show topic facts or add one
@@ -59,6 +62,17 @@ CORTEX (autonomous agent task allocation):
   memoria cortex assign <title> [type] [complexity]  Create + auto-assign task
   memoria cortex complete <task-id> [reward]         Mark done with reward signal
   memoria cortex policy                Show learned Q-values per state
+
+Social / Cultural Learning (Tomasello 1999):
+  memoria teach <project> <title> <topic> <facts>...  Create a lesson
+  memoria lessons [topic] [project] [min_score]        List available lessons
+  memoria lesson <lesson-id>                           Get lesson details
+  memoria outcome <lesson-id> <student> <success>      Record student outcome
+  memoria curriculum <project> [capabilities]          Build agent curriculum
+  memoria culture <project>                            Show cultural memory
+  memoria consolidate <project>                        Consolidate culture
+  memoria evolve <project> [topic]                     Run cultural evolution
+  memoria diversity <project>                          Topic diversity metrics
 """
 
 import json
@@ -70,7 +84,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-SERVER = os.environ.get("MEMORIA_SERVER", "http://100.121.245.69:19998")
+SERVER = os.environ.get("MEMORIA_SERVER", "http://100.126.64.13:19998")
 
 
 def project_name() -> str:
@@ -150,6 +164,38 @@ def cmd_recall(query: str, limit: int = 5):
         print(f"  [{s['id'][:12]}...]")
         print(f"  title: {s['title']}")
         print(f"  summary: {s['summary']}\n")
+
+
+def cmd_context(query: str, limit: int = 10):
+    r = _req("POST", "/context", {"query": query, "limit": limit})
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    results = r.get("results", [])
+    if not results:
+        print(f"No matches for: {query}")
+        return
+    print(f"Found {len(results)} results:\n")
+    for s in results:
+        src = s.get("source", "?")
+        print(f"  [{src}] {s.get('title', '?')}")
+        print(f"  {s.get('text', '')[:200]}\n")
+
+
+def cmd_reindex():
+    r = _req("POST", "/enrichment/reindex")
+    if not r.get("ok"):
+        print(r.get("error", "reindex failed"), file=sys.stderr)
+        sys.exit(1)
+    print(f"Enqueued {r.get('enqueued', 0)} items for re-enrichment")
+
+
+def cmd_papers_rescan():
+    r = _req("POST", "/papers/rescan")
+    if not r.get("ok"):
+        print(r.get("error", "rescan failed"), file=sys.stderr)
+        sys.exit(1)
+    print(r.get("message", "Paper rescan triggered"))
 
 
 def cmd_review(n: int = 3):
@@ -310,7 +356,9 @@ def cmd_topic_delete(name: str):
 
 
 def cmd_topic_edit(name: str, index: int, text: str):
-    r = _req("PUT", f"/topics/{urllib.parse.quote(name)}", {"index": index, "text": text})
+    r = _req(
+        "PUT", f"/topics/{urllib.parse.quote(name)}", {"index": index, "text": text}
+    )
     if "error" in r:
         print(r["error"], file=sys.stderr)
         sys.exit(1)
@@ -475,7 +523,9 @@ def cmd_rollback(project: str, snapshot_id: str | None = None):
 
 
 def cmd_cortex_status():
-    r = _req("GET", f"/topics/cortex_state?project={urllib.parse.quote(project_name())}")
+    r = _req(
+        "GET", f"/topics/cortex_state?project={urllib.parse.quote(project_name())}"
+    )
     if "error" in r or not r.get("facts"):
         print("No CORTEX state found")
         return
@@ -504,7 +554,9 @@ def cmd_cortex_status():
 
 
 def cmd_cortex_learnings(n: int = 5):
-    r = _req("GET", f"/topics/cortex_state?project={urllib.parse.quote(project_name())}")
+    r = _req(
+        "GET", f"/topics/cortex_state?project={urllib.parse.quote(project_name())}"
+    )
     if "error" in r or not r.get("facts"):
         print("No CORTEX state found")
         return
@@ -520,7 +572,9 @@ def cmd_cortex_learnings(n: int = 5):
         return
     for e in episodes[-n:]:
         ts = time.strftime("%H:%M:%S", time.localtime(e.get("timestamp", 0) / 1000))
-        print(f"  [{ts}] {e.get('taskTitle', '?')[:40]:40s} agent={e.get('agentId', '?')[:12]} reward={e.get('reward', 0.5):.2f} outcome={e.get('outcome', '?')}")
+        print(
+            f"  [{ts}] {e.get('taskTitle', '?')[:40]:40s} agent={e.get('agentId', '?')[:12]} reward={e.get('reward', 0.5):.2f} outcome={e.get('outcome', '?')}"
+        )
 
 
 def cmd_cortex_bid():
@@ -528,12 +582,16 @@ def cmd_cortex_bid():
 
 
 def cmd_cortex_assign(title: str, task_type: str = "generic", complexity: int = 5):
-    r = _req("POST", "/tasks", {
-        "project": project_name(),
-        "title": title,
-        "description": "",
-        "payload": {"type": task_type, "complexity": complexity, "threshold": 0.3},
-    })
+    r = _req(
+        "POST",
+        "/tasks",
+        {
+            "project": project_name(),
+            "title": title,
+            "description": "",
+            "payload": {"type": task_type, "complexity": complexity, "threshold": 0.3},
+        },
+    )
     if "error" in r:
         print(r["error"], file=sys.stderr)
         sys.exit(1)
@@ -543,7 +601,11 @@ def cmd_cortex_assign(title: str, task_type: str = "generic", complexity: int = 
 
 def cmd_cortex_complete(task_id: str, reward: str = "0.8"):
     reward_f = float(reward)
-    r = _req("PATCH", f"/tasks/{task_id}", {"status": "completed", "payload": {"cortex_reward": reward_f}})
+    r = _req(
+        "PATCH",
+        f"/tasks/{task_id}",
+        {"status": "completed", "payload": {"cortex_reward": reward_f}},
+    )
     if "error" in r:
         print(r["error"], file=sys.stderr)
         sys.exit(1)
@@ -551,7 +613,9 @@ def cmd_cortex_complete(task_id: str, reward: str = "0.8"):
 
 
 def cmd_cortex_policy():
-    r = _req("GET", f"/topics/cortex_state?project={urllib.parse.quote(project_name())}")
+    r = _req(
+        "GET", f"/topics/cortex_state?project={urllib.parse.quote(project_name())}"
+    )
     if "error" in r or not r.get("facts"):
         print("No CORTEX state found")
         return
@@ -570,6 +634,206 @@ def cmd_cortex_policy():
         sorted_actions = sorted(vals.items(), key=lambda x: -x[1])
         actions_str = ", ".join(f"{a}={v:.3f}" for a, v in sorted_actions)
         print(f"  {state:20s}  →  {actions_str}")
+
+
+# ── Social / Cultural Learning (CLI) ─────────────────────────
+
+
+def cmd_teach(project: str, title: str, topic: str, facts: list[str]):
+    examples = [f for f in facts if f.startswith("eg:")]
+    exercises = [f for f in facts if f.startswith("ex:" or f.startswith("exercise:"))]
+    core_facts = [f for f in facts if not f.startswith(("eg:", "ex:", "exercise:"))]
+    r = _req(
+        "POST",
+        "/teach/lesson",
+        {
+            "teacher_agent": project_name(),
+            "project": project,
+            "title": title,
+            "topic": topic,
+            "facts": core_facts,
+            "examples": examples,
+            "exercises": exercises,
+        },
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    lesson = r.get("lesson", {})
+    print(f"lesson created: {lesson.get('lesson_id', '?')}")
+    print(f"  title: {lesson.get('title', '?')}")
+    print(f"  topic: {lesson.get('topic', '?')}")
+    print(f"  facts: {len(lesson.get('facts', []))}")
+    print(f"  generation: {lesson.get('generation', 0)}")
+
+
+def cmd_lessons(topic: str = "", project: str = "", min_score: float = 0.0):
+    params = []
+    if topic:
+        params.append(f"topic={urllib.parse.quote(topic)}")
+    if project:
+        params.append(f"project={urllib.parse.quote(project)}")
+    if min_score:
+        params.append(f"min_score={min_score}")
+    qs = "&".join(params)
+    r = _req("GET", f"/teach/lessons{'?' + qs if qs else ''}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    lessons = r.get("lessons", [])
+    if not lessons:
+        print("No lessons found")
+        return
+    for l in lessons:
+        score_bar = "█" * int(l.get("score", 0) * 10) + "░" * (
+            10 - int(l.get("score", 0) * 10)
+        )
+        print(
+            f"  {l['lesson_id'][:20]}  gen={l.get('generation', 0)}  [{score_bar}]  {l.get('score', 0):.2f}"
+        )
+        print(f"    {l.get('title', '?')[:70]}")
+        print(f"    topic={l.get('topic', '?')}  students={l.get('n_students', 0)}")
+        if l.get("facts"):
+            for f in l["facts"][:3]:
+                print(f"      • {f[:100]}")
+            if len(l["facts"]) > 3:
+                print(f"      ... and {len(l['facts']) - 3} more")
+        print()
+
+
+def cmd_lesson(lesson_id: str):
+    r = _req("GET", f"/teach/lessons/{urllib.parse.quote(lesson_id)}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    l = r.get("lesson", {})
+    if not l:
+        print("Lesson not found")
+        return
+    print(f"ID:       {l.get('lesson_id', '?')}")
+    print(f"Title:    {l.get('title', '?')}")
+    print(f"Topic:    {l.get('topic', '?')}")
+    print(f"Gen:      {l.get('generation', 0)}")
+    print(f"Score:    {l.get('score', 0):.3f} ({l.get('n_students', 0)} students)")
+    print(f"Teacher:  {l.get('teacher_agent', '?')}")
+    print(f"Prereqs:  {', '.join(l.get('prerequisites', []))[:80] or 'none'}")
+    if l.get("facts"):
+        print(f"\nFacts ({len(l['facts'])}):")
+        for f in l["facts"]:
+            print(f"  • {f[:150]}")
+    if l.get("examples"):
+        print(f"\nExamples ({len(l['examples'])}):")
+        for e in l["examples"]:
+            print(f"  • {e[:150]}")
+    if l.get("exercises"):
+        print(f"\nExercises ({len(l['exercises'])}):")
+        for e in l["exercises"]:
+            print(f"  • {e[:150]}")
+    if l.get("parent_id"):
+        print(f"\nParent:   {l['parent_id']}")
+
+
+def cmd_outcome(lesson_id: str, student: str, success: str):
+    succ = success.lower() in ("true", "1", "yes", "pass", "success")
+    r = _req(
+        "POST",
+        f"/teach/lessons/{urllib.parse.quote(lesson_id)}/outcome",
+        {
+            "student_agent": student,
+            "success": succ,
+        },
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"outcome recorded for {lesson_id[:20]}")
+    print(f"  score: {r.get('score', 0):.3f}")
+    print(f"  students: {r.get('n_students', 0)}")
+
+
+def cmd_curriculum(project: str, capabilities: str = ""):
+    qs = f"project={urllib.parse.quote(project)}"
+    if capabilities:
+        qs += f"&capabilities={urllib.parse.quote(capabilities)}"
+    r = _req("GET", f"/teach/curriculum?{qs}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    curriculum = r.get("curriculum", [])
+    inherited = r.get("inherited_facts", [])
+    print(f"Curriculum for '{project}' ({len(curriculum)} lessons):")
+    for i, l in enumerate(curriculum, 1):
+        print(
+            f"  {i}. [{l.get('topic', '?')}] {l.get('title', '?')[:60]} "
+            f"(score={l.get('score', 0):.2f}, gen={l.get('generation', 0)})"
+        )
+    if inherited:
+        print(f"\nInherited facts ({len(inherited)}):")
+        for f in inherited:
+            print(f"  • {f[:120]}")
+
+
+def cmd_culture(project: str):
+    r = _req("GET", f"/culture/memory?project={urllib.parse.quote(project)}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    facts = r.get("facts", [])
+    gen = r.get("generation", 0)
+    print(f"Cultural memory for '{project}'")
+    print(f"  generation: {gen}")
+    print(f"  facts:      {len(facts)}")
+    for i, f in enumerate(facts, 1):
+        topic = f.get("topic", "?")
+        imp = f.get("importance", 0)
+        agent = f.get("source_agent", "")[:12]
+        bar = "█" * int(imp * 10) + "░" * (10 - int(imp * 10))
+        print(f"  {i:3d}. [{bar}] [{topic}] {f.get('text', '')[:100]}")
+        print(f"       agent={agent} gen={f.get('generation', 0)}")
+
+
+def cmd_consolidate_culture(project: str):
+    r = _req("POST", "/culture/consolidate", {"project": project})
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"Cultural consolidation for '{project}':")
+    print(f"  facts added:   {r.get('facts_added', 0)}")
+    print(f"  variations:    {r.get('variations', 0)}")
+    print(f"  pruned:        {r.get('pruned', 0)}")
+    print(f"  emerged topics: {r.get('emerged', 0)}")
+    print(f"  generation:    {r.get('generation', 0)}")
+
+
+def cmd_evolve(project: str, topic: str = ""):
+    body = {"project": project}
+    if topic:
+        body["topic"] = topic
+    r = _req("POST", "/culture/evolve", body)
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"Cultural evolution for '{project}':")
+    print(f"  variations: {r.get('variations', 0)}")
+    print(f"  pruned:     {r.get('pruned', 0)}")
+    print(f"  emerged:    {r.get('emerged', 0)}")
+
+
+def cmd_diversity(project: str):
+    r = _req("GET", f"/culture/diversity?project={urllib.parse.quote(project)}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"Cultural diversity for '{project}':")
+    print(f"  total lessons:   {r.get('total_lessons', 0)}")
+    print(f"  unique topics:   {r.get('unique_topics', 0)}")
+    print(f"  avg score:       {r.get('avg_score', 0):.3f}")
+    print(f"  max generation:  {r.get('generation_max', 0)}")
+    dist = r.get("topic_distribution", {})
+    if dist:
+        print(f"  topic distribution:")
+        for t, c in sorted(dist.items(), key=lambda x: -x[1])[:10]:
+            print(f"    {t[:30]:30s}  {c} lessons")
 
 
 def main():
@@ -597,6 +861,19 @@ def main():
             print("usage: memoria recall <query>", file=sys.stderr)
             sys.exit(1)
         cmd_recall(" ".join(args[1:]))
+    elif cmd == "context":
+        if len(args) < 2:
+            print("usage: memoria context <query>", file=sys.stderr)
+            sys.exit(1)
+        cmd_context(" ".join(args[1:]))
+    elif cmd == "reindex":
+        cmd_reindex()
+    elif cmd == "papers":
+        if len(args) > 1 and args[1] == "rescan":
+            cmd_papers_rescan()
+        else:
+            print("usage: memoria papers rescan", file=sys.stderr)
+            sys.exit(1)
     elif cmd == "review":
         cmd_review(int(args[1]) if len(args) > 1 else 3)
     elif cmd == "learnings":
@@ -621,7 +898,9 @@ def main():
             cmd_topic_delete(args[2])
         elif sub == "edit":
             if len(args) < 5:
-                print("usage: memoria topic edit <name> <index> <text>", file=sys.stderr)
+                print(
+                    "usage: memoria topic edit <name> <index> <text>", file=sys.stderr
+                )
                 sys.exit(1)
             cmd_topic_edit(args[2], int(args[3]), " ".join(args[4:]))
         elif sub == "remove":
@@ -687,7 +966,10 @@ def main():
         cmd_rollback(args[1], args[2] if len(args) > 2 else None)
     elif cmd == "chitchat":
         if len(args) < 2:
-            print("usage: memoria chitchat <history|rooms|consolidate> [...]", file=sys.stderr)
+            print(
+                "usage: memoria chitchat <history|rooms|consolidate> [...]",
+                file=sys.stderr,
+            )
             sys.exit(1)
         sub = args[1]
         if sub == "history":
@@ -712,10 +994,14 @@ def main():
             print("No clients registered")
             return
         for c in clients:
-            print(f"  {c['name']:<15} {c['host']:<20} {c.get('user', 'daivolt'):<10} {c.get('ssh_key', '~/.ssh/id_memoria')}")
+            print(
+                f"  {c['name']:<15} {c['host']:<20} {c.get('user', 'daivolt'):<10} {c.get('ssh_key', '~/.ssh/id_memoria')}"
+            )
     elif cmd == "client":
         if len(args) < 2:
-            print("usage: memoria client <name> <host> [ssh_key] [user]", file=sys.stderr)
+            print(
+                "usage: memoria client <name> <host> [ssh_key] [user]", file=sys.stderr
+            )
             print("       memoria client remove <name>", file=sys.stderr)
             sys.exit(1)
         if args[1] == "remove":
@@ -732,7 +1018,11 @@ def main():
             host = args[2] if len(args) > 2 else ""
             ssh_key = args[3] if len(args) > 3 else "~/.ssh/id_memoria"
             user = args[4] if len(args) > 4 else "daivolt"
-            r = _req("POST", "/clients", {"name": name, "host": host, "ssh_key": ssh_key, "user": user})
+            r = _req(
+                "POST",
+                "/clients",
+                {"name": name, "host": host, "ssh_key": ssh_key, "user": user},
+            )
             if "error" in r:
                 print(r["error"], file=sys.stderr)
                 sys.exit(1)
@@ -783,14 +1073,21 @@ def main():
             name = args[1]
             url = args[2] if len(args) > 2 else ""
             api_key = args[3] if len(args) > 3 else ""
-            r = _req("POST", "/federation/peers", {"name": name, "url": url, "api_key": api_key})
+            r = _req(
+                "POST",
+                "/federation/peers",
+                {"name": name, "url": url, "api_key": api_key},
+            )
             if "error" in r:
                 print(r["error"], file=sys.stderr)
                 sys.exit(1)
             print(f"peer '{name}' {r.get('action', 'registered')}")
     elif cmd == "sync":
         if len(args) < 3:
-            print("usage: memoria sync <pull|push|full|all> [peer] [types]", file=sys.stderr)
+            print(
+                "usage: memoria sync <pull|push|full|all> [peer] [types]",
+                file=sys.stderr,
+            )
             sys.exit(1)
         sub = args[1]
         peer_name = args[2] if len(args) > 2 else ""
@@ -801,7 +1098,11 @@ def main():
             if not peer_name:
                 print(f"usage: memoria sync {sub} <peer> [types]", file=sys.stderr)
                 sys.exit(1)
-            r = _req("POST", f"/sync/{sub}", {"peer": peer_name, "types": types, "full": sub == "full"})
+            r = _req(
+                "POST",
+                f"/sync/{sub}",
+                {"peer": peer_name, "types": types, "full": sub == "full"},
+            )
         else:
             print(f"unknown sync subcommand: {sub}", file=sys.stderr)
             sys.exit(1)
@@ -823,7 +1124,10 @@ def main():
             print(f"  applied: {r.get('applied', {})}")
     elif cmd == "cortex":
         if len(args) < 2:
-            print("usage: memoria cortex <status|learnings|bid|assign|complete|policy> [...]", file=sys.stderr)
+            print(
+                "usage: memoria cortex <status|learnings|bid|assign|complete|policy> [...]",
+                file=sys.stderr,
+            )
             sys.exit(1)
         sub = args[1]
         if sub == "status":
@@ -834,7 +1138,10 @@ def main():
             cmd_cortex_bid()
         elif sub == "assign":
             if len(args) < 3:
-                print("usage: memoria cortex assign <title> [type] [complexity]", file=sys.stderr)
+                print(
+                    "usage: memoria cortex assign <title> [type] [complexity]",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
             t = args[2]
             typ = args[3] if len(args) > 3 else "generic"
@@ -842,7 +1149,9 @@ def main():
             cmd_cortex_assign(t, typ, comp)
         elif sub == "complete":
             if len(args) < 3:
-                print("usage: memoria cortex complete <task-id> [reward]", file=sys.stderr)
+                print(
+                    "usage: memoria cortex complete <task-id> [reward]", file=sys.stderr
+                )
                 sys.exit(1)
             cmd_cortex_complete(args[2], args[3] if len(args) > 3 else "0.8")
         elif sub == "policy":
@@ -850,6 +1159,57 @@ def main():
         else:
             print(f"unknown cortex subcommand: {sub}", file=sys.stderr)
             sys.exit(1)
+    elif cmd == "teach":
+        if len(args) < 5:
+            print(
+                "usage: memoria teach <project> <title> <topic> <fact> [...]",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        cmd_teach(args[1], args[2], args[3], args[4:])
+    elif cmd == "lessons":
+        topic = args[1] if len(args) > 1 else ""
+        project = args[2] if len(args) > 2 else ""
+        min_score = float(args[3]) if len(args) > 3 else 0.0
+        cmd_lessons(topic, project, min_score)
+    elif cmd == "lesson":
+        if len(args) < 2:
+            print("usage: memoria lesson <lesson-id>", file=sys.stderr)
+            sys.exit(1)
+        cmd_lesson(args[1])
+    elif cmd == "outcome":
+        if len(args) < 4:
+            print(
+                "usage: memoria outcome <lesson-id> <student> <success>",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        cmd_outcome(args[1], args[2], args[3])
+    elif cmd == "curriculum":
+        if len(args) < 2:
+            print("usage: memoria curriculum <project> [capabilities]", file=sys.stderr)
+            sys.exit(1)
+        cmd_curriculum(args[1], args[2] if len(args) > 2 else "")
+    elif cmd == "culture":
+        if len(args) < 2:
+            print("usage: memoria culture <project>", file=sys.stderr)
+            sys.exit(1)
+        cmd_culture(args[1])
+    elif cmd == "consolidate":
+        if len(args) < 2:
+            print("usage: memoria consolidate <project>", file=sys.stderr)
+            sys.exit(1)
+        cmd_consolidate_culture(args[1])
+    elif cmd == "evolve":
+        if len(args) < 2:
+            print("usage: memoria evolve <project> [topic]", file=sys.stderr)
+            sys.exit(1)
+        cmd_evolve(args[1], args[2] if len(args) > 2 else "")
+    elif cmd == "diversity":
+        if len(args) < 2:
+            print("usage: memoria diversity <project>", file=sys.stderr)
+            sys.exit(1)
+        cmd_diversity(args[1])
     else:
         print(f"unknown: {cmd}", file=sys.stderr)
         sys.exit(1)

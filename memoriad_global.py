@@ -56,6 +56,8 @@ except ImportError:
     asyncpg = None
 
 import stats
+import pg
+import enrichment
 
 # ── Paths ──────────────────────────────────────────────────────
 
@@ -68,7 +70,7 @@ MEMORY_LIMIT = 5000
 POLL_INTERVAL = 30
 AGENT_STALE_SEC = 300
 STALE_TASK_INTERVAL = 60  # auto-reap assigned tasks whose agent is gone
-CHITCHAT_URL = os.environ.get("CHITCHAT_URL", "http://100.121.245.69:19999")
+CHITCHAT_URL = os.environ.get("CHITCHAT_URL", "http://100.126.64.13:19999")
 CHITCHAT_LOGS_ROOM = os.environ.get("CHITCHAT_LOGS_ROOM", "logs")
 CHITCHAT_POLL_INTERVAL = 3
 CHITCHAT_CONSOLIDATE_THRESHOLD = 20
@@ -94,6 +96,16 @@ FEDERATION_SYNC_INTERVAL = int(
 )  # 5 min default
 FEDERATION_AUTO_SYNC = os.environ.get("FEDERATION_AUTO_SYNC", "true").lower() == "true"
 
+# ── SIRA-style enrichment ─────────────────────────────────────
+
+ENRICH_ENABLED = os.environ.get("MEMORIA_ENRICH_ENABLED", "true").lower() == "true"
+ENRICH_POLL_INTERVAL = int(os.environ.get("MEMORIA_ENRICH_POLL_INTERVAL", "5"))
+PAPERS_WATCH_INTERVAL = int(os.environ.get("MEMORIA_PAPERS_WATCH_INTERVAL", "60"))
+PAPERS_DIR = Path(
+    os.environ.get("MEMORIA_PAPERS_DIR", str(Path(__file__).parent / "papers"))
+)
+_last_paper_mtimes: dict[str, float] = {}
+
 # ── Background task references ────────────────────────────────
 
 _poll_task: asyncio.Task | None = None
@@ -103,7 +115,10 @@ _cortex_task: asyncio.Task | None = None
 _skill_watch_task: asyncio.Task | None = None
 _awake_replay_task: asyncio.Task | None = None
 _federation_sync_task: asyncio.Task | None = None
-# (duplicate declarations at lines ~710 are intentional module-level re-decl)
+_enrich_worker_task: asyncio.Task | None = None
+_papers_watcher_task: asyncio.Task | None = None
+_stale_task_reaper_task: asyncio.Task | None = None
+_task_healer_task: asyncio.Task | None = None
 
 # ── Shared modules for session extraction ────────────────────
 
@@ -213,29 +228,24 @@ def _init_index():
     db.close()
 
 
-def _index_session(rec: dict):
-    path = WORKDIR / "index.db"
+async def _append_session(rec: dict):
     try:
-        db = sqlite3.connect(str(path))
-        db.execute(
-            "INSERT OR REPLACE INTO sessions_fts(id, title, summary) VALUES (?, ?, ?)",
-            (
-                rec.get("id", ""),
-                rec.get("title", "")[:200],
-                rec.get("summary", "")[:500],
-            ),
-        )
-        db.commit()
-        db.close()
+        await pg.append_session(rec)
+    except Exception:
+        pass  # fallback: keep flat file
+    try:
+        path = WORKDIR / "sessions.jsonl"
+        with open(path, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
-
-
-def _append_session(rec: dict):
-    path = WORKDIR / "sessions.jsonl"
-    with open(path, "a") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    _index_session(rec)
+    # Enrichment hook
+    if _pool and ENRICH_ENABLED:
+        text = f"{rec.get('title', '')} {rec.get('task', '')} {rec.get('summary', '')}"
+        try:
+            await enrichment.enqueue_enrichment(_pool, "sessions", rec["id"], text)
+        except Exception:
+            pass
 
 
 def _glob_wd(project: str) -> Path:
@@ -287,7 +297,7 @@ _chitchat_consolidated_through: dict[
 _recent_chat_texts: dict[str, deque[str]] = {}  # per-room sliding window for dedup
 
 
-def poll_sessions():
+async def poll_sessions():
     global _last_id
     db = _opencode_db()
     if db is None:
@@ -310,7 +320,7 @@ def poll_sessions():
         sid = r["id"]
         rec = _extract_session(sid, db)
         if rec.get("id"):
-            _append_session(rec)
+            await _append_session(rec)
             _last_id = sid
     db.close()
     if _last_id:
@@ -370,7 +380,12 @@ def _index_chat_message(rec: dict):
         pass
 
 
-def _store_message(msg: dict, room: str):
+async def _store_message(msg: dict, room: str):
+    try:
+        await pg.store_message(msg, room)
+    except Exception:
+        pass
+    # Fallback: flat file
     record = {
         "id": msg.get("ts", ""),
         "from": msg.get("from", ""),
@@ -386,10 +401,17 @@ def _store_message(msg: dict, room: str):
     path = room_dir / "inbox.jsonl"
     with open(path, "a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    _index_chat_message(record)
+    # Enrichment hook
+    if _pool and ENRICH_ENABLED:
+        try:
+            await enrichment.enqueue_enrichment(
+                _pool, "chitchat", msg.get("ts", ""), msg.get("text", "")
+            )
+        except Exception:
+            pass
 
 
-def poll_chitchat():
+async def poll_chitchat():
     global _chitchat_unconsolidated
     global _chitchat_cursors
     rooms = _chitchat_rooms()
@@ -408,20 +430,28 @@ def poll_chitchat():
                 continue
             if msg.get("type") not in ("message",):
                 continue
-            _store_message(msg, name)
+            await _store_message(msg, name)
             _chitchat_cursors[name] = ts
             new_count += 1
         _chitchat_unconsolidated += new_count
 
 
-def _load_existing_topic_names() -> list[str]:
+async def _load_existing_topic_names() -> list[str]:
+    try:
+        return await pg.list_topic_names()
+    except Exception:
+        pass
     topics_dir = WORKDIR / "topics"
     if not topics_dir.exists():
         return []
     return sorted(f.stem for f in topics_dir.iterdir() if f.suffix == ".md")
 
 
-def _load_topic_facts(name: str) -> list[str]:
+async def _load_topic_facts(name: str) -> list[str]:
+    try:
+        return await pg.get_topic_facts(name)
+    except Exception:
+        pass
     path = WORKDIR / "topics" / f"{name}.md"
     if not path.exists():
         return []
@@ -494,7 +524,7 @@ def _prune_chitchat():
             pass
 
 
-def _consolidate_chitchat():
+async def _consolidate_chitchat():
     global _chitchat_unconsolidated, _chitchat_consolidated_through
     if _chitchat_unconsolidated < CHITCHAT_CONSOLIDATE_THRESHOLD:
         return
@@ -541,7 +571,6 @@ def _consolidate_chitchat():
         _chitchat_unconsolidated = 0
         return
 
-    # Skip overly generic single-keyword patterns (e.g. just "agent" from system messages)
     if len(top_keywords) <= 2 and all(
         kw in ("agent", "task", "server", "project", "message", "started", "pattern")
         for kw in top_keywords
@@ -551,8 +580,7 @@ def _consolidate_chitchat():
 
     suggested_topic = top_keywords[0]
 
-    # Dedup: skip if very similar to last 3 facts in this topic
-    existing_facts = _load_topic_facts(suggested_topic[:50])
+    existing_facts = await _load_topic_facts(suggested_topic[:50])
     if existing_facts:
         last_three = " ".join(existing_facts[-3:])
         overlap = sum(1 for w in top_keywords if w in last_three)
@@ -573,23 +601,20 @@ def _consolidate_chitchat():
         f"Messages sampled: {len(all_messages)}"
     )
 
-    # Interleaved replay: check existing topics before proposing
-    existing_topics = _load_existing_topic_names()
+    existing_topics = await _load_existing_topic_names()
     match = _find_matching_topic(top_keywords, existing_topics)
     if match:
-        existing_facts = _load_topic_facts(match)
+        existing_facts = await _load_topic_facts(match)
         if len(existing_facts) >= 50:
             existing_facts = existing_facts[-49:]
         if proposal_text not in existing_facts:
             existing_facts.append(proposal_text)
-            content = "\n§\n".join(existing_facts) + "\n"
-            (WORKDIR / "topics" / f"{match}.md").write_text(content)
+            await _add_fact_to_topic(match, proposal_text)
             _notify_chitchat_logs(
                 f"[memoria] pattern '{suggested_topic}' appended to existing topic '{match}'"
                 f" ({len(all_messages)} msgs)"
             )
     else:
-        # Auto-accept flow: check if same topic already proposed
         existing_proposals = _load_proposals()
         existing = next(
             (p for p in existing_proposals if p.get("topic") == suggested_topic[:50]),
@@ -598,7 +623,7 @@ def _consolidate_chitchat():
         if existing:
             existing["hits"] = existing.get("hits", 1) + 1
             if existing["hits"] >= AUTO_ACCEPT_THRESHOLD:
-                _add_fact_to_topic(existing["topic"], existing["text"])
+                await _add_fact_to_topic(existing["topic"], existing["text"])
                 existing_proposals = [
                     p for p in existing_proposals if p.get("id") != existing["id"]
                 ]
@@ -629,14 +654,11 @@ def _consolidate_chitchat():
                 f"({len(all_messages)} msgs, {len(room_counts)} rooms) → proposed"
             )
 
-    # Mark what's been consolidated
     for room, ingested in max_ingested_per_room.items():
         if ingested > _chitchat_consolidated_through.get(room, 0):
             _chitchat_consolidated_through[room] = ingested
 
-    # Prune by slot limit (keeps unconsolidated messages)
     _prune_chitchat()
-
     _chitchat_unconsolidated = 0
 
 
@@ -667,7 +689,7 @@ def _prune_sessions():
             pass
 
 
-def _deep_consolidate():
+async def _deep_consolidate():
     """Cross-layer consolidation: sessions → topics + chat → topics.
 
     Enhanced with:
@@ -681,7 +703,7 @@ def _deep_consolidate():
     # 1. Force chitchat consolidation
     global _chitchat_unconsolidated
     _chitchat_unconsolidated = CHITCHAT_CONSOLIDATE_THRESHOLD
-    _consolidate_chitchat()
+    await _consolidate_chitchat()
 
     # 2. Consolidate hippocampal episodes: cluster by similarity
     try:
@@ -726,7 +748,7 @@ def _deep_consolidate():
                                 kw[w.lower()] += 1
                     top_kw = [w for w, c in kw.most_common(3)]
                     if top_kw:
-                        existing = _load_existing_topic_names()
+                        existing = await _load_existing_topic_names()
                         if not _find_matching_topic(top_kw, existing):
                             prop_text = (
                                 f"[hippocampal consolidation] Cluster '{ttype}': "
@@ -764,7 +786,7 @@ def _deep_consolidate():
                 continue
         top = [w for w, c in session_keywords.most_common(5) if c >= 2]
         if top:
-            existing = _load_existing_topic_names()
+            existing = await _load_existing_topic_names()
             if not _find_matching_topic(top, existing):
                 prop_text = (
                     f"[deep consolidation] Recent session keywords: {', '.join(top)}"
@@ -798,19 +820,22 @@ async def lifespan(app: FastAPI):
         _awake_replay_task, \
         _federation_sync_task, \
         _stale_task_reaper_task, \
-        _task_healer_task
+        _task_healer_task, \
+        _enrich_worker_task, \
+        _papers_watcher_task
     _pool = None
     if asyncpg is not None:
         try:
             _pool = await asyncpg.create_pool(
-                dsn="postgresql://postgres@localhost/bloom_terminal",
-                min_size=1,
-                max_size=5,
+                dsn="postgresql://postgres@localhost/memoria",
+                min_size=2,
+                max_size=10,
             )
             stats.init_pool(_pool)
+            pg.init_pool(_pool)
             await stats.ensure_tables()
         except Exception as exc:
-            print(f"[stats] PostgreSQL pool init failed: {exc}", flush=True)
+            print(f"[PG] pool init failed: {exc}", flush=True)
             _pool = None
     _poll_task = asyncio.create_task(_poll_loop())
     _chitchat_poll_task = asyncio.create_task(_chitchat_poll_loop())
@@ -821,6 +846,8 @@ async def lifespan(app: FastAPI):
     _federation_sync_task = asyncio.create_task(_federation_sync_loop())
     _stale_task_reaper_task = asyncio.create_task(_stale_task_reaper_loop())
     _task_healer_task = asyncio.create_task(_task_healer_loop())
+    _enrich_worker_task = asyncio.create_task(_enrich_worker_loop())
+    _papers_watcher_task = asyncio.create_task(_papers_watcher_loop())
     yield
     if _pool is not None:
         try:
@@ -837,6 +864,8 @@ async def lifespan(app: FastAPI):
         _federation_sync_task,
         _stale_task_reaper_task,
         _task_healer_task,
+        _enrich_worker_task,
+        _papers_watcher_task,
     ):
         if t:
             t.cancel()
@@ -849,7 +878,7 @@ async def lifespan(app: FastAPI):
 async def _poll_loop():
     while True:
         try:
-            poll_sessions()
+            await poll_sessions()
         except Exception:
             pass
         await asyncio.sleep(POLL_INTERVAL)
@@ -859,8 +888,8 @@ async def _chitchat_poll_loop():
     await asyncio.sleep(5)
     while True:
         try:
-            poll_chitchat()
-            _consolidate_chitchat()
+            await poll_chitchat()
+            await _consolidate_chitchat()
         except Exception:
             pass
         await asyncio.sleep(CHITCHAT_POLL_INTERVAL)
@@ -937,6 +966,13 @@ async def _awake_replay_loop():
                     if total_surprise > 0.05:
                         signals["acc_surprise"] = total_surprise
 
+                # Predictive coding free energy: hierarchical prediction quality
+                if engine.gating.pc_hierarchy.total_free_energy:
+                    recent_fe = engine.gating.pc_hierarchy.total_free_energy[-10:]
+                    fe_mag = min(1.0, abs(sum(recent_fe)) / max(len(recent_fe), 1))
+                    if fe_mag > 0.05:
+                        signals["free_energy"] = fe_mag
+
                 # Dialectic conflict: from Socratic records
                 if engine.socrates.dialectic_records:
                     recent_dialectics = [
@@ -1005,7 +1041,7 @@ async def _sleep_cycle_loop():
     await asyncio.sleep(300)
     while True:
         try:
-            _deep_consolidate()
+            await _deep_consolidate()
         except Exception:
             pass
         await asyncio.sleep(SLEEP_CYCLE_HOURS * 3600)
@@ -1109,6 +1145,88 @@ async def _task_healer_loop():
         await asyncio.sleep(TASK_HEAL_COOLDOWN)
 
 
+# ── Enrichment Background Tasks ────────────────────────────────
+
+
+async def _enrich_worker_loop():
+    """Process enrichment queue items using the LLM."""
+    if not ENRICH_ENABLED:
+        return
+    await asyncio.sleep(10)
+    while True:
+        try:
+            if _pool:
+                await enrichment.recover_stale(_pool)
+                count = await enrichment.process_queue(_pool)
+                if count:
+                    print(f"[enrich] processed {count} items", flush=True)
+        except Exception as e:
+            print(f"[enrich] worker error: {e}", flush=True)
+        await asyncio.sleep(ENRICH_POLL_INTERVAL)
+
+
+async def _papers_watcher_loop():
+    """Watch the papers/ directory for new or modified PDFs."""
+    global _last_paper_mtimes
+    await asyncio.sleep(15)
+    while True:
+        try:
+            if not PAPERS_DIR.exists():
+                await asyncio.sleep(PAPERS_WATCH_INTERVAL)
+                continue
+            for pdf_path in sorted(PAPERS_DIR.glob("*.pdf")):
+                fname = pdf_path.name
+                mtime = pdf_path.stat().st_mtime
+                if _last_paper_mtimes.get(fname) == mtime:
+                    continue
+                _last_paper_mtimes[fname] = mtime
+                if not _pool:
+                    continue
+                async with _pool.acquire() as conn:
+                    existing = await conn.fetchval(
+                        "SELECT file_mtime FROM papers WHERE filename = $1", fname
+                    )
+                    if existing is not None and abs(existing - mtime) < 1.0:
+                        continue
+                try:
+                    result = subprocess.run(
+                        ["pdftotext", "-layout", str(pdf_path), "-"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    text = result.stdout.strip()[:10000]
+                except Exception:
+                    text = ""
+                if not text:
+                    continue
+                if not _pool:
+                    continue
+                title = fname.replace(".pdf", "").replace("_", " ")
+                async with _pool.acquire() as conn:
+                    await conn.execute(
+                        "INSERT INTO papers (filename, title, text, file_mtime) "
+                        "VALUES ($1, $2, $3, $4) "
+                        "ON CONFLICT (filename) DO UPDATE SET "
+                        "text = $3, file_mtime = $4, indexed_at = extract(epoch from now())",
+                        fname,
+                        title,
+                        text,
+                        mtime,
+                    )
+                    pid_row = await conn.fetchrow(
+                        "SELECT id FROM papers WHERE filename = $1", fname
+                    )
+                    if pid_row:
+                        await enrichment.enqueue_enrichment(
+                            _pool, "papers", str(pid_row["id"]), text
+                        )
+                print(f"[papers] indexed {fname} ({len(text)} chars)", flush=True)
+        except Exception as e:
+            print(f"[papers] watcher error: {e}", flush=True)
+        await asyncio.sleep(PAPERS_WATCH_INTERVAL)
+
+
 app = FastAPI(title="memoria", version="2.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
@@ -1210,60 +1328,86 @@ async def recall(
     limit: int = 5,
     project: Optional[str] = None,
     source: Optional[str] = None,
+    enrich: bool = True,
 ):
-    path = WORKDIR / "index.db"
-    if not path.exists():
-        raise HTTPException(404, "no index — wait for session extraction")
-    db = sqlite3.connect(str(path))
-    qs = " OR ".join(q.split())
     results = []
+
+    expansion_terms: list[str] = []
+    if enrich and ENRICH_ENABLED and _pool:
+        try:
+            expansion_terms = await enrichment.expand_query(q)
+            if expansion_terms:
+                expansion_terms = await enrichment.df_filter_combined(
+                    expansion_terms, _pool
+                )
+        except Exception:
+            pass
+
+    weight = enrichment.EXPANSION_WEIGHT
 
     if source in (None, "sessions"):
         try:
-            rows = db.execute(
-                "SELECT id, title, summary, rank FROM sessions_fts "
-                "WHERE sessions_fts MATCH ? ORDER BY rank LIMIT ?",
-                (qs, limit),
-            ).fetchall()
+            if expansion_terms:
+                rows = await pg.search_sessions_enriched(
+                    q, expansion_terms, weight, limit
+                )
+            else:
+                rows = await pg.search_sessions(q, limit)
             for r in rows:
                 results.append(
                     {
-                        "id": r[0],
-                        "title": r[1],
-                        "summary": (r[2] or "")[:300],
+                        "id": r["id"],
+                        "title": r["title"],
+                        "project": r.get("project", ""),
+                        "summary": (r.get("summary") or "")[:300],
                         "source": "session",
+                        "rank": r.get("rank", 0),
                     }
                 )
-        except sqlite3.OperationalError:
+        except Exception:
             pass
 
     if source in (None, "chats"):
         try:
-            rows = db.execute(
-                "SELECT id, room, from_name, text, rank FROM chat_fts "
-                "WHERE chat_fts MATCH ? ORDER BY rank LIMIT ?",
-                (qs, limit),
-            ).fetchall()
+            if expansion_terms:
+                rows = await pg.search_messages_enriched(
+                    q, expansion_terms, weight, limit
+                )
+            else:
+                rows = await pg.search_messages(q, limit)
             for r in rows:
                 results.append(
                     {
-                        "id": r[0],
-                        "title": f"[{r[1]}] {r[2]}",
-                        "summary": (r[3] or "")[:300],
+                        "id": r["id"],
+                        "title": f"[{r['room']}] {r['from_name']}",
+                        "summary": (r.get("text") or "")[:300],
                         "source": "chat",
-                        "room": r[1],
-                        "from": r[2],
+                        "room": r["room"],
+                        "from": r["from_name"],
+                        "rank": r.get("rank", 0),
                     }
                 )
-        except sqlite3.OperationalError:
+        except Exception:
             pass
 
-    db.close()
-    return {"query": q, "count": len(results), "results": results[:limit]}
+    results.sort(key=lambda x: x.get("rank", 0), reverse=True)
+    return {
+        "query": q,
+        "count": len(results),
+        "results": results[:limit],
+        "enriched": bool(expansion_terms),
+        "expansion_terms": expansion_terms[:5] if expansion_terms else [],
+    }
 
 
 @app.get("/review")
 async def review(n: int = 3, project: Optional[str] = None):
+    try:
+        sessions = await pg.get_recent_sessions(n, project)
+        return {"sessions": sessions, "count": len(sessions)}
+    except Exception:
+        pass
+    # Fallback: flat file
     path = WORKDIR / "sessions.jsonl"
     if not path.exists():
         return {"sessions": []}
@@ -1287,6 +1431,209 @@ async def review(n: int = 3, project: Optional[str] = None):
             }
         )
     return {"sessions": sessions, "count": len(sessions)}
+
+
+# ── Unified Context (SIRA-style multi-surface retrieval) ──────
+
+
+class ContextRequest(BaseModel):
+    query: str
+    sources: list[str] = [
+        "sessions",
+        "topics",
+        "memory",
+        "chitchat",
+        "papers",
+        "cortex",
+    ]
+    limit: int = 10
+    project: str = ""
+
+
+@app.post("/context")
+async def unified_context(body: ContextRequest):
+    """Single-query retrieval across ALL knowledge surfaces.
+
+    Uses SIRA pattern: LLM expands query → DF filter validates terms
+    → weighted retrieval across all specified surfaces in one pass.
+    """
+    if not body.query.strip():
+        raise HTTPException(400, "query is required")
+
+    expansion_terms: list[str] = []
+    if ENRICH_ENABLED and _pool:
+        try:
+            expansion_terms = await enrichment.expand_query(body.query)
+            if expansion_terms:
+                expansion_terms = await enrichment.df_filter_combined(
+                    expansion_terms, _pool
+                )
+        except Exception:
+            pass
+
+    weight = enrichment.EXPANSION_WEIGHT
+    all_results = []
+
+    async def _search_sessions():
+        if "sessions" not in body.sources:
+            return []
+        try:
+            if expansion_terms:
+                rows = await pg.search_sessions_enriched(
+                    body.query, expansion_terms, weight, body.limit
+                )
+            else:
+                rows = await pg.search_sessions(body.query, body.limit)
+            return [
+                {
+                    "source": "session",
+                    "id": r["id"],
+                    "title": r["title"],
+                    "project": r.get("project", ""),
+                    "text": (r.get("summary") or "")[:300],
+                    "rank": r.get("rank", 0),
+                }
+                for r in rows
+            ]
+        except Exception:
+            return []
+
+    async def _search_chats():
+        if "chitchat" not in body.sources:
+            return []
+        try:
+            if expansion_terms:
+                rows = await pg.search_messages_enriched(
+                    body.query, expansion_terms, weight, body.limit
+                )
+            else:
+                rows = await pg.search_messages(body.query, body.limit)
+            return [
+                {
+                    "source": "chat",
+                    "id": r["id"],
+                    "title": f"[{r['room']}] {r['from_name']}",
+                    "text": (r.get("text") or "")[:300],
+                    "room": r["room"],
+                    "from": r["from_name"],
+                    "rank": r.get("rank", 0),
+                }
+                for r in rows
+            ]
+        except Exception:
+            return []
+
+    async def _search_topics():
+        if "topics" not in body.sources:
+            return []
+        try:
+            if expansion_terms:
+                rows = await pg.search_topics_enriched(
+                    body.query, expansion_terms, weight, body.limit
+                )
+            else:
+                rows = await pg.search_topics(body.query, body.limit)
+            return [
+                {
+                    "source": "topic",
+                    "id": r["name"],
+                    "title": r["name"],
+                    "text": " | ".join(r.get("facts", [])[:3])[:300],
+                    "rank": 0,
+                }
+                for r in rows
+            ]
+        except Exception:
+            return []
+
+    async def _search_memory():
+        if "memory" not in body.sources:
+            return []
+        try:
+            if expansion_terms:
+                rows = await pg.search_memory_enriched(
+                    body.query, expansion_terms, weight, body.limit
+                )
+            else:
+                rows = await pg.search_memory(body.query, body.limit)
+            return [
+                {
+                    "source": "memory",
+                    "id": str(r["id"]),
+                    "title": f"[{r.get('project', '')}]",
+                    "text": (r.get("entry") or "")[:300],
+                    "rank": r.get("rank", 0),
+                }
+                for r in rows
+            ]
+        except Exception:
+            return []
+
+    async def _search_papers():
+        if "papers" not in body.sources:
+            return []
+        try:
+            rows = await pg.search_papers(
+                body.query, expansion_terms, weight, body.limit
+            )
+            return [
+                {
+                    "source": "paper",
+                    "id": str(r["id"]),
+                    "title": r["title"],
+                    "text": r.get("text", "")[:300],
+                    "rank": r.get("rank", 0),
+                }
+                for r in rows
+            ]
+        except Exception:
+            return []
+
+    async def _search_cortex():
+        if "cortex" not in body.sources:
+            return []
+        results = []
+        try:
+            proj = body.project or "unknown"
+            engine = get_engine(proj)
+            similar = engine.hippocampus.recall_similar("generic", 5, body.limit)
+            for ep in similar:
+                results.append(
+                    {
+                        "source": "cortex",
+                        "id": ep.get("task_id", ""),
+                        "title": ep.get("task_title", ""),
+                        "text": f"outcome={ep.get('outcome', '')} reward={ep.get('reward', 0.5)}",
+                        "rank": ep.get("reward", 0.5),
+                    }
+                )
+        except Exception:
+            pass
+        return results
+
+    searches = [
+        _search_sessions(),
+        _search_chats(),
+        _search_topics(),
+        _search_memory(),
+        _search_papers(),
+        _search_cortex(),
+    ]
+    results_lists = await asyncio.gather(*searches)
+
+    for rlist in results_lists:
+        all_results.extend(rlist)
+
+    all_results.sort(key=lambda x: x.get("rank", 0), reverse=True)
+
+    return {
+        "query": body.query,
+        "count": len(all_results),
+        "results": all_results[: body.limit],
+        "enriched": bool(expansion_terms),
+        "expansion_terms": expansion_terms[:10] if expansion_terms else [],
+        "sources_searched": body.sources,
+    }
 
 
 # ── Topics ──────────────────────────────────────────────────
@@ -1319,6 +1666,32 @@ async def read_topic(name: str):
 
 @app.get("/topics/search")
 async def topics_search(q: str = Query(...), limit: int = 3):
+    try:
+        expansion_terms: list[str] = []
+        if ENRICH_ENABLED and _pool:
+            try:
+                expansion_terms = await enrichment.expand_query(q)
+                if expansion_terms:
+                    expansion_terms = await enrichment.df_filter(
+                        expansion_terms, _pool, "topics"
+                    )
+            except Exception:
+                pass
+        if expansion_terms:
+            rows = await pg.search_topics_enriched(
+                q, expansion_terms, enrichment.EXPANSION_WEIGHT, limit
+            )
+        else:
+            rows = await pg.search_topics(q, limit)
+        return {
+            "query": q,
+            "count": len(rows),
+            "topics": rows,
+            "enriched": bool(expansion_terms),
+        }
+    except Exception:
+        pass
+
     keywords = {w.lower() for w in q.split() if len(w) >= 4}
     if not keywords:
         return {"query": q, "count": 0, "topics": []}
@@ -1388,7 +1761,19 @@ def _save_proposals(proposals: list[dict]):
     path.write_text(content + "\n" if content else "")
 
 
-def _add_fact_to_topic(topic: str, text: str):
+async def _add_fact_to_topic(topic: str, text: str):
+    try:
+        await pg.add_topic_fact(topic, text)
+    except Exception:
+        pass
+    # Enrichment hook
+    if _pool and ENRICH_ENABLED:
+        try:
+            await enrichment.enqueue_enrichment(
+                _pool, "topics", topic, f"{topic} {text}"
+            )
+        except Exception:
+            pass
     topics_dir = WORKDIR / "topics"
     topics_dir.mkdir(parents=True, exist_ok=True)
     tpath = topics_dir / f"{topic}.md"
@@ -1456,7 +1841,7 @@ async def accept_proposal(pid: str):
         raise HTTPException(404, f"proposal '{pid}' not found")
     with open(path, "w") as f:
         f.writelines(l + "\n" for l in kept)
-    # Add to topic
+    # Add to topic (flat file fallback + PG with enrichment hook)
     topics_dir = WORKDIR / "topics"
     topics_dir.mkdir(parents=True, exist_ok=True)
     tpath = topics_dir / f"{accepted['topic']}.md"
@@ -1466,6 +1851,16 @@ async def accept_proposal(pid: str):
     entries.append(accepted["text"])
     content = "\n§\n".join(entries) + "\n"
     tpath.write_text(content)
+    if _pool and ENRICH_ENABLED:
+        try:
+            await enrichment.enqueue_enrichment(
+                _pool,
+                "topics",
+                accepted["topic"],
+                f"{accepted['topic']} {accepted['text']}",
+            )
+        except Exception:
+            pass
     return {"ok": True, "moved_to": accepted["topic"]}
 
 
@@ -1601,6 +1996,17 @@ async def add_memory(project: str, body: AddMemory):
         raise HTTPException(413, f"memory limit {MEMORY_LIMIT} chars")
     entries.append(body.text)
     _write_memory(project, entries)
+    # PG store + enrichment hook
+    try:
+        await pg.add_memory_entry(project, body.text)
+        if _pool and ENRICH_ENABLED:
+            rid = await pg.get_memory_entry_id(project, body.text)
+            if rid is not None:
+                await enrichment.enqueue_enrichment(
+                    _pool, "memory", str(rid), body.text
+                )
+    except Exception:
+        pass
     return {"ok": True, "entries": len(entries), "chars": total + len(body.text)}
 
 
@@ -2091,7 +2497,9 @@ async def cortex_complete(body: CortexCompleteRequest):
         "ok": True,
         "task_id": body.task_id,
         "reward": body.reward,
-        "da_signals": {k: round(v, 4) for k, v in da_signals.items()}
+        "da_signals": {
+            k: round(v, 4) if isinstance(v, float) else v for k, v in da_signals.items()
+        }
         if isinstance(da_signals, dict)
         else {"rpe": round(da_signals, 4)},
         "status": "completed",
@@ -2793,6 +3201,13 @@ async def get_config():
         "chitchat_url": CHITCHAT_URL,
         "port": int(os.environ.get("MEMORIA_PORT", "19998")),
         "host": os.environ.get("MEMORIA_HOST", "0.0.0.0"),
+        "enrich_enabled": ENRICH_ENABLED,
+        "enrich_llm_url": enrichment.LLM_URL,
+        "enrich_llm_model": enrichment.LLM_MODEL,
+        "enrich_weight": enrichment.EXPANSION_WEIGHT,
+        "enrich_df_ratio": enrichment.MAX_DF_RATIO,
+        "enrich_temperature": enrichment.ENRICH_TEMPERATURE,
+        "papers_dir": str(PAPERS_DIR),
     }
 
 
@@ -2807,6 +3222,12 @@ class ConfigUpdate(BaseModel):
     session_max_records: Optional[int] = None
     auto_accept_threshold: Optional[int] = None
     chitchat_url: Optional[str] = None
+    enrich_enabled: Optional[bool] = None
+    enrich_llm_url: Optional[str] = None
+    enrich_llm_model: Optional[str] = None
+    enrich_weight: Optional[float] = None
+    enrich_df_ratio: Optional[float] = None
+    enrich_temperature: Optional[float] = None
 
 
 @app.patch("/config")
@@ -2827,7 +3248,58 @@ async def update_config(updates: ConfigUpdate):
     for field, var_name in field_map.items():
         if field in data:
             globals()[var_name] = data[field]
+
+    if "enrich_enabled" in data:
+        global ENRICH_ENABLED
+        ENRICH_ENABLED = data["enrich_enabled"]
+        enrichment.ENRICH_ENABLED = data["enrich_enabled"]
+    if "enrich_llm_url" in data:
+        enrichment.LLM_URL = data["enrich_llm_url"]
+    if "enrich_llm_model" in data:
+        enrichment.LLM_MODEL = data["enrich_llm_model"]
+    if "enrich_weight" in data:
+        enrichment.EXPANSION_WEIGHT = data["enrich_weight"]
+    if "enrich_df_ratio" in data:
+        enrichment.MAX_DF_RATIO = data["enrich_df_ratio"]
+    if "enrich_temperature" in data:
+        enrichment.ENRICH_TEMPERATURE = data["enrich_temperature"]
+
     return {"ok": True, "updated": list(data.keys())}
+
+
+@app.get("/enrichment/stats")
+async def enrichment_stats():
+    """Get enrichment queue status."""
+    if not _pool:
+        return {"ok": False, "error": "no database connection"}
+    try:
+        stats = await enrichment.queue_stats(_pool)
+        return {"ok": True, "stats": stats}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/enrichment/reindex")
+async def trigger_reindex():
+    """Re-enqueue all records for enrichment (use after model/prompt changes)."""
+    if not _pool:
+        raise HTTPException(503, "no database connection")
+    try:
+        result = await enrichment.reindex_all(_pool)
+        return result
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/papers/rescan")
+async def trigger_papers_rescan():
+    """Force immediate rescan of papers/ directory."""
+    global _last_paper_mtimes
+    _last_paper_mtimes = {}
+    return {
+        "ok": True,
+        "message": "paper cache cleared, rescan will run on next watch cycle",
+    }
 
 
 class ChitchatSay(BaseModel):
@@ -2852,7 +3324,7 @@ async def chitchat_say(room: str, body: ChitchatSay):
 async def trigger_consolidation():
     global _chitchat_unconsolidated
     _chitchat_unconsolidated = CHITCHAT_CONSOLIDATE_THRESHOLD
-    _consolidate_chitchat()
+    await _consolidate_chitchat()
     return {"ok": True}
 
 
@@ -3920,6 +4392,44 @@ body {
       </div>
       <div class="settings-grid" id="configGrid"></div>
       <div class="card mt-4">
+        <div class="card-title">🧠 Enrichment — SIRA Search Enhancement</div>
+        <div class="flex gap-2 mt-2" style="flex-wrap:wrap">
+          <div class="setting-row" style="flex:1;min-width:200px">
+            <span class="label">LLM URL</span>
+            <input type="text" id="cfg_enrich_llm_url" value="" data-key="enrich_llm_url" style="width:100%;font-size:12px">
+          </div>
+          <div class="setting-row" style="flex:1;min-width:180px">
+            <span class="label">LLM Model</span>
+            <input type="text" id="cfg_enrich_llm_model" value="" data-key="enrich_llm_model" style="width:100%;font-size:12px">
+          </div>
+        </div>
+        <div class="flex gap-2 mt-2" style="flex-wrap:wrap">
+          <div class="setting-row" style="flex:0 0 auto">
+            <span class="label">Enabled</span>
+            <input type="checkbox" id="cfg_enrich_enabled" data-key="enrich_enabled" checked style="width:20px;height:20px">
+          </div>
+          <div class="setting-row" style="flex:1;min-width:100px">
+            <span class="label">Weight</span>
+            <input type="number" id="cfg_enrich_weight" value="0.5" data-key="enrich_weight" step="0.1" min="0.1" max="1.0" style="width:80px">
+          </div>
+          <div class="setting-row" style="flex:1;min-width:100px">
+            <span class="label">DF Ratio</span>
+            <input type="number" id="cfg_enrich_df_ratio" value="0.1" data-key="enrich_df_ratio" step="0.01" min="0.01" max="1.0" style="width:80px">
+          </div>
+          <div class="setting-row" style="flex:1;min-width:100px">
+            <span class="label">Temperature</span>
+            <input type="number" id="cfg_enrich_temperature" value="0.4" data-key="enrich_temperature" step="0.1" min="0.0" max="1.0" style="width:80px">
+          </div>
+        </div>
+        <div style="margin-top:12px;font-size:12px;color:var(--text-muted)" id="enrichStatus">
+          Queue: -- pending | Last enriched: --
+        </div>
+        <div class="flex gap-2 mt-2">
+          <button class="btn btn-accent btn-sm" onclick="triggerReindex()">🔄 Reindex All</button>
+          <button class="btn btn-accent btn-sm" onclick="triggerRescanPapers()">📄 Rescan Papers</button>
+        </div>
+      </div>
+      <div class="card mt-4">
         <div class="card-title">Actions</div>
         <div class="flex gap-2 mt-2">
           <button class="btn btn-warning btn-sm" onclick="consolidateChat()">🔄 Consolidate</button>
@@ -3930,6 +4440,7 @@ body {
         <div class="card-title">Proposals</div>
         <div id="proposalsList"></div>
       </div>
+    </div>
     <!-- Tab 8: Brain Network -->
      <div class="tab-content" id="tab8">
        <div class="tab-header">
@@ -4597,11 +5108,37 @@ async function loadSettings() {
   try {
     state.config = await api('/config');
     renderConfig();
+    loadEnrichSettings();
+    loadEnrichStats();
     setConn(true);
     loadProposals();
   } catch(e) {
     setConn(false);
     el('configGrid').innerHTML = '<div class="empty-state error">' + esc(e.message) + '</div>';
+  }
+}
+
+function loadEnrichSettings() {
+  const cfg = state.config || {};
+  el('cfg_enrich_llm_url').value = cfg.enrich_llm_url || 'http://localhost:11434/v1/chat/completions';
+  el('cfg_enrich_llm_model').value = cfg.enrich_llm_model || 'deepseek-v4-flash:cloud';
+  el('cfg_enrich_enabled').checked = cfg.enrich_enabled !== false;
+  el('cfg_enrich_weight').value = cfg.enrich_weight ?? 0.5;
+  el('cfg_enrich_df_ratio').value = cfg.enrich_df_ratio ?? 0.1;
+  el('cfg_enrich_temperature').value = cfg.enrich_temperature ?? 0.4;
+}
+
+async function loadEnrichStats() {
+  try {
+    const data = await api('/enrichment/stats');
+    if (data.ok) {
+      const s = data.stats;
+      el('enrichStatus').innerHTML =
+        'Queue: <b>' + s.pending + '</b> pending, <b>' + s.done + '</b> done, <b>' + s.error + '</b> errors | ' +
+        'Last enriched: <b>' + (s.last_enriched ? ago(s.last_enriched) + ' ago' : 'never') + '</b>';
+    }
+  } catch(e) {
+    el('enrichStatus').textContent = 'Stats unavailable';
   }
 }
 
@@ -4635,6 +5172,18 @@ async function saveConfig() {
     if (val !== '' && !isNaN(val)) updates[key] = parseFloat(val);
     else updates[key] = val;
   });
+  // Enrichment fields
+  if (el('cfg_enrich_enabled').checked !== undefined) updates['enrich_enabled'] = el('cfg_enrich_enabled').checked;
+  const weight = parseFloat(el('cfg_enrich_weight').value);
+  if (!isNaN(weight)) updates['enrich_weight'] = weight;
+  const df = parseFloat(el('cfg_enrich_df_ratio').value);
+  if (!isNaN(df)) updates['enrich_df_ratio'] = df;
+  const temp = parseFloat(el('cfg_enrich_temperature').value);
+  if (!isNaN(temp)) updates['enrich_temperature'] = temp;
+  const llm_url = el('cfg_enrich_llm_url').value.trim();
+  if (llm_url) updates['enrich_llm_url'] = llm_url;
+  const llm_model = el('cfg_enrich_llm_model').value.trim();
+  if (llm_model) updates['enrich_llm_model'] = llm_model;
   try {
     await fetch(BASE + '/config', {
       method: 'PATCH',
@@ -4644,6 +5193,26 @@ async function saveConfig() {
     toast('Config saved', 'success');
   } catch(e) {
     toast('Save failed: ' + e.message, 'error');
+  }
+}
+
+async function triggerReindex() {
+  try {
+    const resp = await fetch(BASE + '/enrichment/reindex', { method: 'POST' });
+    const data = await resp.json();
+    toast('Reindex queued: ' + (data.enqueued || 0) + ' items', 'success');
+    setTimeout(loadEnrichStats, 2000);
+  } catch(e) {
+    toast('Reindex failed: ' + e.message, 'error');
+  }
+}
+
+async function triggerRescanPapers() {
+  try {
+    await fetch(BASE + '/papers/rescan', { method: 'POST' });
+    toast('Paper rescan triggered', 'success');
+  } catch(e) {
+    toast('Rescan failed: ' + e.message, 'error');
   }
 }
 
@@ -4713,17 +5282,26 @@ async function clearProposals() {
 // ============================================
 
 var BRAIN_NODES = [
-  { id: 'pfc', label: 'PFC|decomposer', x: 0.5, y: 0.08, color: '#6c5ce7', size: 28 },
+  { id: 'pfc', label: 'PFC|predictions ↓', x: 0.5, y: 0.08, color: '#6c5ce7', size: 28 },
   { id: 'bg', label: 'BG|gating', x: 0.25, y: 0.35, color: '#6c5ce7', size: 26 },
   { id: 'dacc', label: 'dACC|surprise', x: 0.75, y: 0.35, color: '#6c5ce7', size: 24 },
   { id: 'snd', label: 'SNc/VTA|RPE', x: 0.5, y: 0.52, color: '#6c5ce7', size: 22 },
-  { id: 'hip', label: 'Hippocampus|memory', x: 0.25, y: 0.68, color: '#6c5ce7', size: 26 },
-  { id: 'thal', label: 'Thalamus|relay', x: 0.5, y: 0.82, color: '#6c5ce7', size: 20 },
-  { id: 'ctx', label: 'Context|preloader', x: 0.75, y: 0.68, color: '#6c5ce7', size: 22 },
+  { id: 'sensory', label: 'Sensory|errors ↑', x: 0.5, y: 0.62, color: '#00b894', size: 20 },
+  { id: 'hip', label: 'Hippocampus|memory', x: 0.25, y: 0.78, color: '#6c5ce7', size: 26 },
+  { id: 'thal', label: 'Thalamus|relay', x: 0.75, y: 0.78, color: '#6c5ce7', size: 20 },
+  { id: 'ctx', label: 'Context|preloader', x: 0.5, y: 0.88, color: '#6c5ce7', size: 22 },
 ];
 
 var BRAIN_EDGES = [
-  { from: 'pfc', to: 'bg', label: 'task → gate', color: '#fdcb6e' },
+  // Predictive coding: top-down predictions
+  { from: 'pfc', to: 'bg', label: 'μ↓ (goal pred)', color: '#6c5ce7' },
+  { from: 'bg', to: 'sensory', label: 'μ↓ (value pred)', color: '#6c5ce7' },
+  // Predictive coding: bottom-up errors
+  { from: 'sensory', to: 'bg', label: 'ε↑ (PE)', color: '#e17055' },
+  { from: 'bg', to: 'pfc', label: 'ε↑ (goal err)', color: '#e17055' },
+  // Attention (precision modulation)
+  { from: 'pfc', to: 'bg', label: 'π modulation', color: '#fdcb6e' },
+  // Existing connections
   { from: 'bg', to: 'snd', label: 'action → RPE', color: '#e17055' },
   { from: 'snd', to: 'dacc', label: 'surprise', color: '#e17055' },
   { from: 'dacc', to: 'bg', label: 'ε modulation', color: '#fdcb6e' },
@@ -4893,6 +5471,7 @@ function drawBrain(ctx, W, H, cortex, canvas) {
     `agents=${brainAgentData.length}`,
     `wm=${cortex.wm_stack_depth || 0}`,
     `tasks: ${brainTaskData.pending}P ${brainTaskData.assigned}A ${brainTaskData.completed}D ${brainTaskData.failed}F`,
+    `PC-hierarchy: ${cortex.pc_hierarchy ? Object.keys(cortex.pc_hierarchy.levels||{}).length + ' levels' : 'off'}`,
   ];
   stats.forEach((s, i) => {
     ctx.fillText(s, 12, 20 + i * 16);
@@ -4914,9 +5493,10 @@ function drawBrain(ctx, W, H, cortex, canvas) {
     }
     if (found) {
       const descs = {
-        pfc: 'Prefrontal Cortex: hierarchical task decomposition, subgoal generation',
-        bg: 'Basal Ganglia: Go/NoGo gating, Q-learning, action selection',
+        pfc: 'PFC (Level 2): abstract goal predictions ↓, precision-weighted context errors ↑ — free energy minimization',
+        bg: 'BG (Level 1): value predictions ↓, receives sensory errors ↑, Go/NoGo gating, OpAL*',
         dacc: 'Dorsal ACC: surprise tracking, epsilon modulation, meta-learning',
+        sensory: 'Sensory (Level 0): outcome observations, computes prediction errors ↑, precision (attention) weighting',
         snd: 'SNc/VTA: dopamine reward prediction error (RPE) signal',
         hip: 'Hippocampus: episodic memory, pattern completion, replay buffer',
         thal: 'Thalamus: winner-take-all relay, gates cortical output',
@@ -4944,6 +5524,22 @@ function drawBrain(ctx, W, H, cortex, canvas) {
       `      ${brainTaskData.completed} done, ${brainTaskData.failed} failed`,
       `Agents: ${brainAgentData.length} active`,
     ];
+    if (cortex.pc_hierarchy) {
+      const pc = cortex.pc_hierarchy;
+      const levels = pc.levels || {};
+      const pfcLvl = levels.pfc || {};
+      const bgLvl = levels.bg || {};
+      const senLvl = levels.sensory || {};
+      if (pfcLvl.prediction !== undefined) {
+        items.push(`PC-PFC: μ=${pfcLvl.prediction.toFixed(3)} π=${pfcLvl.precision.toFixed(2)} ε=${pfcLvl.error.toFixed(3)}`);
+        items.push(`PC-BG: μ=${bgLvl.prediction.toFixed(3)} π=${bgLvl.precision.toFixed(2)} ε=${bgLvl.error.toFixed(3)}`);
+        items.push(`PC-SEN: μ=${senLvl.prediction.toFixed(3)} π=${senLvl.precision.toFixed(2)} ε=${senLvl.error.toFixed(3)}`);
+        if (pc.totalFreeEnergyTrace && pc.totalFreeEnergyTrace.length > 0) {
+          const fe = pc.totalFreeEnergyTrace[pc.totalFreeEnergyTrace.length - 1];
+          items.push(`Free Energy: ${fe.toFixed(3)}`);
+        }
+      }
+    }
     signalsEl.innerHTML = items.map(s => `<div>${s}</div>`).join('');
   }
 }
