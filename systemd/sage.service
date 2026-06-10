@@ -1,11 +1,11 @@
 [Unit]
-Description=Verifier — test-based task verification agent for memoria
+Description=Sage — quality-focused chat agent (lint, test, verification)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/daivolt/conf/chitchat/verifier.py
+ExecStart=/usr/bin/python3 /home/daivolt/conf/chitchat/sage.py
 Restart=on-failure
 RestartSec=5
 Environment=HOME=/home/daivolt
