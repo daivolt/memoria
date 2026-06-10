@@ -2309,6 +2309,9 @@ class CreateTask(BaseModel):
     description: str = ""
     assigned_to: str = ""
     depends_on: list[str] = []
+    test_command: str = ""
+    lint_command: str = ""
+    rubric: list[str] = []
 
 
 class UpdateTask(BaseModel):
@@ -2317,6 +2320,19 @@ class UpdateTask(BaseModel):
     result: str = ""
     error: str = ""
     rollback_commit: str = ""
+    test_command: str = ""
+    lint_command: str = ""
+    rubric: list[str] = []
+
+
+class VerifyTask(BaseModel):
+    score: float = 0.0
+    test_passed: Optional[bool] = None
+    lint_violations: Optional[int] = None
+    rubric_score: Optional[float] = None
+    rubric_detail: list[str] = []
+    log: str = ""
+    by: str = "verifier"
 
 
 @app.post("/tasks")
@@ -2335,11 +2351,15 @@ async def create_task(body: CreateTask):
         "result": "",
         "error": "",
         "rollback_commit": "",
+        "test_command": body.test_command,
+        "lint_command": body.lint_command,
+        "rubric": body.rubric,
+        "verification": None,
     }
     _save_task(task)
     if body.assigned_to:
         _notify_chitchat(
-            f"@{body.assigned_to} task assigned: {body.task[:200]} on '{body.project}'"
+            f"@{body.assigned_to} task assigned: {body.title[:200]} on '{body.project}'"
         )
     asyncio.ensure_future(
         _events.broadcast(
@@ -2395,8 +2415,42 @@ async def update_task(task_id: str, body: UpdateTask):
         t["status"] = "failed"
     if body.rollback_commit:
         t["rollback_commit"] = body.rollback_commit
+    if body.test_command:
+        t["test_command"] = body.test_command
+    if body.lint_command:
+        t["lint_command"] = body.lint_command
+    if body.rubric:
+        t["rubric"] = body.rubric
     _save_task(t)
     return {"ok": True}
+
+
+@app.post("/tasks/{task_id}/verify")
+async def verify_task(task_id: str, body: VerifyTask):
+    t = _load_task(task_id)
+    if t is None:
+        raise HTTPException(404, "task not found")
+    t["verification"] = {
+        "score": body.score,
+        "test_passed": body.test_passed,
+        "lint_violations": body.lint_violations,
+        "rubric_score": body.rubric_score,
+        "rubric_detail": body.rubric_detail,
+        "log": body.log[:2000],
+        "by": body.by[:64] or "verifier",
+        "verified_at": time.time(),
+    }
+    if not t.get("status") in ("verified",):
+        t["status"] = "verified"
+    _save_task(t)
+    _notify_chitchat(
+        f"verification for {task_id[:12]}: "
+        f"score={body.score:.2f} "
+        f"test={'PASS' if body.test_passed else 'FAIL' if body.test_passed is not None else '-'} "
+        f"lint={body.lint_violations if body.lint_violations is not None else '-'} "
+        f"rubric={body.rubric_score:.2f if body.rubric_score is not None else '-'}"
+    )
+    return {"ok": True, "task_id": task_id, "score": body.score}
 
 
 @app.delete("/tasks/{task_id}")

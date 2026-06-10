@@ -1,0 +1,22 @@
+[Unit]
+Description=Verifier — test-based task verification agent for memoria
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/daivolt/conf/chitchat/verifier.py
+Restart=on-failure
+RestartSec=5
+Environment=HOME=/home/daivolt
+Environment=CHITCHAT_HOST=localhost
+Environment=CHITCHAT_PORT=19999
+Environment=CHITCHAT_ROOMS=general,logs
+Environment=MEMORIA_URL=http://localhost:19998
+Environment=OPENCODE_URL=http://localhost:4096
+Environment=VERIFY_POLL_SEC=30
+Environment=VERIFY_TIMEOUT=120
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
