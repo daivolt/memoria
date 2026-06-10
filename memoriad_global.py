@@ -1655,15 +1655,6 @@ async def list_topics(detail: bool = False):
     return {"topics": names}
 
 
-@app.get("/topics/{name}")
-async def read_topic(name: str):
-    path = WORKDIR / "topics" / f"{name}.md"
-    if not path.exists():
-        raise HTTPException(404, f"topic '{name}' not found")
-    entries = [e.strip() for e in path.read_text().split("§") if e.strip()]
-    return {"topic": name, "facts": entries}
-
-
 @app.get("/topics/search")
 async def topics_search(q: str = Query(...), limit: int = 3):
     try:
@@ -1710,6 +1701,15 @@ async def topics_search(q: str = Query(...), limit: int = 3):
     scored.sort(key=lambda x: -x[0])
     topics = [{"name": t, "facts": f} for _, t, f in scored[:limit]]
     return {"query": q, "count": len(topics), "topics": topics}
+
+
+@app.get("/topics/{name}")
+async def read_topic(name: str):
+    path = WORKDIR / "topics" / f"{name}.md"
+    if not path.exists():
+        raise HTTPException(404, f"topic '{name}' not found")
+    entries = [e.strip() for e in path.read_text().split("§") if e.strip()]
+    return {"topic": name, "facts": entries}
 
 
 class AddTopicFact(BaseModel):
