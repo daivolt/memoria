@@ -94,6 +94,28 @@ def _extract_content(data: dict) -> str:
     return ""
 
 
+def _parse_keywords(raw: str) -> list[str]:
+    """Parse JSON keywords from LLM output, handling DeepSeek reasoning
+    that may precede the JSON content."""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        return data.get("keywords", [])
+    except json.JSONDecodeError:
+        pass
+    idx = raw.rfind('{"keywords"')
+    if idx != -1:
+        end = raw.find("}", idx)
+        if end != -1:
+            try:
+                data = json.loads(raw[idx : end + 1])
+                return data.get("keywords", [])
+            except json.JSONDecodeError:
+                pass
+    return []
+
+
 def _extract_keywords_from_reasoning(data: dict) -> list[str]:
     """Fallback: extract keyword-like phrases from reasoning text when DeepSeek
     eats all tokens on thinking and never produces JSON content field."""

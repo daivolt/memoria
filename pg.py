@@ -501,7 +501,7 @@ async def add_topic_fact(name: str, text: str, pool=None):
             "INSERT INTO topics (name, facts, updated_at) "
             "VALUES ($1, ARRAY[$2], now()) "
             "ON CONFLICT (name) DO UPDATE SET "
-            "  facts = array_append(EXCLUDED.facts, $2), "
+            "  facts = array_append(topics.facts, $2), "
             "  updated_at = now()",
             name,
             text,
@@ -609,32 +609,33 @@ async def search_papers(
         pool = await _get_pool()
     expansion = " ".join(expansion_terms) if expansion_terms else ""
     async with pool.acquire() as conn:
-        await conn.execute("SET pg_trgm.similarity_threshold = 0.01")
-        if expansion:
-            rows = await conn.fetch(
-                "SELECT id, filename, title, "
-                "  similarity(text, $1) * 1.0 + "
-                "  similarity(COALESCE(enriched_text, ''), $2) * $3 AS rank "
-                "FROM papers "
-                "WHERE text % $1 OR enriched_text % $2 "
-                "   OR text ILIKE '%' || $1 || '%' "
-                "ORDER BY rank DESC LIMIT $4",
-                query,
-                expansion,
-                weight,
-                limit,
-            )
-        else:
-            rows = await conn.fetch(
-                "SELECT id, filename, title, "
-                "  similarity(text, $1) AS rank "
-                "FROM papers "
-                "WHERE text % $1 OR text ILIKE '%' || $1 || '%' "
-                "ORDER BY rank DESC LIMIT $2",
-                query,
-                limit,
-            )
-        return [dict(r) for r in rows]
+        async with conn.transaction():
+            await conn.execute("SET LOCAL pg_trgm.similarity_threshold = 0.01")
+            if expansion:
+                rows = await conn.fetch(
+                    "SELECT id, filename, title, "
+                    "  similarity(text, $1) * 1.0 + "
+                    "  similarity(COALESCE(enriched_text, ''), $2) * $3 AS rank "
+                    "FROM papers "
+                    "WHERE text % $1 OR enriched_text % $2 "
+                    "   OR text ILIKE '%' || $1 || '%' "
+                    "ORDER BY rank DESC LIMIT $4",
+                    query,
+                    expansion,
+                    weight,
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT id, filename, title, "
+                    "  similarity(text, $1) AS rank "
+                    "FROM papers "
+                    "WHERE text % $1 OR text ILIKE '%' || $1 || '%' "
+                    "ORDER BY rank DESC LIMIT $2",
+                    query,
+                    limit,
+                )
+            return [dict(r) for r in rows]
 
 
 async def search_memory(query: str, limit: int = 5, pool=None) -> list[dict]:
