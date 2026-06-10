@@ -3226,14 +3226,30 @@ async def sync_incoming(body: dict):
 
 @app.get("/chitchat/rooms")
 async def chitchat_rooms():
-    if not CHITCHAT_DIR.exists():
-        return {"rooms": []}
+    CHITCHAT_DIR.mkdir(parents=True, exist_ok=True)
+    # Start with rooms that have local inbox files
+    seen = set()
     rooms = []
     for d in sorted(CHITCHAT_DIR.iterdir()):
         if d.is_dir():
             path = d / "inbox.jsonl"
             count = sum(1 for _ in path.open()) if path.exists() else 0
             rooms.append({"room": d.name, "messages": count})
+            seen.add(d.name)
+    # Add any rooms known to the chitchat server but missing locally
+    try:
+        req = urllib.request.Request(f"{CHITCHAT_URL}/rooms")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            remote = json.loads(resp.read()).get("rooms", [])
+        for r in remote:
+            name = r.get("name", "").strip()
+            if name and name not in seen:
+                rooms.append({"room": name, "messages": r.get("messages", 0)})
+                seen.add(name)
+                # Create inbox dir so future messages get indexed
+                (CHITCHAT_DIR / name).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     return {"rooms": rooms, "count": len(rooms)}
 
 
