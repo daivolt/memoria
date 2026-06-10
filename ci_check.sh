@@ -29,7 +29,7 @@ fail() { printf "FAIL\n"; FAIL=1; }
 if [ "${1:-}" = "--fast" ]; then
   TOTAL=8
 else
-  TOTAL=11
+  TOTAL=8
 fi
 
 echo "═══ ci_check.sh — memoria deploy gate ═══"
@@ -74,6 +74,23 @@ else
   if [ "$(printf '%s' "$HTML" | grep -c 'AbortController')" -eq 0 ]; then
     ISSUES="$ISSUES  api() missing timeout — AbortController\n"
   fi
+  # JS syntax validation via node --check
+  JS_TMP=$(mktemp /tmp/memoria_js_XXXX.js)
+  printf '%s' "$HTML" | python3 -c "
+import sys, re
+html = sys.stdin.read()
+scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+for s in scripts:
+    sys.stdout.write(s + '\n')
+" > "$JS_TMP" 2>/dev/null
+  if [ -s "$JS_TMP" ]; then
+    if node --check "$JS_TMP" 2>/dev/null; then
+      :
+    else
+      ISSUES="$ISSUES  JS syntax error — run 'node --check' for details\n"
+    fi
+  fi
+  rm -f "$JS_TMP"
   if [ -n "$ISSUES" ]; then echo; echo -e "$ISSUES" | head -20; fail; else pass; fi
 fi
 
@@ -103,16 +120,62 @@ else
   echo " (no response)"
 fi
 
-# ── 5. Agent count ──────────────────────────────────────────
+# ── 5. Agent claim E2E ──────────────────────────────────────
 
-next "Agents registered"
-AGENTS=$(curl -s --max-time 5 "http://localhost:$MEMORIA_PORT/agents" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('agents',[])))" 2>/dev/null || echo "0")
-if [ "$AGENTS" -gt 0 ]; then
-  pass
-  echo " ($AGENTS agents)"
-else
+next "Agent claim E2E"
+# Wait for agents to register (up to 60s)
+AGENT_ID=""
+for i in $(seq 1 12); do
+  AGENTS_JSON=$(curl -s --max-time 3 "http://localhost:$MEMORIA_PORT/agents" 2>/dev/null || echo '{"agents":[]}')
+  AGENT_ID=$(echo "$AGENTS_JSON" | python3 -c "
+import sys,json
+ags = json.load(sys.stdin).get('agents',[])
+for a in ags:
+    caps = a.get('capabilities',[])
+    if any(c in caps for c in ['coding','deploy','build','bugfix']):
+        print(a['id']); break
+" 2>/dev/null)
+  if [ -n "$AGENT_ID" ]; then break; fi
+  echo -n "."
+  sleep 5
+done
+if [ -z "$AGENT_ID" ]; then
   fail
-  echo " (0 agents — nobody registered)"
+  echo " (no capable agent registered in 60s)"
+else
+  printf " (%s)" "$AGENT_ID"
+  # Create task assigned to this agent
+  TASK_ID=$(curl -s -X POST "http://localhost:$MEMORIA_PORT/tasks" \
+    -H "Content-Type: application/json" \
+    -d "{\"project\":\"memoria\",\"title\":\"ci_check agent E2E\",\"description\":\"agent liveness gate\",\"assigned_to\":\"$AGENT_ID\"}" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin).get('task_id',''))" 2>/dev/null)
+  if [ -z "$TASK_ID" ]; then
+    fail
+    echo " (could not create task)"
+  else
+    # Wait for agent to claim it (up to 60s)
+    CLAIMED=0
+    for i in $(seq 1 12); do
+      STATUS=$(curl -s --max-time 3 "http://localhost:$MEMORIA_PORT/tasks/$TASK_ID" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+      if [ "$STATUS" = "assigned" ] || [ "$STATUS" = "in_progress" ]; then
+        CLAIMED=1; break
+      fi
+      echo -n "."
+      sleep 5
+    done
+    # Clean up — mark complete
+    curl -s -X PATCH "http://localhost:$MEMORIA_PORT/tasks/$TASK_ID" \
+      -H "Content-Type: application/json" \
+      -d '{"status":"completed","result":"ci_check agent E2E"}' > /dev/null 2>&1
+    if [ "$CLAIMED" -eq 1 ]; then
+      pass
+      echo " (claimed by agent within $((i*5))s)"
+    else
+      fail
+      echo " (agent did NOT claim task within 60s)"
+    fi
+  fi
 fi
 
 # ── 6. Sage E2E test (skipped with --fast) ──────────────────
@@ -124,18 +187,18 @@ if [ "${1:-}" = "--fast" ]; then
 else
 
 next "Sage E2E: create + complete task"
-TASK_ID=$(curl -s -X POST "http://localhost:$MEMORIA_PORT/tasks" \
+SAGE_TASK_ID=$(curl -s -X POST "http://localhost:$MEMORIA_PORT/tasks" \
   -H "Content-Type: application/json" \
   -d '{"project":"memoria","title":"deploy_gate_test","description":"ci_check.sh e2e","test_command":"exit 0","lint_command":"exit 0","rubric":["passes"]}' \
   | python3 -c "import sys,json; print(json.load(sys.stdin).get('task_id',''))" 2>/dev/null || echo "")
-if [ -z "$TASK_ID" ]; then
+if [ -z "$SAGE_TASK_ID" ]; then
   fail
   echo " (could not create task)"
 else
-  curl -s -X PATCH "http://localhost:$MEMORIA_PORT/tasks/$TASK_ID" \
+  curl -s -X PATCH "http://localhost:$MEMORIA_PORT/tasks/$SAGE_TASK_ID" \
     -H "Content-Type: application/json" \
     -d '{"status":"completed","result":"ci_check e2e"}' > /dev/null 2>&1
-  echo " ($TASK_ID)"
+  echo " ($SAGE_TASK_ID)"
 fi
 
 # ── 7. Wait for Sage verification ───────────────────────────
@@ -143,7 +206,7 @@ fi
 next "Sage verification (max ${E2E_MAX_WAIT}s)"
 SCORE="null"
 for i in $(seq 1 $((E2E_MAX_WAIT / 5))); do
-  SCORE=$(curl -s --max-time 3 "http://localhost:$MEMORIA_PORT/tasks/$TASK_ID" \
+  SCORE=$(curl -s --max-time 3 "http://localhost:$MEMORIA_PORT/tasks/$SAGE_TASK_ID" \
     | python3 -c "import sys,json; t=json.load(sys.stdin); v=t.get('verification') or {}; print(v.get('score','null'))" 2>/dev/null || echo "null")
   if [ "$SCORE" != "null" ]; then break; fi
   echo -n "."
