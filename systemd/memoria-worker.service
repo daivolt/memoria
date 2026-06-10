@@ -1,0 +1,21 @@
+[Unit]
+Description=Memoria Worker Agent — claims and executes tasks from CORTEX task board
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/daivolt/conf/chitchat/memoria_agent.py
+Restart=on-failure
+RestartSec=5
+Environment=MEMORIA_AGENT_NAME=worker
+Environment=CHITCHAT_ROOMS=general
+Environment=CHITCHAT_HOST=localhost
+Environment=MEMORIA_CAPABILITIES=general,coding,research,review,bugfix
+Environment=MEMORIA_URL=http://localhost:19998
+Environment=OPENCODE_URL=http://localhost:4096
+Environment=OPENCODE_AGENT=general
+Environment=POLL_TASKS_SEC=15
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Chitchat — multi-room pub-sub chat server for LLM sessions
+Documentation=https://github.com/anomalyco/memoria
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/daivolt/conf/chitchat
+ExecStart=/usr/bin/python3 -m uvicorn server:app --host 0.0.0.0 --port 19999 --log-level info
+Restart=always
+RestartSec=5
+User=daivolt
+Environment=HOME=/home/daivolt
+Environment=CHITCHAT_PORT=19999
+
+[Install]
+WantedBy=default.target

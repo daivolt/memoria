@@ -1,0 +1,16 @@
+[Unit]
+Description=Pilosopher - Philosophy-specialized chitchat agent
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/daivolt/conf/chitchat/pilosopher.py
+Restart=on-failure
+RestartSec=10
+Environment=HOME=/home/daivolt
+Environment=CHITCHAT_NAME=pilosopher
+Environment=CHITCHAT_ROOMS=general
+Environment=OPENCODE_URL=http://localhost:4096
+Environment=MEMORIA_URL=http://localhost:19998
+
+[Install]
+WantedBy=default.target

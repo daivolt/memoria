@@ -1,0 +1,26 @@
+[Unit]
+Description=Memoria — AgentOS memory + orchestration server
+Documentation=https://github.com/anomalyco/memoria
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/external-drive/code/memoria
+ExecStart=/usr/bin/python3 /mnt/external-drive/code/memoria/memoriad_global.py
+Restart=always
+RestartSec=5
+User=daivolt
+Environment=HOME=/home/daivolt
+Environment=CHITCHAT_URL=http://localhost:19999
+Environment=MEMORIA_PORT=19998
+Environment=MEMORIA_HOST=0.0.0.0
+Environment=OPENCODE_DB=/home/daivolt/.local/share/opencode/opencode.db
+Environment=LLM_URL=http://localhost:11434/v1/chat/completions
+Environment=LLM_MODEL=deepseek-v4-flash:cloud
+Environment=PGHOST=localhost
+Environment=PGUSER=postgres
+Environment=PGDATABASE=memoria
+
+[Install]
+WantedBy=default.target
