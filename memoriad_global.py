@@ -4645,9 +4645,20 @@ function el(id) { return document.getElementById(id); }
 
 // -- Fetch Wrapper --
 async function api(path) {
-  const r = await fetch(BASE + path);
-  if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
-  return r.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const r = await fetch(BASE + path, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      throw new Error((r.status + ' ' + r.statusText + (body ? ': ' + body.slice(0, 120) : '')).trim());
+    }
+    return r.json();
+  } catch(e) {
+    clearTimeout(timer);
+    throw e;
+  }
 }
 
 // -- Progress Bar --
@@ -5059,7 +5070,7 @@ function switchChatRoom(room) {
 
 function renderMarkdown(text) {
   if (!text) return '';
-  let s = text.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+  let s = esc(text);
   s = s.replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
   s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
   s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
@@ -5228,7 +5239,7 @@ async function saveConfig() {
     else updates[key] = val;
   });
   // Enrichment fields
-  if (el('cfg_enrich_enabled').checked !== undefined) updates['enrich_enabled'] = el('cfg_enrich_enabled').checked;
+  updates['enrich_enabled'] = el('cfg_enrich_enabled').checked;
   const weight = parseFloat(el('cfg_enrich_weight').value);
   if (!isNaN(weight)) updates['enrich_weight'] = weight;
   const df = parseFloat(el('cfg_enrich_df_ratio').value);
@@ -5597,6 +5608,10 @@ function brainFreeze() {
   if (brainSim) brainSim.stop();
 }
 
+function easeInOut(t) {
+  return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+}
+
 function updateSignalsPanel(cortex) {
   const el = document.getElementById('brainSignals');
   if (!el) return;
@@ -5627,97 +5642,7 @@ function updateSignalsPanel(cortex) {
   el.innerHTML = items.map(s => '<div>' + s + '</div>').join('');
 }
 
-let brainTaskData = { pending: 0, assigned: 0, completed: 0, failed: 0 };
-let brainAgentData = [];
-let _brainRetries = 0;
-
-function loadBrain() {
-  const canvas = document.getElementById('brainCanvas');
-  if (!canvas) return;
-  const wrap = document.getElementById('brainWrap');
-  const rect = wrap ? wrap.getBoundingClientRect() : null;
-  const W = rect && rect.width > 0 ? rect.width : (window.innerWidth - 280);
-  const H = rect && rect.height > 0 ? rect.height : (window.innerHeight - 160);
-  if (W < 50 || H < 50) {
-    if (++_brainRetries < 8) { setTimeout(loadBrainDelayed, 300); }
-    return;
-  }
-  _brainRetries = 0;
-  canvas.width = W;
-  canvas.height = H;
-  const ctx = canvas.getContext('2d');
-
-  const initNodes = BRAIN_NODES;
-  const initEdges = BRAIN_EDGES;
-
-  Promise.all([
-    fetch(BASE + '/cortex/status').then(r => r.json()).catch(() => ({})),
-    fetch(BASE + '/tasks').then(r => r.json()).catch(() => ({ tasks: [] })),
-    fetch(BASE + '/agents').then(r => r.json()).catch(() => ({ agents: [] })),
-  ]).then(([cortexData, tasksData, agentsData]) => {
-    const cortex = cortexData.cortex || {};
-    const tasks = tasksData.tasks || [];
-    const agents = agentsData.agents || [];
-    brainTaskData = {
-      pending: tasks.filter(t => t.status === 'pending').length,
-      assigned: tasks.filter(t => t.status === 'assigned').length,
-      completed: tasks.filter(t => t.status === 'completed').length,
-      failed: tasks.filter(t => t.status === 'failed').length,
-    };
-    brainAgentData = agents;
-    document.getElementById('brainTs').textContent = new Date().toLocaleTimeString();
-
-    updateSignalsPanel(cortex);
-
-    // Seed edge particles
-    if (brainParticles.length === 0) {
-      const padX = W * 0.08, padY = H * 0.08;
-      initEdges.forEach(edge => {
-        for (let i = 0; i < 8; i++) {
-          brainParticles.push({
-            from: edge.from, to: edge.to,
-            t: Math.random(),
-            speed: 0.0002 + Math.random() * 0.0008,
-            color: edge.color,
-            size: 1.2 + Math.random() * 2.0,
-          });
-        }
-      });
-    }
-
-    if (brainAnimFrame) cancelAnimationFrame(brainAnimFrame);
-    // Animate with real data injected
-    (function frameLoop() {
-      const nodes = initNodes.map(n => ({
-        ...n,
-        px: 50 + n.x * (W - 100),
-        py: 50 + n.y * (H - 100),
-      }));
-      const nodeMap = {};
-      nodes.forEach(n => nodeMap[n.id] = n);
-      drawBrainFrame(ctx, W, H, nodes, nodeMap, initEdges, cortex, agents);
-      brainAnimFrame = requestAnimationFrame(frameLoop);
-    })();
-  }).catch(() => {
-    const nodes = initNodes.map(n => ({
-      ...n,
-      px: 50 + n.x * (W - 100),
-      py: 50 + n.y * (H - 100),
-    }));
-    const nodeMap = {};
-    nodes.forEach(n => nodeMap[n.id] = n);
-    if (brainAnimFrame) cancelAnimationFrame(brainAnimFrame);
-    (function frameLoop() {
-      drawBrainFrame(ctx, W, H, nodes, nodeMap, initEdges, {}, []);
-      brainAnimFrame = requestAnimationFrame(frameLoop);
-    })();
-  });
-}
-
-function drawBrainFrame(ctx, W, H, nodes, nodeMap, edges, cortex, agents) {
-  ctx.clearRect(0, 0, W, H);
-  const now = Date.now() * brainSpeed * 0.001;
-  const dt = brainSpeed * 0.016;
+// ── Tab 4 Preview ───────────────────────────────────────────
 
   // Background grid dots
   ctx.fillStyle = 'rgba(99,102,241,0.03)';
@@ -5908,41 +5833,6 @@ function drawBrainFrame(ctx, W, H, nodes, nodeMap, edges, cortex, agents) {
     tooltip.style.opacity = '0';
     setTimeout(() => tooltip.style.display = 'none', 150);
   };
-}
-
-function easeInOut(t) {
-  return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-}
-
-function updateSignalsPanel(cortex) {
-  const el = document.getElementById('brainSignals');
-  if (!el) return;
-  const items = [
-    '<span style="color:#818cf8">\u25cf</span> Q-table: <b>' + (cortex.q_table_size || 0) + '</b> states',
-    '<span style="color:#2dd4bf">\u25cf</span> Replay buffer: <b>' + (cortex.replay_buffer || 0) + '</b>',
-    '<span style="color:#f472b6">\u25cf</span> Episodic memory: <b>' + (cortex.episodes || 0) + '</b>',
-    '<span style="color:#fbbf24">\u25cf</span> Working memory: depth <b>' + (cortex.wm_stack_depth || 0) + '</b>',
-    '<span style="color:#f87171">\u25cf</span> Surprise \u03b1=' + ((cortex.alpha_surprise || 0)) + ' \u03b2=' + ((cortex.beta_surprise || 0)),
-    '<span style="color:#94a3b8">\u25cf</span> Agents: <b>' + (brainAgentData.length) + '</b> | Tasks: <b>' + (brainTaskData.total || brainTaskData.pending + brainTaskData.assigned + brainTaskData.completed + brainTaskData.failed) + '</b>',
-  ];
-  if (cortex.pc_hierarchy) {
-    const pc = cortex.pc_hierarchy;
-    const lvls = pc.levels || {};
-    const pfcL = lvls.pfc || {};
-    const bgL = lvls.bg || {};
-    const senL = lvls.sensory || {};
-    if (pfcL.prediction !== undefined) {
-      items.push('<span style="color:#a78bfa">\u25c9</span> PFC: \u03bc=' + pfcL.prediction.toFixed(3) + ' \u03c0=' + pfcL.precision.toFixed(2) + ' \u03b5=' + pfcL.error.toFixed(3));
-      items.push('<span style="color:#818cf8">\u25c9</span> BG:  \u03bc=' + bgL.prediction.toFixed(3) + ' \u03c0=' + bgL.precision.toFixed(2) + ' \u03b5=' + bgL.error.toFixed(3));
-      items.push('<span style="color:#34d399">\u25c9</span> SEN: \u03bc=' + senL.prediction.toFixed(3) + ' \u03c0=' + senL.precision.toFixed(2) + ' \u03b5=' + senL.error.toFixed(3));
-    }
-    const feTrace = pc.totalFreeEnergyTrace;
-    if (feTrace && feTrace.length > 0) {
-      const fe = feTrace[feTrace.length - 1];
-      items.push('<span style="color:#fbbf24">\u25c9</span> Free Energy: <b>' + fe.toFixed(3) + '</b>');
-    }
-  }
-  el.innerHTML = items.map(s => '<div>' + s + '</div>').join('');
 }
 
 // ============================================
