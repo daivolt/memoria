@@ -2443,12 +2443,19 @@ async def verify_task(task_id: str, body: VerifyTask):
     if not t.get("status") in ("verified",):
         t["status"] = "verified"
     _save_task(t)
+    test_str = (
+        "PASS"
+        if body.test_passed
+        else ("FAIL" if body.test_passed is not None else "-")
+    )
+    lint_str = (
+        f"{body.lint_violations} viol." if body.lint_violations is not None else "-"
+    )
+    rubric_str = f"{body.rubric_score:.2f}" if body.rubric_score is not None else "-"
     _notify_chitchat(
         f"verification for {task_id[:12]}: "
-        f"score={body.score:.2f} "
-        f"test={'PASS' if body.test_passed else 'FAIL' if body.test_passed is not None else '-'} "
-        f"lint={body.lint_violations if body.lint_violations is not None else '-'} "
-        f"rubric={body.rubric_score:.2f if body.rubric_score is not None else '-'}"
+        f"score={body.score:.2f} test={test_str} "
+        f"lint={lint_str} rubric={rubric_str}"
     )
     return {"ok": True, "task_id": task_id, "score": body.score}
 
