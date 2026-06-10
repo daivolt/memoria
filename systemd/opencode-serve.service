@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenCode serve — REST API for session management
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/opencode serve --port 4096 --hostname 127.0.0.1
+Restart=on-failure
+RestartSec=5
+Environment=HOME=/home/daivolt
+
+[Install]
+WantedBy=default.target
