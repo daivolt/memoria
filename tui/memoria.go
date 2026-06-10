@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-var memoriaBase = getEnv("MEMORIA_SERVER", "http://100.121.245.69:19998")
+var memoriaBase = getEnv("MEMORIA_SERVER", "http://100.126.64.13:19998")
 
 type MemoriaClient struct {
 	client *http.Client
@@ -28,14 +28,14 @@ type AgentInfo struct {
 }
 
 type TaskInfo struct {
-	ID          string  `json:"id"`
-	Project     string  `json:"project"`
-	Title       string  `json:"title"`
-	Status      string  `json:"status"`
-	AssignedTo  string  `json:"assigned_to"`
-	Result      string  `json:"result"`
-	Error       string  `json:"error"`
-	CreatedAt   float64 `json:"created_at"`
+	ID         string  `json:"id"`
+	Project    string  `json:"project"`
+	Title      string  `json:"title"`
+	Status     string  `json:"status"`
+	AssignedTo string  `json:"assigned_to"`
+	Result     string  `json:"result"`
+	Error      string  `json:"error"`
+	CreatedAt  float64 `json:"created_at"`
 }
 
 type MemoryEntry struct {
@@ -45,9 +45,9 @@ type MemoryEntry struct {
 }
 
 type RecallResult struct {
-	Query   string         `json:"query"`
-	Count   int            `json:"count"`
-	Results []RecallHit    `json:"results"`
+	Query   string      `json:"query"`
+	Count   int         `json:"count"`
+	Results []RecallHit `json:"results"`
 }
 
 type RecallHit struct {
@@ -60,18 +60,18 @@ type RecallHit struct {
 }
 
 type MemoriaConfig struct {
-	MemoryLimit                 int    `json:"memory_limit"`
-	PollInterval                int    `json:"poll_interval"`
-	AgentStaleSec               int    `json:"agent_stale_sec"`
-	ChitchatPollInterval        int    `json:"chitchat_poll_interval"`
-	ChitchatConsolidateThreshold int   `json:"chitchat_consolidate_threshold"`
-	ChitchatMaxMessages         int    `json:"chitchat_max_messages"`
-	SleepCycleHours             int    `json:"sleep_cycle_hours"`
-	SessionMaxRecords           int    `json:"session_max_records"`
-	AutoAcceptThreshold         int    `json:"auto_accept_threshold"`
-	ChitchatURL                 string `json:"chitchat_url"`
-	Port                        int    `json:"port"`
-	Host                        string `json:"host"`
+	MemoryLimit                  int    `json:"memory_limit"`
+	PollInterval                 int    `json:"poll_interval"`
+	AgentStaleSec                int    `json:"agent_stale_sec"`
+	ChitchatPollInterval         int    `json:"chitchat_poll_interval"`
+	ChitchatConsolidateThreshold int    `json:"chitchat_consolidate_threshold"`
+	ChitchatMaxMessages          int    `json:"chitchat_max_messages"`
+	SleepCycleHours              int    `json:"sleep_cycle_hours"`
+	SessionMaxRecords            int    `json:"session_max_records"`
+	AutoAcceptThreshold          int    `json:"auto_accept_threshold"`
+	ChitchatURL                  string `json:"chitchat_url"`
+	Port                         int    `json:"port"`
+	Host                         string `json:"host"`
 }
 
 type HealthInfo struct {

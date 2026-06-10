@@ -1,7 +1,7 @@
 # memoria v2 — Memory + AgentOS Orchestration
 
 Persistent memory + agent coordination for opencode.
-Runs as a REST server on the Tailscale mini server (`100.121.245.69:19998`).
+Runs as a REST server on mediserv (`100.126.64.13:19998`).
 
 ## Architecture (6 Layers + Safety)
 
@@ -45,7 +45,7 @@ Runs as a REST server on the Tailscale mini server (`100.121.245.69:19998`).
 ## Components
 
 ### `memoriad_global.py` — REST Server (port 19998)
-FastAPI server with all endpoints. Runs on the mini server.
+FastAPI server with all endpoints. Runs on mediserv.
 Background task polls opencode.db every 30s for new sessions.
 
 **Endpoints:**
@@ -154,7 +154,7 @@ Terminal UI built with [Charm](https://charm.land/libs/) (Bubble Tea + Lip Gloss
 The TUI is also available as a **Tailscale service** via SSH. From any device on your Tailscale network:
 
 ```bash
-ssh -p 23234 daivolt@100.121.245.69
+ssh -p 23234 daivolt@100.126.64.13
 ```
 
 ### systemd — TUI SSH Server
@@ -202,7 +202,7 @@ Reference copies are kept at `opencode-integration/` in this repo.
 
 | Env Var | Default | Purpose |
 |---------|---------|---------|
-| `MEMORIA_SERVER` | `http://100.121.245.69:19998` | REST server URL |
+| `MEMORIA_SERVER` | `http://100.126.64.13:19998` | REST server URL |
 | `MEMORIA_PROJECT` | `$(basename $(pwd))` | Project name for memory scoping |
 | `MEMORIA_PORT` | `19998` | Server port (server-side) |
 | `MEMORIA_HOST` | `0.0.0.0` | Server bind address |
@@ -231,13 +231,13 @@ Reference copies are kept at `opencode-integration/` in this repo.
 ## Deployment
 
 ```bash
-# On the mini server:
+# On mediserv:
 mkdir -p ~/memoria
 # rsync or copy files from mediserv
 uvicorn memoriad_global:app --host 0.0.0.0 --port 19998
 
-# On any machine with network access to mini server:
-export MEMORIA_SERVER=http://100.121.245.69:19998
+# On any machine with network access to mediserv:
+export MEMORIA_SERVER=http://100.126.64.13:19998
 !memoria status
 ```
 

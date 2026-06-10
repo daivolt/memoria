@@ -11,20 +11,20 @@ import (
 	"time"
 )
 
-var chitchatBase = getEnv("CHITCHAT_URL", "http://100.121.245.69:19999")
+var chitchatBase = getEnv("CHITCHAT_URL", "http://100.126.64.13:19999")
 
 type ChatMessage struct {
-	TS     string `json:"ts"`
-	From   string `json:"from"`
-	Text   string `json:"text"`
-	Topic  string `json:"topic"`
-	Room   string `json:"room"`
-	Type   string `json:"type"`
+	TS    string `json:"ts"`
+	From  string `json:"from"`
+	Text  string `json:"text"`
+	Topic string `json:"topic"`
+	Room  string `json:"room"`
+	Type  string `json:"type"`
 }
 
 type RoomInfo struct {
-	Name    string `json:"name"`
-	MessageCount int `json:"message_count"`
+	Name         string `json:"name"`
+	MessageCount int    `json:"message_count"`
 }
 
 type ChitchatClient struct {
@@ -38,7 +38,7 @@ func NewChitchatClient() *ChitchatClient {
 	return &ChitchatClient{
 		rooms:    []string{"general"},
 		messages: make(map[string][]ChatMessage),
-		client: &http.Client{Timeout: 5 * time.Second},
+		client:   &http.Client{Timeout: 5 * time.Second},
 	}
 }
 

@@ -2,12 +2,12 @@
 [DEPRECATED] memoriad — use memoriad_global.py instead.
 
 The per-project background daemon has been replaced by the REST server
-(memoriad_global.py) which runs once on the mini server (port 19998)
+(memoriad_global.py) which runs once on mediserv (port 19998)
 and serves all projects. It includes the same session extraction and
 FTS5 indexing logic.
 
 Migration:
-- The REST server runs on the mini server at 100.121.245.69:19998
+- The REST server runs on mediserv at 100.126.64.13:19998
 - All commands go through memoria.py (HTTP client) targeting MEMORIA_SERVER
 - No per-project daemon needed — the server handles everything globally
 - Context state, compression, topics, proposals all available via REST
