@@ -4231,6 +4231,7 @@ body {
   50% { opacity: 1; transform: scale(1.2); }
 }
 </style>
+<script src="https://d3js.org/d3.v7.min.js"></script>
 </head>
 <body>
 
@@ -4444,18 +4445,17 @@ body {
     <!-- Tab 8: Brain Network -->
       <div class="tab-content" id="tab8">
         <div class="tab-header">
-          <div class="tab-title">🧠 Brain — Neural Network Visualization</div>
+          <div class="tab-title">🧠 Brain — Force-Directed Neural Graph</div>
           <div class="tab-actions">
             <span class="text-sm text-muted" id="brainTs"></span>
-            <button class="btn btn-sm" onclick="brainSpeedSlow()">⏪</button>
-            <button class="btn btn-sm" onclick="brainSpeedNormal()">▶</button>
-            <button class="btn btn-sm" onclick="brainSpeedFast()">⏩</button>
+            <button class="btn btn-sm" onclick="brainReheat()">🔥 Reheat</button>
+            <button class="btn btn-sm" onclick="brainFreeze()">❄️ Freeze</button>
           </div>
         </div>
-        <div id="brainWrap" style="position:relative;width:100%;height:calc(100vh - 160px);min-height:400px;background:radial-gradient(ellipse at center, #1a1a2e 0%, #0f0f1a 70%, #0a0a10 100%);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;">
-          <canvas id="brainCanvas" style="display:block;width:100%;height:100%;"></canvas>
-          <div id="brainTooltip" style="display:none;position:absolute;background:rgba(26,26,46,0.95);backdrop-filter:blur(12px);border:1px solid rgba(108,92,231,0.4);border-radius:8px;padding:10px 14px;font-size:12px;pointer-events:none;z-index:10;max-width:300px;color:#e0e0ff;box-shadow:0 4px 20px rgba(108,92,231,0.2);transition:opacity 0.15s;"></div>
-          <div style="position:absolute;top:12px;right:12px;width:240px;display:flex;flex-direction:column;gap:8px;pointer-events:none;">
+        <div id="brainWrap" style="position:relative;width:100%;height:calc(100vh - 160px);min-height:400px;background:radial-gradient(ellipse at center, #1a1a2e 0%, #0f0f1a 70%, #0a0a10 100%);overflow:hidden;">
+          <svg id="brainSvg" width="100%" height="100%"></svg>
+          <div id="brainTooltip" style="display:none;position:absolute;background:rgba(26,26,46,0.95);backdrop-filter:blur(12px);border:1px solid rgba(108,92,231,0.4);border-radius:8px;padding:10px 14px;font-size:12px;pointer-events:none;z-index:10;max-width:300px;color:#e0e0ff;box-shadow:0 4px 20px rgba(108,92,231,0.2);"></div>
+          <div style="position:absolute;top:12px;right:12px;width:250px;display:flex;flex-direction:column;gap:8px;pointer-events:none;">
             <div style="background:rgba(26,26,46,0.85);backdrop-filter:blur(8px);border:1px solid rgba(108,92,231,0.2);border-radius:8px;padding:10px 12px;">
               <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:rgba(108,92,231,0.7);margin-bottom:6px;">Signals</div>
               <div id="brainSignals" style="font-size:11px;font-family:var(--mono);color:#a0a0c0;display:flex;flex-direction:column;gap:3px;"></div>
@@ -5275,43 +5275,295 @@ async function clearProposals() {
 // BRAIN NETWORK VISUALIZATION
 // ============================================
 
-var BRAIN_NODES = [
-  { id: 'pfc', label: 'PFC', sub: 'predictions', x: 0.5, y: 0.08, color: '#a78bfa', size: 32, desc: 'Prefrontal Cortex — abstract goal predictions ↓, top-down precision-weighted context, free energy minimization' },
-  { id: 'bg', label: 'BG', sub: 'gating', x: 0.22, y: 0.33, color: '#818cf8', size: 28, desc: 'Basal Ganglia — value predictions ↓, Go/NoGo gating, OpAL* actor-critic, receives sensory prediction errors' },
-  { id: 'dacc', label: 'dACC', sub: 'surprise', x: 0.78, y: 0.33, color: '#c084fc', size: 24, desc: 'Dorsal Anterior Cingulate — surprise tracking, epsilon modulation, meta-learning over policy exploration' },
-  { id: 'snd', label: 'SNc', sub: 'RPE ↑', x: 0.5, y: 0.52, color: '#fbbf24', size: 22, desc: 'Substantia Nigra / VTA — dopamine reward prediction error signal, broadcasts RPE to striatum and cortex' },
-  { id: 'sensory', label: 'Sensory', sub: 'errors ↑', x: 0.5, y: 0.62, color: '#34d399', size: 24, desc: 'Sensory Cortex (Level 0) — outcome observations, computes bottom-up prediction errors with precision weighting' },
-  { id: 'hip', label: 'HPC', sub: 'replay', x: 0.22, y: 0.78, color: '#2dd4bf', size: 28, desc: 'Hippocampus — episodic memory, pattern completion, experience replay buffer for offline Q-learning consolidation' },
-  { id: 'thal', label: 'Thalamus', sub: 'relay', x: 0.78, y: 0.78, color: '#94a3b8', size: 20, desc: 'Thalamus — winner-take-all relay, gates cortical output, attention filtering' },
-  { id: 'ctx', label: 'Context', sub: 'preload', x: 0.5, y: 0.88, color: '#f472b6', size: 22, desc: 'Context Preloader — automatic pattern completion for current task, primes relevant memories' },
-];
+// ============================================
+// BRAIN NETWORK — D3 Force-Directed Simulation
+// ============================================
 
-var BRAIN_EDGES = [
-  { from: 'pfc', to: 'bg', label: 'goal μ↓', color: '#a78bfa', dashed: false },
-  { from: 'bg', to: 'sensory', label: 'value μ↓', color: '#818cf8', dashed: false },
-  { from: 'sensory', to: 'bg', label: 'PE ε↑', color: '#f87171', dashed: false },
-  { from: 'bg', to: 'pfc', label: 'goal ε↑', color: '#f87171', dashed: false },
-  { from: 'pfc', to: 'dacc', label: 'control', color: '#fbbf24', dashed: true },
-  { from: 'bg', to: 'snd', label: 'action → RPE', color: '#f87171', dashed: false },
-  { from: 'snd', to: 'dacc', label: 'surprise', color: '#fbbf24', dashed: true },
-  { from: 'dacc', to: 'bg', label: 'ε mod', color: '#fbbf24', dashed: true },
-  { from: 'hip', to: 'bg', label: 'replay → Q', color: '#2dd4bf', dashed: false },
-  { from: 'hip', to: 'ctx', label: 'episodes', color: '#f472b6', dashed: true },
-  { from: 'bg', to: 'thal', label: 'Go/NoGo', color: '#fbbf24', dashed: false },
-  { from: 'thal', to: 'pfc', label: 'gated', color: '#94a3b8', dashed: true },
-  { from: 'ctx', to: 'pfc', label: 'context', color: '#f472b6', dashed: true },
-];
-
-var brainAnimFrame = null;
-var brainSpeed = 1.0;
-var brainParticles = [];
-
-function brainSpeedSlow() { brainSpeed = 0.5; }
-function brainSpeedNormal() { brainSpeed = 1.0; }
-function brainSpeedFast() { brainSpeed = 2.0; }
+let brainSim = null;
+let brainNodeElems = null;
+let brainEdgeElems = null;
+let brainLabelElems = null;
+let brainData = null;
+let brainTaskData = { pending: 0, assigned: 0, completed: 0, failed: 0 };
+let brainAgentData = [];
+let _brainRetries = 0;
+let _brainSvg = null;
 
 function loadBrainDelayed() {
   requestAnimationFrame(() => requestAnimationFrame(() => loadBrain()));
+}
+
+function loadBrain() {
+  const wrap = document.getElementById('brainWrap');
+  const svgEl = document.getElementById('brainSvg');
+  if (!wrap || !svgEl) return;
+  const W = wrap.clientWidth;
+  const H = wrap.clientHeight;
+  if (W < 50 || H < 50) {
+    if (++_brainRetries < 8) { setTimeout(loadBrainDelayed, 300); }
+    return;
+  }
+  _brainRetries = 0;
+
+  svgEl.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svgEl.style.width = W + 'px';
+  svgEl.style.height = H + 'px';
+
+  if (!_brainSvg) {
+    _brainSvg = d3.select('#brainSvg');
+    // Dot grid background
+    const defs = _brainSvg.append('defs');
+    defs.append('pattern')
+      .attr('id', 'brainGrid')
+      .attr('width', 40).attr('height', 40)
+      .attr('patternUnits', 'userSpaceOnUse')
+      .append('circle').attr('cx', 20).attr('cy', 20).attr('r', 1).attr('fill', 'rgba(99,102,241,0.08)');
+    _brainSvg.append('rect').attr('width', '100%').attr('height', '100%').attr('fill', 'url(#brainGrid)');
+
+    // Glow filter
+    defs.append('filter').attr('id', 'nodeGlow')
+      .html('<feGaussianBlur stdDeviation="3" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>');
+  }
+
+  Promise.all([
+    fetch(BASE + '/cortex/status').then(r => r.json()).catch(() => ({})),
+    fetch(BASE + '/tasks').then(r => r.json()).catch(() => ({ tasks: [] })),
+    fetch(BASE + '/agents').then(r => r.json()).catch(() => ({ agents: [] })),
+  ]).then(([cortexData, tasksData, agentsData]) => {
+    const cortex = cortexData.cortex || {};
+    const tasks = tasksData.tasks || [];
+    const agents = agentsData.agents || [];
+    brainTaskData = {
+      pending: tasks.filter(t => t.status === 'pending').length,
+      assigned: tasks.filter(t => t.status === 'assigned').length,
+      completed: tasks.filter(t => t.status === 'completed').length,
+      failed: tasks.filter(t => t.status === 'failed').length,
+    };
+    brainAgentData = agents;
+    document.getElementById('brainTs').textContent = new Date().toLocaleTimeString();
+    updateSignalsPanel(cortex);
+    renderD3Brain(W, H, cortex, agents);
+  }).catch(() => renderD3Brain(W, H, {}, []));
+}
+
+function renderD3Brain(W, H, cortex, agents) {
+  const nodes = [
+    { id: 'pfc', label: 'PFC', sub: 'predictions', color: '#a78bfa', r: 32, desc: 'Prefrontal Cortex — goal predictions ↓, free energy minimization' },
+    { id: 'bg', label: 'BG', sub: 'gating', color: '#818cf8', r: 28, desc: 'Basal Ganglia — value predictions ↓, Go/NoGo gating, OpAL*' },
+    { id: 'dacc', label: 'dACC', sub: 'surprise', color: '#c084fc', r: 24, desc: 'Dorsal ACC — surprise tracking, epsilon modulation, meta-learning' },
+    { id: 'snd', label: 'SNc', sub: 'RPE ↑', color: '#fbbf24', r: 22, desc: 'SNc/VTA — dopamine reward prediction error broadcast' },
+    { id: 'sensory', label: 'Sensory', sub: 'errors ↑', color: '#34d399', r: 24, desc: 'Sensory (L0) — outcome observations, prediction errors ↑' },
+    { id: 'hip', label: 'HPC', sub: 'replay', color: '#2dd4bf', r: 28, desc: 'Hippocampus — episodic memory, pattern completion, replay buffer' },
+    { id: 'thal', label: 'Thalamus', sub: 'relay', color: '#94a3b8', r: 20, desc: 'Thalamus — winner-take-all relay, gates cortical output' },
+    { id: 'ctx', label: 'Context', sub: 'preload', color: '#f472b6', r: 22, desc: 'Context Preloader — pattern completion for current task' },
+  ];
+  const edges = [
+    { source: 'pfc', target: 'bg', label: 'goal μ↓', color: '#a78bfa', dash: false },
+    { source: 'bg', target: 'sensory', label: 'value μ↓', color: '#818cf8', dash: false },
+    { source: 'sensory', target: 'bg', label: 'PE ε↑', color: '#f87171', dash: false },
+    { source: 'bg', target: 'pfc', label: 'goal ε↑', color: '#f87171', dash: false },
+    { source: 'pfc', target: 'dacc', label: 'control', color: '#fbbf24', dash: true },
+    { source: 'bg', target: 'snd', label: 'action → RPE', color: '#f87171', dash: false },
+    { source: 'snd', target: 'dacc', label: 'surprise', color: '#fbbf24', dash: true },
+    { source: 'dacc', target: 'bg', label: 'ε mod', color: '#fbbf24', dash: true },
+    { source: 'hip', target: 'bg', label: 'replay → Q', color: '#2dd4bf', dash: false },
+    { source: 'hip', target: 'ctx', label: 'episodes', color: '#f472b6', dash: true },
+    { source: 'bg', target: 'thal', label: 'Go/NoGo', color: '#fbbf24', dash: false },
+    { source: 'thal', target: 'pfc', label: 'gated', color: '#94a3b8', dash: true },
+    { source: 'ctx', target: 'pfc', label: 'context', color: '#f472b6', dash: true },
+  ];
+
+  // Kill existing simulation
+  if (brainSim) { brainSim.stop(); brainSim = null; }
+
+  // Seed positions using prior positions or center
+  const savedX = {}, savedY = {};
+  if (brainNodeElems) {
+    brainNodeElems.each(d => { savedX[d.id] = d.x; savedY[d.id] = d.y; });
+  }
+  nodes.forEach(n => {
+    n.x = savedX[n.id] !== undefined ? savedX[n.id] : W / 2 + (Math.random() - 0.5) * (W * 0.3);
+    n.y = savedY[n.id] !== undefined ? savedY[n.id] : H / 2 + (Math.random() - 0.5) * (H * 0.3);
+  });
+
+  // Root container with pan/zoom
+  if (!brainData) {
+    _brainSvg.selectAll('g.brainRoot').remove();
+    brainData = _brainSvg.append('g').attr('class', 'brainRoot');
+    const zoom = d3.zoom()
+      .scaleExtent([0.4, 3])
+      .on('zoom', (e) => brainData.attr('transform', e.transform));
+    _brainSvg.call(zoom);
+  }
+
+  // Edge particles (flowing dots)
+  const edgeG = brainData.selectAll('g.edge').data(edges, d => d.source + '-' + d.target);
+  edgeG.exit().remove();
+  const edgeEnter = edgeG.enter().append('g').attr('class', 'edge');
+
+  const edgeLines = brainData.selectAll('g.edge line').data(edges, d => 'line-' + d.source + '-' + d.target);
+  edgeLines.exit().remove();
+  edgeLines.enter().append('line').attr('stroke', d => d.color + '30').attr('stroke-width', 1.2)
+    .attr('stroke-dasharray', d => d.dash ? '5,5' : null);
+
+  // Edge particles (animated)
+  const particles = brainData.selectAll('g.edge circle').data(edges, d => 'p-' + d.source + '-' + d.target);
+  particles.exit().remove();
+  particles.enter().append('circle').attr('r', 2.5).attr('fill', d => d.color);
+
+  // Edge labels
+  const lbls = brainData.selectAll('g.edge text').data(edges, d => 't-' + d.source + '-' + d.target);
+  lbls.exit().remove();
+  lbls.enter().append('text')
+    .attr('fill', 'rgba(148,163,184,0.5)')
+    .attr('font-size', '8px').attr('font-family', 'monospace')
+    .attr('text-anchor', 'middle').text(d => d.label);
+
+  // Node groups
+  brainNodeElems = brainData.selectAll('g.node').data(nodes, d => d.id);
+  brainNodeElems.exit().remove();
+  const nodeEnter = brainNodeElems.enter().append('g').attr('class', 'node')
+    .attr('cursor', 'pointer');
+
+  // Glow circles
+  nodeEnter.append('circle').attr('class', 'glow')
+    .attr('fill', d => d.color + '22')
+    .attr('stroke', 'none');
+
+  // Main circles
+  const circ = nodeEnter.append('circle').attr('class', 'core')
+    .attr('r', d => d.r * 0.45).attr('filter', 'url(#nodeGlow)')
+    .attr('fill', d => d.color).attr('stroke', '#fff').attr('stroke-width', 1.5);
+
+  // Labels
+  nodeEnter.append('text').attr('class', 'nlabel')
+    .attr('fill', '#e2e8f0').attr('font-size', '11px')
+    .attr('font-family', '"SF Mono","Cascadia Code",monospace')
+    .attr('font-weight', '600').attr('text-anchor', 'middle')
+    .text(d => d.label);
+  nodeEnter.append('text').attr('class', 'sublabel')
+    .attr('fill', 'rgba(148,163,184,0.5)').attr('font-size', '9px')
+    .attr('font-family', 'monospace').attr('text-anchor', 'middle')
+    .text(d => d.sub);
+
+  // Tooltip
+  brainNodeElems.on('mouseenter', function(e, d) {
+    const tip = document.getElementById('brainTooltip');
+    tip.style.display = 'block';
+    tip.innerHTML = '<strong style="color:' + d.color + '">' + d.id.toUpperCase() + '</strong><br><span style="color:#94a3b8;font-size:11px;">' + (d.desc || '') + '</span>';
+    d3.select(this).select('circle.core').transition().duration(150).attr('r', d.r * 0.55);
+  }).on('mousemove', function(e) {
+    const tip = document.getElementById('brainTooltip');
+    tip.style.left = (e.offsetX + 16) + 'px';
+    tip.style.top = (e.offsetY - 8) + 'px';
+  }).on('mouseleave', function(e, d) {
+    document.getElementById('brainTooltip').style.display = 'none';
+    d3.select(this).select('circle.core').transition().duration(150).attr('r', d.r * 0.45);
+  });
+
+  // Agent circles along bottom
+  const reputations = cortex.avg_reputations || {};
+  const maxAgents = Math.min(agents.length, Math.floor((W - 100) / 22));
+  const agentStartX = W / 2 - (maxAgents * 22) / 2;
+  const agentY = H - 25;
+  const agentData = [];
+  for (let i = 0; i < maxAgents; i++) {
+    const a = agents[i];
+    const rep = reputations[a.id] || 0.5;
+    const alive = (Date.now() / 1000 - (a.last_heartbeat || 0)) < 300;
+    agentData.push({
+      id: a.id, rep: rep, alive: alive,
+      x: agentStartX + i * 22, y: agentY,
+      clr: !alive ? '#f87171' : rep > 0.6 ? '#34d399' : rep > 0.3 ? '#fbbf24' : '#f87171',
+    });
+  }
+  const agentG = brainData.selectAll('g.agent').data(agentData, d => 'ag-' + d.id);
+  agentG.exit().remove();
+  const agentEnter = agentG.enter().append('g').attr('class', 'agent');
+  agentEnter.append('circle').attr('r', 5).attr('stroke', 'rgba(255,255,255,0.2)').attr('stroke-width', 1);
+  agentEnter.append('text').attr('fill', 'rgba(148,163,184,0.5)')
+    .attr('font-size', '7px').attr('font-family', 'monospace')
+    .attr('text-anchor', 'middle');
+  brainData.selectAll('g.agent circle').attr('cx', d => d.x).attr('cy', d => d.y).attr('fill', d => d.clr);
+  brainData.selectAll('g.agent text').attr('x', d => d.x).attr('y', d => d.y + 14).text(d => (d.id||'?').slice(0, 6));
+
+  // D3 Force Simulation — real physics
+  const linkForce = edges.map(e => ({ ...e, source: e.source, target: e.target }));
+  brainSim = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(linkForce).id(d => d.id).distance(d => d.dash ? 150 : 110).strength(d => d.dash ? 0.005 : 0.04))
+    .force('charge', d3.forceManyBody().strength(-400).distanceMin(60).distanceMax(300))
+    .force('center', d3.forceCenter(W / 2, H / 2))
+    .force('collide', d3.forceCollide(d => d.r * 0.8))
+    .force('x', d3.forceX(W / 2).strength(0.02))
+    .force('y', d3.forceY(H / 2).strength(0.02))
+    .alphaDecay(0.01)
+    .on('tick', () => {
+      // Edge lines
+      brainData.selectAll('g.edge line')
+        .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+      // Edge particles (animated along path)
+      brainData.selectAll('g.edge circle')
+        .attr('cx', d => {
+          const t = ((Date.now() * 0.0008 + d.source.x * 0.01) % 1);
+          return d.source.x + (d.target.x - d.source.x) * t;
+        })
+        .attr('cy', d => {
+          const t = ((Date.now() * 0.0008 + d.source.y * 0.01) % 1);
+          return d.source.y + (d.target.y - d.source.y) * t;
+        });
+      // Edge labels
+      brainData.selectAll('g.edge text')
+        .attr('x', d => (d.source.x + d.target.x) / 2)
+        .attr('y', d => (d.source.y + d.target.y) / 2 + 10);
+      // Nodes
+      brainData.selectAll('g.node').attr('transform', d => 'translate(' + d.x + ',' + d.y + ')');
+      brainData.selectAll('g.node circle.glow').attr('r', d => d.r * 0.85);
+      // Pulse glow
+      if (Math.floor(Date.now() / 80) % 2 === 0) {
+        brainData.selectAll('g.node circle.glow').attr('r', d => d.r * 0.95);
+      }
+    });
+}
+
+// ── Controls ─────────────────────────────────────────────────
+
+function brainReheat() {
+  if (brainSim) brainSim.alpha(0.3).restart();
+}
+
+function brainFreeze() {
+  if (brainSim) brainSim.stop();
+}
+
+function updateSignalsPanel(cortex) {
+  const el = document.getElementById('brainSignals');
+  if (!el) return;
+  const items = [
+    '<span style="color:#818cf8">\u25cf</span> Q-table: <b>' + (cortex.q_table_size || 0) + '</b> states',
+    '<span style="color:#2dd4bf">\u25cf</span> Replay buffer: <b>' + (cortex.replay_buffer || 0) + '</b>',
+    '<span style="color:#f472b6">\u25cf</span> Episodic memory: <b>' + (cortex.episodes || 0) + '</b>',
+    '<span style="color:#fbbf24">\u25cf</span> Working memory: depth <b>' + (cortex.wm_stack_depth || 0) + '</b>',
+    '<span style="color:#f87171">\u25cf</span> Surprise \u03b1=' + ((cortex.alpha_surprise || 0)) + ' \u03b2=' + ((cortex.beta_surprise || 0)),
+    '<span style="color:#94a3b8">\u25cf</span> Agents: <b>' + (brainAgentData.length) + '</b> | Tasks: ' + (brainTaskData.pending + brainTaskData.assigned + brainTaskData.completed + brainTaskData.failed),
+  ];
+  if (cortex.pc_hierarchy) {
+    const pc = cortex.pc_hierarchy;
+    const lvls = pc.levels || {};
+    const pfcL = lvls.pfc || {};
+    const bgL = lvls.bg || {};
+    const senL = lvls.sensory || {};
+    if (pfcL.prediction !== undefined) {
+      items.push('<span style="color:#a78bfa">\u25c9</span> PFC: \u03bc=' + pfcL.prediction.toFixed(3) + ' \u03c0=' + pfcL.precision.toFixed(2) + ' \u03b5=' + pfcL.error.toFixed(3));
+      items.push('<span style="color:#818cf8">\u25c9</span> BG:  \u03bc=' + bgL.prediction.toFixed(3) + ' \u03c0=' + bgL.precision.toFixed(2) + ' \u03b5=' + bgL.error.toFixed(3));
+      items.push('<span style="color:#34d399">\u25c9</span> SEN: \u03bc=' + senL.prediction.toFixed(3) + ' \u03c0=' + senL.precision.toFixed(2) + ' \u03b5=' + senL.error.toFixed(3));
+    }
+    const feTrace = pc.totalFreeEnergyTrace;
+    if (feTrace && feTrace.length > 0) {
+      items.push('<span style="color:#fbbf24">\u25c9</span> Free Energy: <b>' + feTrace[feTrace.length - 1].toFixed(3) + '</b>');
+    }
+  }
+  el.innerHTML = items.map(s => '<div>' + s + '</div>').join('');
 }
 
 let brainTaskData = { pending: 0, assigned: 0, completed: 0, failed: 0 };
