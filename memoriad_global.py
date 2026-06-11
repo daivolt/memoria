@@ -3244,30 +3244,36 @@ async def sync_incoming(body: dict):
 @app.get("/chitchat/rooms")
 async def chitchat_rooms():
     CHITCHAT_DIR.mkdir(parents=True, exist_ok=True)
-    # Start with rooms that have local inbox files
     seen = set()
     rooms = []
+    pause_map: dict[str, str | None] = {}
     for d in sorted(CHITCHAT_DIR.iterdir()):
         if d.is_dir():
             path = d / "inbox.jsonl"
             count = sum(1 for _ in path.open()) if path.exists() else 0
             rooms.append({"room": d.name, "messages": count})
             seen.add(d.name)
-    # Add any rooms known to the chitchat server but missing locally
     try:
         req = urllib.request.Request(f"{CHITCHAT_URL}/rooms")
         with urllib.request.urlopen(req, timeout=3) as resp:
             remote = json.loads(resp.read()).get("rooms", [])
         for r in remote:
             name = r.get("name", "").strip()
+            pb = r.get("paused_by")
+            if pb:
+                pause_map[name] = pb
             if name and name not in seen:
                 rooms.append({"room": name, "messages": r.get("messages", 0)})
                 seen.add(name)
-                # Create inbox dir + file so future messages get indexed
                 (CHITCHAT_DIR / name).mkdir(parents=True, exist_ok=True)
                 inbox = CHITCHAT_DIR / name / "inbox.jsonl"
                 if not inbox.exists():
                     inbox.write_text("")
+        # Attach pause state to local entries
+        for rr in rooms:
+            n = rr["room"]
+            if n in pause_map:
+                rr["paused_by"] = pause_map[n]
     except Exception:
         pass
     return {"rooms": rooms, "count": len(rooms)}
@@ -3455,6 +3461,38 @@ async def chitchat_rename_room(room: str, body: ChitchatRename):
 async def chitchat_create_room(room: str):
     url = f"{CHITCHAT_URL}/{urllib.parse.quote(room)}/create"
     req = urllib.request.Request(url, data=b"{}", method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        raise HTTPException(502, f"chitchat proxy error: {e}")
+
+
+class ChitchatPause(BaseModel):
+    from_name: str
+
+
+@app.post("/chitchat/{room}/pause")
+async def chitchat_pause_room(room: str, body: ChitchatPause):
+    url = f"{CHITCHAT_URL}/{urllib.parse.quote(room)}/pause"
+    req = urllib.request.Request(
+        url, data=json.dumps({"from_name": body.from_name}).encode(), method="POST"
+    )
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        raise HTTPException(502, f"chitchat proxy error: {e}")
+
+
+@app.post("/chitchat/{room}/resume")
+async def chitchat_resume_room(room: str, body: ChitchatPause):
+    url = f"{CHITCHAT_URL}/{urllib.parse.quote(room)}/resume"
+    req = urllib.request.Request(
+        url, data=json.dumps({"from_name": body.from_name}).encode(), method="POST"
+    )
     req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -4526,6 +4564,8 @@ body {
       </div>
     </div>
     <div id="roomContextMenu" class="context-menu" style="display:none;position:fixed;z-index:1000">
+      <div class="context-item" onclick="pauseRoom(currentRoom)">Pause</div>
+      <div class="context-item" onclick="resumeRoom(currentRoom)">Resume</div>
       <div class="context-item" onclick="renameRoom(currentRoom)">Rename</div>
       <div class="context-item danger" onclick="deleteRoom(currentRoom)">Delete</div>
     </div>
@@ -5163,16 +5203,21 @@ async function loadChat() {
       return;
     }
     if (!state.chatRooms.includes(state.chatRoom)) state.chatRoom = state.chatRooms[0];
-    sel.innerHTML = state.chatRooms.map(r =>
-      '<div class="chat-room' + (r === state.chatRoom ? ' active' : '') + '" data-room="' + esc(r) + '" oncontextmenu="showRoomMenu(event,\\'' + esc(r) + '\\')">' +
-        '<span class="room-name">' + esc(r) + '</span>' +
-        '<span class="count">' + (data.rooms.find(rr => rr.room === r)?.messages || 0) + '</span>' +
+    sel.innerHTML = state.chatRooms.map(r => {
+      const rr = data.rooms.find(rr => rr.room === r);
+      const paused = rr && rr.paused_by;
+      return '<div class="chat-room' + (r === state.chatRoom ? ' active' : '') + '" data-room="' + esc(r) + '" oncontextmenu="showRoomMenu(event,\'' + esc(r) + '\')">' +
+        '<span class="room-name">' + (paused ? '\u23f8 ' : '') + esc(r) + '</span>' +
+        '<span class="count">' + (rr?.messages || 0) + '</span>' +
         '<span class="room-actions">' +
-          '<button onclick="event.stopPropagation();renameRoom(\\'' + esc(r) + '\\')" title="Rename">\u270f</button>' +
-          '<button onclick="event.stopPropagation();deleteRoom(\\'' + esc(r) + '\\')" title="Delete">\u2716</button>' +
+          (paused
+            ? '<button onclick="event.stopPropagation();resumeRoom(\'' + esc(r) + '\')" title="Resume">\u25b6</button>'
+            : (r !== 'general' ? '<button onclick="event.stopPropagation();pauseRoom(\'' + esc(r) + '\')" title="Pause">\u23f8</button>' : '')) +
+          '<button onclick="event.stopPropagation();renameRoom(\'' + esc(r) + '\')" title="Rename">\u270f</button>' +
+          '<button onclick="event.stopPropagation();deleteRoom(\'' + esc(r) + '\')" title="Delete">\u2716</button>' +
         '</span>' +
-      '</div>'
-    ).join('');
+      '</div>';
+    }).join('');
     sel.onclick = function(e) {
       const room = e.target.closest('.chat-room');
       if (room) switchChatRoom(room.dataset.room);
@@ -5322,6 +5367,46 @@ async function deleteRoom(room) {
     }
   } catch(e) {
     toast('Delete failed: ' + e.message, 'error');
+  }
+}
+
+async function pauseRoom(room) {
+  try {
+    const res = await fetch(BASE + '/chitchat/' + encodeURIComponent(room) + '/pause', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_name: 'dashboard' })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      el('roomContextMenu').style.display = 'none';
+      await loadChat();
+      toast('Room "' + room + '" paused', 'success');
+    } else {
+      toast('Pause failed: ' + (data.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    toast('Pause failed: ' + e.message, 'error');
+  }
+}
+
+async function resumeRoom(room) {
+  try {
+    const res = await fetch(BASE + '/chitchat/' + encodeURIComponent(room) + '/resume', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_name: 'dashboard' })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      el('roomContextMenu').style.display = 'none';
+      await loadChat();
+      toast('Room "' + room + '" resumed', 'success');
+    } else {
+      toast('Resume failed: ' + (data.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    toast('Resume failed: ' + e.message, 'error');
   }
 }
 
