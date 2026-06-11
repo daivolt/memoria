@@ -5133,12 +5133,12 @@ async function loadChat() {
     }
     if (!state.chatRooms.includes(state.chatRoom)) state.chatRoom = state.chatRooms[0];
     sel.innerHTML = state.chatRooms.map(r =>
-      '<div class="chat-room' + (r === state.chatRoom ? ' active' : '') + '" data-room="' + esc(r) + '" oncontextmenu="showRoomMenu(event,\'' + esc(r) + '\')">' +
+      '<div class="chat-room' + (r === state.chatRoom ? ' active' : '') + '" data-room="' + esc(r) + '" oncontextmenu="showRoomMenu(event,\\'' + esc(r) + '\\')">' +
         '<span class="room-name">' + esc(r) + '</span>' +
         '<span class="count">' + (data.rooms.find(rr => rr.room === r)?.messages || 0) + '</span>' +
         '<span class="room-actions">' +
-          '<button onclick="event.stopPropagation();renameRoom(\'' + esc(r) + '\')" title="Rename">\u270f</button>' +
-          '<button onclick="event.stopPropagation();deleteRoom(\'' + esc(r) + '\')" title="Delete">\u2716</button>' +
+          '<button onclick="event.stopPropagation();renameRoom(\\'' + esc(r) + '\\')" title="Rename">\u270f</button>' +
+          '<button onclick="event.stopPropagation();deleteRoom(\\'' + esc(r) + '\\')" title="Delete">\u2716</button>' +
         '</span>' +
       '</div>'
     ).join('');
