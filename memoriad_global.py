@@ -2129,14 +2129,13 @@ def _notify_chitchat(text: str):
 
 
 def _ensure_chitchat_room(room_name: str):
-    """Ensure a chitchat room exists by POSTing a silent message (triggers auto-creation)."""
+    """Ensure a chitchat room exists (creates silently, no message in history)."""
     if not room_name:
         return
     try:
-        data = json.dumps({"text": ".", "from_name": "_system_"}).encode()
         req = urllib.request.Request(
-            f"{CHITCHAT_URL}/{room_name}/say",
-            data=data,
+            f"{CHITCHAT_URL}/{room_name}/create",
+            data=b"{}",
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -3448,6 +3447,18 @@ async def chitchat_rename_room(room: str, body: ChitchatRename):
             return json.loads(resp.read())
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(502, f"chitchat proxy error: {e}")
+
+
+@app.post("/chitchat/{room}/create")
+async def chitchat_create_room(room: str):
+    url = f"{CHITCHAT_URL}/{urllib.parse.quote(room)}/create"
+    req = urllib.request.Request(url, data=b"{}", method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
     except Exception as e:
         raise HTTPException(502, f"chitchat proxy error: {e}")
 
@@ -5237,11 +5248,11 @@ async function createRoom() {
   if (!name || !name.trim()) return;
   const r = name.trim().toLowerCase().replace(/\\s+/g, '-').replace(/[^a-z0-9-]/g, '');
   if (!r || r === 'general') { toast('Invalid room name', 'error'); return; }
-  try {
-    await fetch(BASE + '/chitchat/' + encodeURIComponent(r) + '/say', {
+    try {
+    await fetch(BASE + '/chitchat/' + encodeURIComponent(r) + '/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: 'room created', from_name: 'system' })
+      body: '{}'
     });
     state.chatRoom = r;
     await loadChat();
