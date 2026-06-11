@@ -1,0 +1,16 @@
+[Unit]
+Description=Mini — general-purpose catch-all memoria worker agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /home/daivolt/conf/chitchat/mini.sh
+Restart=on-failure
+RestartSec=5
+Environment=CHITCHAT_HOST=localhost
+Environment=CHITCHAT_ROOMS=general,brainstorm
+Environment=MEMORIA_URL=http://localhost:19998
+
+[Install]
+WantedBy=default.target

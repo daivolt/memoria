@@ -49,7 +49,7 @@ echo "  done"
 # ── Stop all services ───────────────────────────────────────
 
 echo "  [2/6] Stopping all services..."
-for s in sage builder researcher orchestrator memoria-worker pilosopher memoria-server chitchat-server; do
+for s in mini sage builder researcher orchestrator memoria-worker pilosopher memoria-server chitchat-server; do
   systemctl --user stop "$s" 2>/dev/null || true
 done
 sleep 2
@@ -82,7 +82,7 @@ done
 echo ""
 
 echo "  [5/6] Starting agents..."
-for s in memoria-worker orchestrator researcher builder pilosopher sage; do
+for s in mini memoria-worker orchestrator researcher builder pilosopher sage; do
   systemctl --user start "$s" 2>&1
   echo "  started $s"
 done
