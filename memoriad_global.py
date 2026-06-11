@@ -502,11 +502,20 @@ def _prune_chitchat():
         kept = unconsolidated + [line for _, line in kept_consolidated]
         if len(kept) < len(lines):
             pruned = consolidated[: max(0, len(consolidated) - slot_remaining)]
+            pruned_lines = []
             for _, line in pruned:
                 try:
-                    pruned_ids.append(json.loads(line).get("id", ""))
+                    msg = json.loads(line)
+                    msg["archived"] = True
+                    pruned_lines.append(json.dumps(msg, ensure_ascii=False))
+                    pruned_ids.append(msg.get("id", ""))
                 except json.JSONDecodeError:
-                    pass
+                    pruned_lines.append(line)
+            # Append pruned messages to archive instead of deleting
+            if pruned_lines:
+                archive_path = room_dir / "archive.jsonl"
+                with open(archive_path, "a") as af:
+                    af.write("\n".join(pruned_lines) + "\n")
             all_pruned_ids.extend(pruned_ids)
             path.write_text("\n".join(kept) + "\n" if kept else "")
     if all_pruned_ids:
@@ -3280,7 +3289,7 @@ async def chitchat_rooms():
 
 
 @app.get("/chitchat/{room}")
-async def chitchat_history(room: str, limit: int = 20):
+async def chitchat_history(room: str, limit: int = 20, include_archived: bool = False):
     path = CHITCHAT_DIR / room / "inbox.jsonl"
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3288,7 +3297,22 @@ async def chitchat_history(room: str, limit: int = 20):
         return {"room": room, "messages": [], "count": 0}
     lines = path.read_text().strip().splitlines()
     messages = [json.loads(l) for l in lines[-limit:] if l.strip()]
-    return {"room": room, "messages": messages, "count": len(messages)}
+    count = len(messages)
+    if include_archived:
+        archive_path = CHITCHAT_DIR / room / "archive.jsonl"
+        if archive_path.exists():
+            archive_lines = archive_path.read_text().strip().splitlines()
+            archive_msgs = [json.loads(l) for l in archive_lines if l.strip()]
+            # Merge: inbox first (recent), archive second (older), capped at limit
+            merged = (
+                archive_msgs[-(limit - len(messages)) :]
+                if len(messages) < limit
+                else []
+            )
+            merged.extend(messages)
+            messages = merged
+            count = len(messages)
+    return {"room": room, "messages": messages, "count": count}
 
 
 @app.get("/config")
@@ -5304,8 +5328,8 @@ function renderMarkdown(text) {
 async function loadChatMessages() {
   if (!state.chatRoom) return;
   try {
-    const limit = window.__memoriaMaxMessages || 100;
-    const data = await api('/chitchat/' + encodeURIComponent(state.chatRoom) + '?limit=' + limit);
+    const limit = window.__memoriaMaxMessages || 500;
+    const data = await api('/chitchat/' + encodeURIComponent(state.chatRoom) + '?limit=' + limit + '&include_archived=true');
     const msgs = data.messages || [];
     const container = el('chatMessages');
     const filtered = state.chatFilter === 'all' ? msgs : state.chatFilter === 'human' ? msgs.filter(m => m.from !== 'agent-os' && m.from !== 'system') : msgs.filter(m => m.from === state.chatFilter);
