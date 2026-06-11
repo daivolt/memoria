@@ -4466,6 +4466,7 @@ body {
             <button class="filter-btn" data-filter="completed" onclick="setTaskFilter('completed')">Done</button>
             <button class="filter-btn" data-filter="failed" onclick="setTaskFilter('failed')">Failed</button>
           </div>
+          <button class="btn btn-sm" onclick="createTask()" style="margin-left:8px">+ New</button>
         </div>
       </div>
       <div class="item-list" id="taskList"></div>
@@ -4996,6 +4997,25 @@ function setChatFilter(f) {
   state.chatFilter = f;
   document.querySelectorAll('#chatFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
   loadChatMessages();
+}
+
+function createTask() {
+  const title = prompt('Task title:');
+  if (!title || !title.trim()) return;
+  const desc = prompt('Description (optional):');
+  const project = 'memoria';
+  fetch(BASE + '/tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: title.trim(), description: (desc || '').trim(), project })
+  }).then(r => r.json()).then(data => {
+    if (data.id) {
+      toast('Task created: ' + data.id.slice(0, 12), 'success');
+      loadTasks();
+    } else {
+      toast('Create failed', 'error');
+    }
+  }).catch(e => toast('Create failed: ' + e.message, 'error'));
 }
 
 function renderTasks() {
