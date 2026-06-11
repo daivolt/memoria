@@ -13,10 +13,11 @@ Environment=CHITCHAT_HOST=localhost
 Environment=CHITCHAT_PORT=19999
 Environment=CHITCHAT_ROOMS=general,logs,memoria
 Environment=MEMORIA_URL=http://localhost:19998
-Environment=OPENCODE_URL=http://localhost:4096
 Environment=VERIFY_POLL_SEC=30
 Environment=VERIFY_TIMEOUT=120
 Environment=PYTHONUNBUFFERED=1
+Environment=OLLAMA_URL=http://localhost:11434
+Environment=OLLAMA_MODEL=glm-5.1:cloud
 
 [Install]
 WantedBy=default.target
