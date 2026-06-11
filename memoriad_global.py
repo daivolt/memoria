@@ -419,8 +419,6 @@ async def poll_chitchat():
         return
     for r in rooms:
         name = r["name"]
-        if name not in CHITCHAT_ROOMS:
-            continue
         history = _chitchat_history(name)
         cursor = _chitchat_cursors.get(name, "")
         new_count = 0
