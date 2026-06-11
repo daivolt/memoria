@@ -4611,7 +4611,7 @@ function switchTab(n) {
 }
 
 function initTabFromHash() {
-  const m = location.hash.match(/tab=(\d)/);
+  const m = location.hash.match(/tab=(\\d)/);
   if (m) {
     const n = parseInt(m[1]);
     if (n >= 0 && n <= 8) { switchTab(n); return; }
@@ -5663,7 +5663,7 @@ function updateSignalsPanel(cortex) {
 initTabFromHash();
 
 window.addEventListener('hashchange', function() {
-  const m = location.hash.match(/tab=(\d)/);
+  const m = location.hash.match(/tab=(\\d)/);
   if (m) { const n = parseInt(m[1]); if (n >= 0 && n <= 8 && n !== state.tab) switchTab(n); }
 });
 
