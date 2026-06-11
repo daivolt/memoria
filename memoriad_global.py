@@ -3469,6 +3469,36 @@ async def chitchat_create_room(room: str):
         raise HTTPException(502, f"chitchat proxy error: {e}")
 
 
+RATE_LIMIT_FILE = CHITCHAT_DIR / "rate_limit.json"
+
+
+def _load_rate_limit() -> float:
+    try:
+        return json.loads(RATE_LIMIT_FILE.read_text()).get("seconds", 3.0)
+    except Exception:
+        return 3.0
+
+
+def _save_rate_limit(seconds: float):
+    RATE_LIMIT_FILE.write_text(json.dumps({"seconds": seconds}))
+
+
+@app.get("/config/rate_limit")
+async def get_rate_limit():
+    return {"seconds": _load_rate_limit()}
+
+
+class RateLimitUpdate(BaseModel):
+    seconds: float
+
+
+@app.post("/config/rate_limit")
+async def set_rate_limit(body: RateLimitUpdate):
+    v = max(0.1, min(60.0, body.seconds))
+    _save_rate_limit(v)
+    return {"seconds": v}
+
+
 class ChitchatPause(BaseModel):
     from_name: str
 
@@ -4547,7 +4577,10 @@ body {
           <button class="filter-btn" data-filter="human" onclick="setChatFilter('human')">Human</button>
           <button class="filter-btn" data-filter="agent-os" onclick="setChatFilter('agent-os')">Agent-OS</button>
         </div>
-        <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
+        <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+          <span class="text-muted text-sm">Speed:</span>
+          <input type="range" id="rateSlider" min="0.1" max="10" step="0.5" value="3" style="width:80px" oninput="setRateLimit(this.value)">
+          <span id="rateLabel" class="text-muted text-sm" style="min-width:30px">3s</span>
           <button class="btn btn-sm" onclick="createRoom()" title="Create room">+ New</button>
           <span class="text-muted text-sm">← → switch rooms</span>
         </div>
@@ -5037,6 +5070,27 @@ function setChatFilter(f) {
   state.chatFilter = f;
   document.querySelectorAll('#chatFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
   loadChatMessages();
+}
+
+async function setRateLimit(seconds) {
+  el('rateLabel').textContent = seconds + 's';
+  try {
+    await fetch(BASE + '/config/rate_limit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ seconds: parseFloat(seconds) })
+    });
+  } catch(e) { /* slider is best-effort */ }
+}
+
+async function loadRateLimit() {
+  try {
+    const data = await api('/config/rate_limit');
+    if (data.seconds) {
+      el('rateSlider').value = data.seconds;
+      el('rateLabel').textContent = parseFloat(data.seconds).toFixed(1) + 's';
+    }
+  } catch(e) { /* use default */ }
 }
 
 function createTask() {
@@ -5942,7 +5996,7 @@ setInterval(() => {
   else if (state.tab === 1) loadAgents();
   else if (state.tab === 2) loadTasks();
   else if (state.tab === 3) loadMemory();
-  else if (state.tab === 5) { loadChat(); }
+  else if (state.tab === 5) { loadChat(); loadRateLimit(); }
   else if (state.tab === 6) loadSafety();
   else if (state.tab === 7) { loadSettings(); }
   else if (state.tab === 8) { loadBrainDelayed(); }
