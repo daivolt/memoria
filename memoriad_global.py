@@ -5267,7 +5267,7 @@ async function loadChatMessages() {
         '</div>';
     }).join('');
     // Only auto-scroll if user is near the bottom (within 50px)
-    const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 50;
+    const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < container.clientHeight * 0.2;
     if (nearBottom) container.scrollTop = container.scrollHeight;
     setConn(true);
   } catch(e) {
