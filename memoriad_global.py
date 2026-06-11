@@ -16,6 +16,7 @@ import time
 import tempfile
 import urllib.parse
 import urllib.request
+import urllib.error
 import uuid
 from collections import Counter, deque
 import difflib
@@ -3419,6 +3420,38 @@ async def chitchat_say(room: str, body: ChitchatSay):
         raise HTTPException(502, f"chitchat proxy error: {e}")
 
 
+class ChitchatRename(BaseModel):
+    new_name: str
+
+
+@app.delete("/chitchat/{room}")
+async def chitchat_delete_room(room: str):
+    url = f"{CHITCHAT_URL}/{urllib.parse.quote(room)}"
+    req = urllib.request.Request(url, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"chitchat proxy error: {e}")
+
+
+@app.post("/chitchat/{room}/rename")
+async def chitchat_rename_room(room: str, body: ChitchatRename):
+    url = f"{CHITCHAT_URL}/{urllib.parse.quote(room)}/rename"
+    payload = {"new_name": body.new_name}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"chitchat proxy error: {e}")
+
+
 @app.post("/chitchat/consolidate")
 async def trigger_consolidation():
     global _chitchat_unconsolidated
@@ -3966,6 +3999,14 @@ body {
 .chat-room:hover { background: var(--bg-hover); color: var(--text-primary); }
 .chat-room.active { background: var(--accent-glow); color: var(--accent); font-weight: 600; }
 .chat-room .count { font-size: 11px; color: var(--text-muted); background: var(--bg-elevated); padding: 1px 6px; border-radius: 8px; }
+.chat-room .room-actions { display: none; margin-left:auto; gap:2px; }
+.chat-room:hover .room-actions { display: flex; }
+.chat-room .room-actions button { background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:12px; padding:0 3px; line-height:1; }
+.chat-room .room-actions button:hover { color:var(--text-primary); }
+.context-menu { background:var(--bg-elevated); border:1px solid var(--border); border-radius:8px; padding:4px 0; box-shadow:0 4px 12px rgba(0,0,0,.3); min-width:120px; }
+.context-item { padding:6px 16px; cursor:pointer; font-size:13px; color:var(--text-primary); }
+.context-item:hover { background:var(--bg-hover); }
+.context-item.danger { color:var(--danger); }
 .chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .chat-messages {
   flex: 1;
@@ -4456,7 +4497,10 @@ body {
           <button class="filter-btn" data-filter="human" onclick="setChatFilter('human')">Human</button>
           <button class="filter-btn" data-filter="agent-os" onclick="setChatFilter('agent-os')">Agent-OS</button>
         </div>
-        <div class="text-muted text-sm" style="margin-left:auto">← → switch rooms</div>
+        <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
+          <button class="btn btn-sm" onclick="createRoom()" title="Create room">+ New</button>
+          <span class="text-muted text-sm">← → switch rooms</span>
+        </div>
       </div>
       <div class="chat-layout">
         <div class="chat-rooms" id="chatRoomList"></div>
@@ -4468,6 +4512,10 @@ body {
           </div>
         </div>
       </div>
+    </div>
+    <div id="roomContextMenu" class="context-menu" style="display:none;position:fixed;z-index:1000">
+      <div class="context-item" onclick="renameRoom(currentRoom)">Rename</div>
+      <div class="context-item danger" onclick="deleteRoom(currentRoom)">Delete</div>
     </div>
 
     <!-- Tab 6: Safety -->
@@ -5085,8 +5133,13 @@ async function loadChat() {
     }
     if (!state.chatRooms.includes(state.chatRoom)) state.chatRoom = state.chatRooms[0];
     sel.innerHTML = state.chatRooms.map(r =>
-      '<div class="chat-room' + (r === state.chatRoom ? ' active' : '') + '" data-room="' + esc(r) + '">' +
-        esc(r) + ' <span class="count">' + (data.rooms.find(rr => rr.room === r)?.messages || 0) + '</span>' +
+      '<div class="chat-room' + (r === state.chatRoom ? ' active' : '') + '" data-room="' + esc(r) + '" oncontextmenu="showRoomMenu(event,\'' + esc(r) + '\')">' +
+        '<span class="room-name">' + esc(r) + '</span>' +
+        '<span class="count">' + (data.rooms.find(rr => rr.room === r)?.messages || 0) + '</span>' +
+        '<span class="room-actions">' +
+          '<button onclick="event.stopPropagation();renameRoom(\'' + esc(r) + '\')" title="Rename">\u270f</button>' +
+          '<button onclick="event.stopPropagation();deleteRoom(\'' + esc(r) + '\')" title="Delete">\u2716</button>' +
+        '</span>' +
       '</div>'
     ).join('');
     sel.onclick = function(e) {
@@ -5159,6 +5212,85 @@ async function sendChat() {
     setTimeout(loadChatMessages, 500);
   } catch(e) {
     toast('Send failed: ' + e.message, 'error');
+  }
+}
+
+var currentRoom = null;
+
+function showRoomMenu(e, room) {
+  if (room === 'general') return;
+  e.preventDefault();
+  currentRoom = room;
+  const menu = el('roomContextMenu');
+  menu.style.display = 'block';
+  menu.style.left = e.clientX + 'px';
+  menu.style.top = e.clientY + 'px';
+}
+
+document.addEventListener('click', function(e) {
+  const menu = el('roomContextMenu');
+  if (menu && !menu.contains(e.target)) menu.style.display = 'none';
+});
+
+async function createRoom() {
+  const name = prompt('New room name:');
+  if (!name || !name.trim()) return;
+  const r = name.trim().toLowerCase().replace(/\\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+  if (!r || r === 'general') { toast('Invalid room name', 'error'); return; }
+  try {
+    await fetch(BASE + '/chitchat/' + encodeURIComponent(r) + '/say', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'room created', from_name: 'system' })
+    });
+    state.chatRoom = r;
+    await loadChat();
+    toast('Room "' + r + '" created', 'success');
+  } catch(e) {
+    toast('Create failed: ' + e.message, 'error');
+  }
+}
+
+async function renameRoom(room) {
+  if (room === 'general') return;
+  const name = prompt('New name for "' + room + '":');
+  if (!name || !name.trim()) return;
+  const r = name.trim().toLowerCase().replace(/\\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+  if (!r || r === room) return;
+  try {
+    const res = await fetch(BASE + '/chitchat/' + encodeURIComponent(room) + '/rename', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ new_name: r })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      if (state.chatRoom === room) state.chatRoom = r;
+      await loadChat();
+      toast('Room renamed to "' + r + '"', 'success');
+    } else {
+      toast('Rename failed: ' + (data.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    toast('Rename failed: ' + e.message, 'error');
+  }
+}
+
+async function deleteRoom(room) {
+  if (room === 'general') return;
+  if (!confirm('Delete room "' + room + '"? This cannot be undone.')) return;
+  try {
+    const res = await fetch(BASE + '/chitchat/' + encodeURIComponent(room), { method: 'DELETE' });
+    const data = await res.json();
+    if (data.ok) {
+      if (state.chatRoom === room) state.chatRoom = state.chatRooms.find(r => r !== room) || 'general';
+      await loadChat();
+      toast('Room "' + room + '" deleted', 'success');
+    } else {
+      toast('Delete failed: ' + (data.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    toast('Delete failed: ' + e.message, 'error');
   }
 }
 
