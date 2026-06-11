@@ -3246,8 +3246,11 @@ async def chitchat_rooms():
             if name and name not in seen:
                 rooms.append({"room": name, "messages": r.get("messages", 0)})
                 seen.add(name)
-                # Create inbox dir so future messages get indexed
+                # Create inbox dir + file so future messages get indexed
                 (CHITCHAT_DIR / name).mkdir(parents=True, exist_ok=True)
+                inbox = CHITCHAT_DIR / name / "inbox.jsonl"
+                if not inbox.exists():
+                    inbox.write_text("")
     except Exception:
         pass
     return {"rooms": rooms, "count": len(rooms)}
@@ -3257,7 +3260,9 @@ async def chitchat_rooms():
 async def chitchat_history(room: str, limit: int = 20):
     path = CHITCHAT_DIR / room / "inbox.jsonl"
     if not path.exists():
-        raise HTTPException(404, f"no messages for room '{room}'")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+        return {"room": room, "messages": [], "count": 0}
     lines = path.read_text().strip().splitlines()
     messages = [json.loads(l) for l in lines[-limit:] if l.strip()]
     return {"room": room, "messages": messages, "count": len(messages)}
