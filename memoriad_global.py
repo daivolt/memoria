@@ -24,7 +24,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+    Response,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -3616,6 +3623,22 @@ async def list_clients():
     return {"clients": clients, "count": len(clients)}
 
 
+@app.get("/static/{filename}")
+async def serve_static(filename: str):
+    path = Path(__file__).parent / "static" / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404)
+    content = path.read_bytes()
+    ct = "application/javascript"
+    if filename.endswith(".js"):
+        ct = "application/javascript"
+    elif filename.endswith(".css"):
+        ct = "text/css"
+    elif filename.endswith(".svg"):
+        ct = "image/svg+xml"
+    return Response(content=content, media_type=ct)
+
+
 @app.post("/clients")
 async def register_client(body: RegisterClient):
     clients = _load_clients()
@@ -4448,8 +4471,16 @@ body {
   padding: 0;
   border-radius: 0;
   color: var(--text-primary);
-  font-size: 12px;
 }
+.sidepane-agent { cursor:pointer; transition:opacity .2s; }
+.sidepane-agent:hover { opacity:.8; }
+.sidepane-task { background:var(--bg-elevated); border-radius:6px; padding:8px 10px; font-size:12px; border-left:3px solid var(--border); }
+.sidepane-task.pending { border-left-color:var(--warning); }
+.sidepane-task.running { border-left-color:var(--accent); }
+.sidepane-task.completed { border-left-color:var(--success); opacity:.7; }
+.sidepane-task.failed { border-left-color:var(--danger); }
+.sidepane-task .title { font-weight:600; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.sidepane-task .meta { font-size:10px; color:var(--text-muted); margin-top:2px; }
 .msg .body a { color: var(--accent); text-decoration: underline; }
 .msg .body a:hover { opacity: 0.8; }
 
@@ -4474,7 +4505,7 @@ body {
   50% { opacity: 1; transform: scale(1.2); }
 }
 </style>
-<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="/static/d3.v7.min.js"></script>
 </head>
 <body>
 
@@ -4517,6 +4548,7 @@ body {
     <div class="nav-item" data-tab="6" onclick="switchTab(6)"><span class="icon">🛡</span> Safety</div>
     <div class="nav-item" data-tab="7" onclick="switchTab(7)"><span class="icon">⚙</span> Settings</div>
     <div class="nav-item" data-tab="8" onclick="switchTab(8)"><span class="icon">🧠</span> Brain</div>
+    <div class="nav-item" data-tab="9" onclick="switchTab(9)"><span class="icon">📊</span> Sidepane</div>
   </div>
 
   <!-- Main Content -->
@@ -4719,6 +4751,32 @@ body {
           </div>
         </div>
       </div>
+    <!-- Tab 9: Sidepane -->
+    <div class="tab-content" id="tab9">
+      <div class="tab-header">
+        <div class="tab-title">📊 Sidepane — Progress Board</div>
+        <div class="tab-actions">
+          <span class="text-muted text-sm" id="sidepaneTs"></span>
+        </div>
+      </div>
+      <div id="sidepaneContent" style="display:flex;gap:12px;height:calc(100vh - var(--topbar-h) - 80px);padding:8px 0;">
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:8px;">
+          <div class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;">
+            <div class="card-title" style="flex-shrink:0;">Agents</div>
+            <div id="sidepaneGraph" style="flex:1;min-height:0;"></div>
+          </div>
+        </div>
+        <div style="width:320px;flex-shrink:0;display:flex;flex-direction:column;gap:8px;">
+          <div class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;">
+            <div class="card-title" style="flex-shrink:0;">
+              Tasks
+              <span class="text-muted text-sm" style="margin-left:8px;">pending / running / done</span>
+            </div>
+            <div id="sidepaneTasks" style="flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:4px;padding:4px 0;"></div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -4785,7 +4843,7 @@ function switchTab(n) {
   document.querySelector('.nav-item[data-tab="' + n + '"]')?.classList.add('active');
   document.getElementById('sidebar').classList.remove('open');
   location.hash = 'tab=' + n;
-  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, null, loadChat, loadSafety, loadSettings, loadBrainDelayed];
+  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, null, loadChat, loadSafety, loadSettings, loadBrainDelayed, loadSidepane];
   if (loaders[n]) loaders[n]();
 }
 
@@ -4793,7 +4851,7 @@ function initTabFromHash() {
   const m = location.hash.match(/tab=(\\d)/);
   if (m) {
     const n = parseInt(m[1]);
-    if (n >= 0 && n <= 8) { switchTab(n); return; }
+    if (n >= 0 && n <= 9) { switchTab(n); return; }
   }
   loadOverview();
 }
@@ -6005,6 +6063,69 @@ function updateSignalsPanel(cortex) {
   }
   el.innerHTML = items.map(s => '<div>' + s + '</div>').join('');
 }
+
+async function loadSidepane() {
+  try {
+    const [agents, tasks] = await Promise.all([
+      api('/agents'),
+      api('/tasks?project=memoria')
+    ]);
+    const aList = agents.agents || [];
+    const tList = tasks.tasks || [];
+    el('sidepaneTs').textContent = 'agents: ' + aList.length + '  tasks: ' + tList.length;
+
+    // Render agent graph as simple D3 force layout
+    const wrap = el('sidepaneGraph');
+    wrap.innerHTML = '<svg style="width:100%;height:100%"></svg>';
+    const svg = d3.select(wrap.querySelector('svg'));
+    const W = wrap.clientWidth;
+    const H = wrap.clientHeight;
+    if (W < 10 || H < 10 || !aList.length) return;
+
+    const nodes = aList.map(a => ({id: a.chitchat_name || a.id.slice(0,8), status: a.status || 'unknown'}));
+    const links = [];
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        if (Math.random() < 0.3) links.push({source: nodes[i].id, target: nodes[j].id});
+      }
+    }
+
+    const simulation = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(links).id(d => d.id).distance(80).strength(0.05))
+      .force('charge', d3.forceManyBody().strength(-200))
+      .force('center', d3.forceCenter(W / 2, H / 2))
+      .force('collide', d3.forceCollide(28));
+
+    const g = svg.append('g');
+    const link = g.selectAll('line').data(links).join('line')
+      .attr('stroke', 'var(--border)').attr('stroke-width', 1).attr('stroke-opacity', 0.4);
+    const node = g.selectAll('g.node').data(nodes).join('g').attr('class', 'sidepane-agent')
+      .call(d3.drag().on('drag', (e, d) => { d.x = e.x; d.y = e.y; simulation.alpha(0.3).restart(); }));
+    node.append('circle').attr('r', 24)
+      .attr('fill', d => d.status === 'active' ? 'var(--success)' : d.status === 'idle' ? 'var(--warning)' : 'var(--text-muted)')
+      .attr('stroke', 'var(--bg)').attr('stroke-width', 2);
+    node.append('text').text(d => d.id.slice(0, 6)).attr('text-anchor', 'middle').attr('dy', 4)
+      .attr('fill', '#fff').attr('font-size', 9).attr('font-family', 'var(--mono)');
+
+    simulation.on('tick', () => {
+      link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+          .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+      node.attr('transform', d => 'translate(' + d.x + ',' + d.y + ')');
+    });
+
+    // Render task list
+    const tc = el('sidepaneTasks');
+    const order = {pending: 0, assigned: 1, running: 2, completed: 3, done: 3, failed: 4, verified: 5};
+    tList.sort((a, b) => (order[a.status] || 9) - (order[b.status] || 9));
+    tc.innerHTML = tList.slice(0, 30).map(t => {
+      const st = t.status === 'running' || t.status === 'assigned' || t.status === 'pending' ? t.status : (t.status === 'completed' || t.status === 'done' ? 'completed' : t.status);
+      return '<div class="sidepane-task ' + st + '">' +
+        '<div class="title">' + esc(t.title.slice(0, 60)) + '</div>' +
+        '<div class="meta">' + esc(t.status) + ' · ' + esc(t.assigned_to ? t.assigned_to.slice(0, 16) : 'unassigned') + ' · ' + ago(t.created_at) + '</div>' +
+        '</div>';
+    }).join('');
+  } catch(e) { /* sidepane silent fail */ }
+}
 // ============================================
 // INIT
 // ============================================
@@ -6012,7 +6133,7 @@ initTabFromHash();
 
 window.addEventListener('hashchange', function() {
   const m = location.hash.match(/tab=(\\d)/);
-  if (m) { const n = parseInt(m[1]); if (n >= 0 && n <= 8 && n !== state.tab) switchTab(n); }
+  if (m) { const n = parseInt(m[1]); if (n >= 0 && n <= 9 && n !== state.tab) switchTab(n); }
 });
 
 setInterval(() => {
@@ -6024,6 +6145,7 @@ setInterval(() => {
   else if (state.tab === 6) loadSafety();
   else if (state.tab === 7) { loadSettings(); }
   else if (state.tab === 8) { loadBrainDelayed(); }
+  else if (state.tab === 9) { loadSidepane(); }
 }, 3000);
 
 setInterval(() => {
