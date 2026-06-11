@@ -2127,6 +2127,23 @@ def _notify_chitchat(text: str):
         pass
 
 
+def _ensure_chitchat_room(room_name: str):
+    """Ensure a chitchat room exists by POSTing a silent message (triggers auto-creation)."""
+    if not room_name:
+        return
+    try:
+        data = json.dumps({"text": ".", "from_name": "_system_"}).encode()
+        req = urllib.request.Request(
+            f"{CHITCHAT_URL}/{room_name}/say",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass
+
+
 def _notify_chitchat_logs(text: str):
     """Post agent-internal messages to the dedicated logs room."""
     try:
@@ -2174,6 +2191,8 @@ async def register_agent(body: RegisterAgent):
         "capabilities": body.capabilities,
     }
     _save_agent(agent)
+    if body.chitchat_name:
+        _ensure_chitchat_room(body.chitchat_name)
     _notify_chitchat_logs(
         f"agent {agent_id[:12]} started on project '{body.project}': {body.task[:200]}"
         + (f" — conflicts: {'; '.join(conflicts)}" if conflicts else "")
