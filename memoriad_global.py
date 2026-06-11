@@ -5816,8 +5816,27 @@ function loadBrain() {
     renderBrainTasks(tasks);
     document.getElementById('brainTs').textContent = new Date().toLocaleTimeString();
     updateSignalsPanel(cortex);
-    renderD3Brain(W, H, cortex, agents);
-  }).catch(() => renderD3Brain(W, H, {}, []));
+    if (!brainData) {
+      renderD3Brain(W, H, cortex, agents);
+    } else {
+      // Update agent node colors/states without restarting simulation
+      brainNodeElems.each(function(d) {
+        if (d.type === 'agent') {
+          const a = agents.find(x => (x.chitchat_name || x.id.slice(0, 8)) === d.chitchat_name);
+          if (a) {
+            const alive = (Date.now() / 1000 - (a.last_heartbeat || 0)) < 300;
+            d.color = !alive ? '#f87171' : a.status === 'active' ? '#34d399' : a.status === 'idle' ? '#fbbf24' : '#94a3b8';
+            d.r = alive ? 20 : 14;
+          }
+        }
+      });
+      // Update visual state without full re-render
+      brainData.selectAll('g.node circle.core').attr('r', d => d.type === 'agent' ? d.r * 0.6 : d.r * 0.45).attr('stroke', d => d.color).attr('fill', d => d.type === 'agent' ? 'none' : d.color);
+      brainData.selectAll('g.node circle.inner').attr('fill', d => d.color);
+      brainData.selectAll('g.node circle.glow').attr('fill', d => d.color + '22');
+      brainData.selectAll('g.node text.nlabel').attr('fill', d => d.type === 'agent' ? d.color : '#e2e8f0');
+    }
+  }).catch(() => { if (!brainData) renderD3Brain(W, H, {}, []); });
 }
 
 function renderD3Brain(W, H, cortex, agents) {
@@ -5897,25 +5916,37 @@ function renderD3Brain(W, H, cortex, agents) {
   brainNodeElems = brainData.selectAll('g.node').data(nodes, d => d.id);
   brainNodeElems.exit().remove();
   const nodeEnter = brainNodeElems.enter().append('g').attr('class', 'node')
-    .attr('cursor', 'pointer');
+    .attr('cursor', 'pointer').on('click', function(e, d) {
+      if (d.type === 'agent') { filterBrainTasksByAgent(d.chitchat_name); }
+    });
 
-  // Glow circles
-  nodeEnter.append('circle').attr('class', 'glow')
+  // Glow circles (neural only)
+  nodeEnter.filter(d => d.type !== 'agent').append('circle').attr('class', 'glow')
     .attr('fill', d => d.color + '22')
     .attr('stroke', 'none');
 
-  // Main circles
+  // Main circles — agents get a ring
   const circ = nodeEnter.append('circle').attr('class', 'core')
-    .attr('r', d => d.r * 0.45).attr('filter', 'url(#nodeGlow)')
-    .attr('fill', d => d.color).attr('stroke', '#fff').attr('stroke-width', 1.5);
+    .attr('r', d => d.type === 'agent' ? d.r * 0.6 : d.r * 0.45)
+    .attr('filter', d => d.type === 'agent' ? null : 'url(#nodeGlow)')
+    .attr('fill', d => d.type === 'agent' ? 'none' : d.color)
+    .attr('stroke', d => d.type === 'agent' ? d.color : '#fff')
+    .attr('stroke-width', d => d.type === 'agent' ? 2.5 : 1.5);
+
+  // Agent inner dot
+  nodeEnter.filter(d => d.type === 'agent').append('circle').attr('class', 'inner')
+    .attr('r', 5).attr('fill', d => d.color).attr('stroke', 'none');
 
   // Labels
   nodeEnter.append('text').attr('class', 'nlabel')
-    .attr('fill', '#e2e8f0').attr('font-size', '11px')
+    .attr('fill', d => d.type === 'agent' ? d.color : '#e2e8f0')
+    .attr('font-size', d => d.type === 'agent' ? '9px' : '11px')
     .attr('font-family', '"SF Mono","Cascadia Code",monospace')
-    .attr('font-weight', '600').attr('text-anchor', 'middle')
-    .text(d => d.label);
-  nodeEnter.append('text').attr('class', 'sublabel')
+    .attr('font-weight', d => d.type === 'agent' ? '400' : '600')
+    .attr('text-anchor', 'middle')
+    .attr('dy', d => d.type === 'agent' ? 14 : 0)
+    .text(d => d.type === 'agent' ? d.label : d.label);
+  nodeEnter.filter(d => d.type !== 'agent').append('text').attr('class', 'sublabel')
     .attr('fill', 'rgba(148,163,184,0.5)').attr('font-size', '9px')
     .attr('font-family', 'monospace').attr('text-anchor', 'middle')
     .text(d => d.sub);
@@ -5924,7 +5955,11 @@ function renderD3Brain(W, H, cortex, agents) {
   brainNodeElems.on('mouseenter', function(e, d) {
     const tip = document.getElementById('brainTooltip');
     tip.style.display = 'block';
-    tip.innerHTML = '<strong style="color:' + d.color + '">' + d.id.toUpperCase() + '</strong><br><span style="color:#94a3b8;font-size:11px;">' + (d.desc || '') + '</span>';
+    if (d.type === 'agent') {
+      tip.innerHTML = '<strong style="color:' + d.color + '">' + d.chitchat_name + '</strong><br><span style="color:#94a3b8;font-size:11px;">' + (d.desc || '') + '</span><br><span style="color:#6366f1;font-size:10px;">click to filter tasks</span>';
+    } else {
+      tip.innerHTML = '<strong style="color:' + d.color + '">' + d.id.toUpperCase() + '</strong><br><span style="color:#94a3b8;font-size:11px;">' + (d.desc || '') + '</span>';
+    }
     d3.select(this).select('circle.core').transition().duration(150).attr('r', d.r * 0.55);
   }).on('mousemove', function(e) {
     const tip = document.getElementById('brainTooltip');
@@ -5935,31 +5970,37 @@ function renderD3Brain(W, H, cortex, agents) {
     d3.select(this).select('circle.core').transition().duration(150).attr('r', d.r * 0.45);
   });
 
-  // Agent circles along bottom
-  const reputations = cortex.avg_reputations || {};
-  const maxAgents = Math.min(agents.length, Math.floor((W - 100) / 22));
-  const agentStartX = W / 2 - (maxAgents * 22) / 2;
-  const agentY = H - 25;
-  const agentData = [];
-  for (let i = 0; i < maxAgents; i++) {
-    const a = agents[i];
-    const rep = reputations[a.id] || 0.5;
+  // Build agent nodes for the force graph
+  const agentNodes = agents.slice(0, 12).map((a, i) => {
+    const name = a.chitchat_name || a.id.slice(0, 8);
     const alive = (Date.now() / 1000 - (a.last_heartbeat || 0)) < 300;
-    agentData.push({
-      id: a.id, rep: rep, alive: alive,
-      x: agentStartX + i * 22, y: agentY,
-      clr: !alive ? '#f87171' : rep > 0.6 ? '#34d399' : rep > 0.3 ? '#fbbf24' : '#f87171',
-    });
-  }
-  const agentG = brainData.selectAll('g.agent').data(agentData, d => 'ag-' + d.id);
-  agentG.exit().remove();
-  const agentEnter = agentG.enter().append('g').attr('class', 'agent');
-  agentEnter.append('circle').attr('r', 5).attr('stroke', 'rgba(255,255,255,0.2)').attr('stroke-width', 1);
-  agentEnter.append('text').attr('fill', 'rgba(148,163,184,0.5)')
-    .attr('font-size', '7px').attr('font-family', 'monospace')
-    .attr('text-anchor', 'middle');
-  brainData.selectAll('g.agent circle').attr('cx', d => d.x).attr('cy', d => d.y).attr('fill', d => d.clr);
-  brainData.selectAll('g.agent text').attr('x', d => d.x).attr('y', d => d.y + 14).text(d => (d.id||'?').slice(0, 6));
+    return {
+      id: 'agent-' + name,
+      label: name.slice(0, 7),
+      type: 'agent',
+      chitchat_name: name,
+      alive: alive,
+      status: a.status || 'unknown',
+      r: alive ? 20 : 14,
+      color: !alive ? '#f87171' : a.status === 'active' ? '#34d399' : a.status === 'idle' ? '#fbbf24' : '#94a3b8',
+      desc: (alive ? 'active' : 'stale') + ' · ' + (a.status || 'unknown'),
+    };
+  });
+
+  // Add agent nodes to the simulation
+  nodes.push(...agentNodes);
+
+  // Build agent → nearest neural region edges
+  const neuralIds = nodes.filter(n => n.type !== 'agent').map(n => n.id);
+  agentNodes.forEach((ag, i) => {
+    const target = neuralIds[i % neuralIds.length];
+    edges.push({ source: ag.id, target, label: ag.label, color: ag.color, dash: true });
+    // If multiple agents, link them in a chain
+    if (i > 0) {
+      const prev = 'agent-' + (agents[i - 1]?.chitchat_name || agents[i - 1]?.id?.slice(0, 8));
+      edges.push({ source: prev, target: ag.id, label: '', color: 'rgba(148,163,184,0.2)', dash: true });
+    }
+  });
 
   // D3 Force Simulation — real physics
   const linkForce = edges.map(e => ({ ...e, source: e.source, target: e.target }));
@@ -5993,6 +6034,8 @@ function renderD3Brain(W, H, cortex, agents) {
       // Nodes
       brainData.selectAll('g.node').attr('transform', d => 'translate(' + d.x + ',' + d.y + ')');
       brainData.selectAll('g.node circle.glow').attr('r', d => d.r * 0.85);
+      // Agent inner dots follow parent
+      brainData.selectAll('g.node circle.inner').attr('r', d => (d.type === 'agent' ? d.r : 0) * 0.85);
       // Pulse glow
       if (Math.floor(Date.now() / 80) % 2 === 0) {
         brainData.selectAll('g.node circle.glow').attr('r', d => d.r * 0.95);
@@ -6044,21 +6087,27 @@ function updateSignalsPanel(cortex) {
   el.innerHTML = items.map(s => '<div>' + s + '</div>').join('');
 }
 
-function renderBrainTasks(tasks) {
+function renderBrainTasks(tasks, skipCounts) {
+  window.__brainTaskList = tasks;
   const counts = el('brainTaskCounts');
-  if (!counts) return;
-  const p = tasks.filter(t => t.status === 'pending').length;
-  const r = tasks.filter(t => t.status === 'running' || t.status === 'assigned').length;
-  const d = tasks.filter(t => t.status === 'completed' || t.status === 'done').length;
-  const f = tasks.filter(t => t.status === 'failed').length;
-  counts.innerHTML = '<span style="color:var(--warning)">●</span> ' + p + '  <span style="color:var(--accent)">●</span> ' + r + '  <span style="color:var(--success)">●</span> ' + d + '  <span style="color:var(--danger)">●</span> ' + f;
+  if (counts && !skipCounts) {
+    const p = tasks.filter(t => t.status === 'pending').length;
+    const r = tasks.filter(t => t.status === 'running' || t.status === 'assigned').length;
+    const d = tasks.filter(t => t.status === 'completed' || t.status === 'done').length;
+    const f = tasks.filter(t => t.status === 'failed').length;
+    counts.innerHTML = '<span style="color:var(--warning)">●</span> ' + p + '  <span style="color:var(--accent)">●</span> ' + r + '  <span style="color:var(--success)">●</span> ' + d + '  <span style="color:var(--danger)">●</span> ' + f;
+  }
 
-  // Populate expandable task list
+  // Filter tasks if agent is selected
+  const filtered = _brainTaskFilter
+    ? tasks.filter(t => (t.assigned_to || '').toLowerCase().includes(_brainTaskFilter.toLowerCase()))
+    : tasks;
+
   const tl = el('brainTaskList');
   if (!tl) return;
   const order = {pending: 0, assigned: 1, running: 2, completed: 3, done: 3, failed: 4};
-  tasks.sort((a, b) => (order[a.status] || 9) - (order[b.status] || 9));
-  tl.innerHTML = tasks.slice(0, 40).map(t => {
+  filtered.sort((a, b) => (order[a.status] || 9) - (order[b.status] || 9));
+  tl.innerHTML = filtered.slice(0, 40).map(t => {
     const st = t.status === 'running' || t.status === 'assigned' || t.status === 'pending' ? t.status : (t.status === 'completed' || t.status === 'done' ? 'completed' : t.status);
     return '<div class="sidepane-task ' + st + '">' +
       '<div class="title">' + esc(t.title.slice(0, 60)) + '</div>' +
@@ -6067,10 +6116,17 @@ function renderBrainTasks(tasks) {
 }
 
 var _brainTasksOpen = false;
+var _brainTaskFilter = '';
 function toggleBrainTasks() {
   _brainTasksOpen = !_brainTasksOpen;
   el('brainTaskList').style.display = _brainTasksOpen ? 'flex' : 'none';
   el('brainTaskArrow').textContent = _brainTasksOpen ? '▼' : '▲';
+}
+function filterBrainTasksByAgent(name) {
+  _brainTaskFilter = _brainTaskFilter === name ? '' : name;
+  el('brainTaskStrip').style.borderTopColor = _brainTaskFilter ? '#34d399' : 'rgba(108,92,231,0.2)';
+  if (!_brainTasksOpen) toggleBrainTasks();
+  renderBrainTasks(window.__brainTaskList || [], true);
 }
 // INIT
 // ============================================
