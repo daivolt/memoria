@@ -662,6 +662,14 @@ async def _consolidate_chitchat():
                 "proposed_at": time.time(),
                 "source": "chitchat_consolidation",
                 "hits": 1,
+                "context": {
+                    "rooms": sorted(room_counts.keys()),
+                    "participants": sorted(from_counts.keys()),
+                    "keywords": top_keywords,
+                    "message_count": len(all_messages),
+                    "room_counts": dict(room_counts),
+                    "from_counts": dict(from_counts),
+                },
             }
             with open(path, "a") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -766,9 +774,19 @@ async def _deep_consolidate():
                     if top_kw:
                         existing = await _load_existing_topic_names()
                         if not _find_matching_topic(top_kw, existing):
+                            avg_reward = sum(
+                                e.get("reward", 0) for e in high_val
+                            ) / len(high_val)
+                            sample_titles = list(
+                                {
+                                    e.get("task_title", "")
+                                    for e in high_val
+                                    if e.get("task_title")
+                                }
+                            )[:8]
                             prop_text = (
                                 f"[hippocampal consolidation] Cluster '{ttype}': "
-                                f"{len(high_val)} high-reward episodes, "
+                                f"{len(high_val)} high-reward episodes (avg reward: {avg_reward:.2f}), "
                                 f"keywords: {', '.join(top_kw)}"
                             )
                             prop_path = WORKDIR / "proposals.jsonl"
@@ -778,6 +796,15 @@ async def _deep_consolidate():
                                 "topic": top_kw[0][:50],
                                 "proposed_at": time.time(),
                                 "source": "hippocampal_consolidation",
+                                "context": {
+                                    "cluster_type": ttype,
+                                    "episode_count": len(high_val),
+                                    "total_episodes": len(cluster),
+                                    "avg_reward": round(avg_reward, 3),
+                                    "keywords": top_kw,
+                                    "sample_titles": sample_titles,
+                                    "project": project,
+                                },
                             }
                             with open(prop_path, "a") as f:
                                 f.write(json.dumps(record) + "\n")
@@ -804,8 +831,24 @@ async def _deep_consolidate():
         if top:
             existing = await _load_existing_topic_names()
             if not _find_matching_topic(top, existing):
+                recent_sessions = []
+                for line in lines[-5:]:
+                    try:
+                        s = json.loads(line)
+                        recent_sessions.append(
+                            {
+                                "title": s.get("title", ""),
+                                "task": (s.get("task") or "")[:200],
+                                "id": s.get("id", ""),
+                            }
+                        )
+                    except json.JSONDecodeError:
+                        continue
                 prop_text = (
-                    f"[deep consolidation] Recent session keywords: {', '.join(top)}"
+                    f"[deep consolidation] Recent session keywords: {', '.join(top)}\n"
+                    f"Sessions analyzed: {len(recent_sessions)}\n"
+                    f"Titles: "
+                    + "; ".join(s["title"][:60] for s in recent_sessions if s["title"])
                 )
                 prop_path = WORKDIR / "proposals.jsonl"
                 record = {
@@ -814,6 +857,14 @@ async def _deep_consolidate():
                     "topic": top[0][:50],
                     "proposed_at": time.time(),
                     "source": "deep_consolidation",
+                    "context": {
+                        "keywords": top,
+                        "keyword_counts": {
+                            w: c for w, c in session_keywords.most_common(5) if c >= 2
+                        },
+                        "session_count": len(recent_sessions),
+                        "sessions": recent_sessions,
+                    },
                 }
                 with open(prop_path, "a") as f:
                     f.write(json.dumps(record) + "\n")
@@ -1961,6 +2012,99 @@ async def clear_proposals(confirm: bool = False):
     if path.exists():
         path.write_text("")
     return {"ok": True}
+
+
+class BulkProposalRequest(BaseModel):
+    ids: list[str]
+
+
+@app.post("/proposals/accept-batch")
+async def accept_proposals_batch(body: BulkProposalRequest):
+    results = []
+    for pid in body.ids:
+        try:
+            path = WORKDIR / "proposals.jsonl"
+            if not path.exists():
+                continue
+            lines = path.read_text().strip().splitlines()
+            kept = []
+            accepted = None
+            for line in lines:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("id") == pid:
+                    accepted = rec
+                else:
+                    kept.append(line)
+            if accepted is None:
+                results.append({"id": pid, "ok": False, "error": "not found"})
+                continue
+            with open(path, "w") as f:
+                f.writelines(l + "\n" for l in kept)
+            topics_dir = WORKDIR / "topics"
+            topics_dir.mkdir(parents=True, exist_ok=True)
+            tpath = topics_dir / f"{accepted['topic']}.md"
+            entries = []
+            if tpath.exists():
+                entries = [e.strip() for e in tpath.read_text().split("§") if e.strip()]
+            entries.append(accepted["text"])
+            tpath.write_text("\n§\n".join(entries) + "\n")
+            task_id = f"task_{uuid.uuid4().hex[:12]}"
+            task = {
+                "id": task_id,
+                "project": accepted.get("topic", "general")[:50],
+                "title": accepted["text"][:100],
+                "description": accepted["text"],
+                "status": "pending",
+                "assigned_to": "",
+                "depends_on": [],
+                "created_at": time.time(),
+                "assigned_at": None,
+                "result": "",
+                "error": "",
+                "rollback_commit": "",
+                "test_command": "",
+                "lint_command": "",
+                "rubric": [],
+                "verification": None,
+                "attempt_count": 0,
+                "max_attempts": 3,
+            }
+            _save_task(task)
+            results.append({"id": pid, "ok": True, "task_id": task_id})
+        except Exception as e:
+            results.append({"id": pid, "ok": False, "error": str(e)})
+    return {
+        "ok": True,
+        "results": results,
+        "accepted": sum(1 for r in results if r["ok"]),
+    }
+
+
+@app.post("/proposals/delete-batch")
+async def delete_proposals_batch(body: BulkProposalRequest):
+    path = WORKDIR / "proposals.jsonl"
+    if not path.exists():
+        return {"ok": True, "deleted": 0}
+    lines = path.read_text().strip().splitlines()
+    id_set = set(body.ids)
+    kept = []
+    deleted = 0
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            kept.append(line)
+            continue
+        if rec.get("id") in id_set:
+            deleted += 1
+        else:
+            kept.append(line)
+    with open(path, "w") as f:
+        f.writelines(l + "\n" for l in kept)
+    return {"ok": True, "deleted": deleted}
 
 
 @app.delete("/topics/{name}")
@@ -4572,6 +4716,21 @@ body {
 }
 .item-card .item-actions { border-top: 1px solid var(--border); padding: 6px 12px 8px; display: flex; gap: 4px; flex-wrap: wrap; }
 
+/* Bulk selection */
+.bulk-toolbar { display: none; position: sticky; top: 0; z-index: 10; background: var(--bg-elevated); border: 1px solid var(--accent); border-radius: var(--radius-sm); padding: 8px 12px; margin-bottom: 8px; align-items: center; gap: 10px; flex-wrap: wrap; }
+.bulk-toolbar.visible { display: flex; }
+.bulk-toolbar .count { font-size: 12px; font-weight: 600; color: var(--accent); }
+.item-card .select-check { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; flex-shrink: 0; margin-right: 6px; }
+
+/* Context blocks on proposals */
+.ctx-block { font-size: 11px; margin-top: 6px; padding: 6px 10px; border-radius: 4px; background: var(--bg-elevated); border: 1px solid var(--border); }
+.ctx-block .ctx-label { font-weight: 600; color: var(--text-muted); margin-bottom: 2px; text-transform: uppercase; letter-spacing: 0.3px; font-size: 10px; }
+.ctx-block .ctx-list { color: var(--text-secondary); line-height: 1.5; }
+.ctx-tag { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin: 1px 2px; background: rgba(156,163,175,0.12); color: var(--text-muted); }
+.ctx-tag.keyword { background: rgba(99,102,241,0.12); color: var(--accent); }
+.ctx-tag.room { background: rgba(52,211,153,0.12); color: var(--success); }
+.ctx-tag.person { background: rgba(251,191,36,0.12); color: var(--warning); }
+
 /* Buttons */
 .btn {
   display: inline-flex;
@@ -4938,6 +5097,13 @@ body {
           <button class="btn btn-sm" onclick="toggleAllDetails()" title="Expand/collapse all detail sections">&#9776; Toggle</button>
           <button class="btn btn-sm" onclick="createTask()" style="margin-left:4px">+ New</button>
         </div>
+      </div>
+      <div class="bulk-toolbar" id="bulkToolbar">
+        <input type="checkbox" class="select-check" id="selectAllCb" onchange="toggleSelectAll(this.checked)" title="Select all">
+        <span class="count" id="bulkCount">0 selected</span>
+        <button class="btn btn-xs btn-success" onclick="bulkAccept()">&#10003; Accept Selected</button>
+        <button class="btn btn-xs btn-error" onclick="bulkDelete()">&#10005; Delete Selected</button>
+        <button class="btn btn-xs" onclick="clearSelection()">Clear</button>
       </div>
       <div class="item-list" id="taskList"></div>
     </div>
@@ -5501,6 +5667,7 @@ function renderAgents() {
 // ============================================
 let tasksData = [];
 let proposalsData = [];
+let selectedProposals = new Set();
 
 async function loadTasks() {
   try {
@@ -5528,6 +5695,9 @@ function setTaskFilter(f) {
   document.querySelectorAll('#taskFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
   const clearBtn = document.getElementById('clearProposalsBtn');
   if (clearBtn) clearBtn.style.display = (f === 'proposals' && proposalsData.length > 0) ? '' : 'none';
+  // Show bulk toolbar when proposals filter active or items selected
+  const bar = document.getElementById('bulkToolbar');
+  if (bar) bar.classList.toggle('visible', f === 'proposals' || selectedProposals.size > 0);
   renderTasks();
 }
 
@@ -5707,9 +5877,57 @@ function renderTaskCard(t) {
 
 function renderProposalCard(p) {
   const sourceLabel = (p.source || '').replace('chitchat_consolidation', 'chat replay').replace('hippocampal_consolidation', 'hippocampal').replace('deep_consolidation', 'deep scan');
+  const checked = selectedProposals.has(p.id) ? 'checked' : '';
+
+  // Build context blocks from p.context
+  let ctxHtml = '';
+  const ctx = p.context || {};
+  if (ctx.rooms && ctx.rooms.length) {
+    ctxHtml += '<div class="ctx-block"><div class="ctx-label">Rooms</div><div class="ctx-list">' +
+      ctx.rooms.map(r => '<span class="ctx-tag room">#' + esc(r) + '</span>').join('') + '</div></div>';
+  }
+  if (ctx.participants && ctx.participants.length) {
+    ctxHtml += '<div class="ctx-block"><div class="ctx-label">Participants</div><div class="ctx-list">' +
+      ctx.participants.map(n => '<span class="ctx-tag person">' + esc(n) + '</span>').join('') + '</div></div>';
+  }
+  if (ctx.message_count) {
+    ctxHtml += '<div class="ctx-block"><div class="ctx-label">Messages Analyzed</div><div class="ctx-list">' + ctx.message_count + ' messages across ' + (ctx.rooms || []).length + ' rooms</div></div>';
+  }
+  if (ctx.keywords && ctx.keywords.length) {
+    ctxHtml += '<div class="ctx-block"><div class="ctx-label">Keywords</div><div class="ctx-list">' +
+      ctx.keywords.map(k => '<span class="ctx-tag keyword">' + esc(k) + '</span>').join('') + '</div></div>';
+  }
+  if (ctx.room_counts && Object.keys(ctx.room_counts).length) {
+    ctxHtml += '<div class="ctx-block"><div class="ctx-label">Messages per Room</div><div class="ctx-list">' +
+      Object.entries(ctx.room_counts).map(([r, c]) => '#' + esc(r) + ': ' + c).join(' &middot; ') + '</div></div>';
+  }
+  if (ctx.episode_count) {
+    ctxHtml += '<div class="ctx-block"><div class="ctx-label">Episodes</div><div class="ctx-list">' +
+      ctx.episode_count + ' high-reward (of ' + (ctx.total_episodes || '?') + ' total), avg reward: ' + (ctx.avg_reward || '?') +
+      (ctx.project ? ', project: ' + esc(ctx.project) : '') + '</div></div>';
+  }
+  if (ctx.cluster_type) {
+    ctxHtml += '<div class="ctx-block"><div class="ctx-label">Cluster Type</div><div class="ctx-list">' + esc(ctx.cluster_type) + '</div></div>';
+  }
+  if (ctx.sample_titles && ctx.sample_titles.length) {
+    ctxHtml += '<div class="ctx-block"><div class="ctx-label">Sample Episode Titles</div><div class="ctx-list">' +
+      ctx.sample_titles.map(t => '<div style="margin:1px 0">' + esc(t) + '</div>').join('') + '</div></div>';
+  }
+  if (ctx.keyword_counts && Object.keys(ctx.keyword_counts).length) {
+    ctxHtml += '<div class="ctx-block"><div class="ctx-label">Keyword Frequency</div><div class="ctx-list">' +
+      Object.entries(ctx.keyword_counts).map(([w, c]) => '<span class="ctx-tag keyword">' + esc(w) + '</span> ×' + c).join(' ') + '</div></div>';
+  }
+  if (ctx.session_count) {
+    ctxHtml += '<div class="ctx-block"><div class="ctx-label">Sessions Analyzed</div><div class="ctx-list">' + ctx.session_count + ' recent sessions</div></div>';
+  }
+  if (ctx.sessions && ctx.sessions.length) {
+    ctxHtml += '<div class="ctx-block"><div class="ctx-label">Session Details</div><div class="ctx-list">' +
+      ctx.sessions.map(s => '<div style="margin:2px 0"><strong>' + esc(s.title || '(untitled)') + '</strong>' + (s.task ? '<div style="font-size:10px;color:var(--text-muted)">' + esc(s.task).slice(0, 120) + '</div>' : '') + '</div>').join('') + '</div></div>';
+  }
 
   return '<div class="item-card item-proposal">' +
     '<div class="top" onclick="toggleDetail(this.parentElement)" style="cursor:pointer">' +
+      '<input type="checkbox" class="select-check" ' + checked + ' onclick="event.stopPropagation(); toggleSelectProposal(\'' + esc(p.id) + '\', this.checked)" title="Select for bulk action">' +
       '<span class="item-type-badge">&#128196; PROPOSAL</span>' +
       tag(p.topic, 'warning') +
       (sourceLabel ? tag(sourceLabel, 'default') : '') +
@@ -5724,6 +5942,7 @@ function renderProposalCard(p) {
     '<div class="meta">' +
       '<span>&#128368; Proposed ' + ago(p.proposed_at) + ' (' + fmtTime(p.proposed_at) + ')</span>' +
     '</div>' +
+    ctxHtml +
     '<div class="item-actions">' +
       '<button class="btn btn-xs btn-success" data-action="accept-proposal" data-proposal-id="' + p.id + '">&#10003; Accept</button>' +
       '<button class="btn btn-xs btn-error" data-action="delete-proposal" data-proposal-id="' + p.id + '">&#10005; Delete</button>' +
@@ -5823,6 +6042,67 @@ async function clearProposals() {
     toast('All proposals cleared', 'success');
     loadTasks();
   } catch(ex) { toast('Clear failed: ' + ex.message, 'error'); }
+}
+
+// -- Bulk Selection --
+function toggleSelectProposal(id, checked) {
+  if (checked) selectedProposals.add(id);
+  else selectedProposals.delete(id);
+  updateBulkToolbar();
+}
+function toggleSelectAll(checked) {
+  if (checked) proposalsData.forEach(p => selectedProposals.add(p.id));
+  else selectedProposals.clear();
+  updateBulkToolbar();
+  renderTasks();
+}
+function clearSelection() {
+  selectedProposals.clear();
+  updateBulkToolbar();
+  renderTasks();
+}
+function updateBulkToolbar() {
+  const n = selectedProposals.size;
+  const bar = document.getElementById('bulkToolbar');
+  const cnt = document.getElementById('bulkCount');
+  const cb = document.getElementById('selectAllCb');
+  if (bar) bar.classList.toggle('visible', n > 0);
+  if (cnt) cnt.textContent = n + ' selected';
+  if (cb) cb.checked = n > 0 && proposalsData.length > 0 && n === proposalsData.length;
+}
+async function bulkAccept() {
+  const ids = [...selectedProposals];
+  if (!ids.length) return;
+  if (!confirm('Accept ' + ids.length + ' proposal(s)? Tasks will be created for each.')) return;
+  try {
+    const res = await fetch(BASE + '/proposals/accept-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids })
+    });
+    const data = await res.json();
+    toast(data.accepted + ' proposals accepted, ' + (ids.length - data.accepted) + ' failed', 'success');
+    selectedProposals.clear();
+    updateBulkToolbar();
+    loadTasks();
+  } catch(ex) { toast('Bulk accept failed: ' + ex.message, 'error'); }
+}
+async function bulkDelete() {
+  const ids = [...selectedProposals];
+  if (!ids.length) return;
+  if (!confirm('Delete ' + ids.length + ' proposal(s)?')) return;
+  try {
+    const res = await fetch(BASE + '/proposals/delete-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids })
+    });
+    const data = await res.json();
+    toast(data.deleted + ' proposals deleted', 'success');
+    selectedProposals.clear();
+    updateBulkToolbar();
+    loadTasks();
+  } catch(ex) { toast('Bulk delete failed: ' + ex.message, 'error'); }
 }
 
 async function toggleAutoApprove(enabled) {
