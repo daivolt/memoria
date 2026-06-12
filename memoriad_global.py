@@ -5407,13 +5407,30 @@ function ago(ts) {
 function el(id) { return document.getElementById(id); }
 function toggleDetail(card) {
   const d = card.querySelector('.detail');
-  if (d) d.classList.toggle('open');
+  if (!d) return;
+  const id = card.querySelector('[data-task-id]')?.dataset?.taskId || card.querySelector('[data-proposal-id]')?.dataset?.proposalId || card.querySelector('.title')?.textContent || '';
+  d.classList.toggle('open');
+  if (d.classList.contains('open')) expandedCards.add(id);
+  else expandedCards.delete(id);
 }
 function toggleAllDetails() {
-  const open = document.querySelectorAll('.item-card .detail.open').length;
-  document.querySelectorAll('.item-card .detail').forEach(d => {
-    if (open > 0) d.classList.remove('open');
-    else d.classList.add('open');
+  const allDetails = document.querySelectorAll('.item-card .detail');
+  const anyOpen = document.querySelectorAll('.item-card .detail.open').length > 0;
+  allDetails.forEach(d => {
+    const card = d.parentElement;
+    const id = card.querySelector('[data-task-id]')?.dataset?.taskId || card.querySelector('[data-proposal-id]')?.dataset?.proposalId || card.querySelector('.title')?.textContent || '';
+    if (anyOpen) { d.classList.remove('open'); expandedCards.delete(id); }
+    else { d.classList.add('open'); expandedCards.add(id); }
+  });
+}
+function restoreExpanded() {
+  if (!expandedCards.size) return;
+  document.querySelectorAll('.item-card').forEach(card => {
+    const id = card.querySelector('[data-task-id]')?.dataset?.taskId || card.querySelector('[data-proposal-id]')?.dataset?.proposalId || card.querySelector('.title')?.textContent || '';
+    if (expandedCards.has(id)) {
+      const d = card.querySelector('.detail');
+      if (d) d.classList.add('open');
+    }
   });
 }
 
@@ -5668,6 +5685,7 @@ function renderAgents() {
 let tasksData = [];
 let proposalsData = [];
 let selectedProposals = new Set();
+let expandedCards = new Set();
 
 async function loadTasks() {
   try {
@@ -5755,6 +5773,7 @@ function renderTasks() {
     else if (action === 'accept-proposal') approveProposal(btn.dataset.proposalId, e);
     else if (action === 'delete-proposal') deleteProposal(btn.dataset.proposalId, e);
   };
+  restoreExpanded();
 }
 
 function renderTaskCard(t) {
