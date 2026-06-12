@@ -1890,9 +1890,12 @@ async def list_proposals():
     proposals = []
     for line in lines:
         try:
-            proposals.append(json.loads(line))
+            rec = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if rec.get("archived"):
+            continue
+        proposals.append(rec)
     return {"proposals": proposals, "count": len(proposals)}
 
 
@@ -2002,6 +2005,39 @@ async def reject_proposal(pid: str):
     with open(path, "w") as f:
         f.writelines(l + "\n" for l in kept)
     return {"ok": True, "rejected": pid}
+
+
+class PatchProposal(BaseModel):
+    archived: bool = False
+
+
+@app.patch("/proposals/{pid}")
+async def patch_proposal(pid: str, body: PatchProposal):
+    path = WORKDIR / "proposals.jsonl"
+    if not path.exists():
+        raise HTTPException(404, "no proposals")
+    lines = path.read_text().strip().splitlines()
+    found = False
+    updated = []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            updated.append(line)
+            continue
+        if rec.get("id") == pid:
+            found = True
+            if body.archived:
+                rec["archived"] = True
+                rec["archived_at"] = time.time()
+            updated.append(json.dumps(rec))
+        else:
+            updated.append(line)
+    if not found:
+        raise HTTPException(404, f"proposal '{pid}' not found")
+    with open(path, "w") as f:
+        f.writelines(l + "\n" for l in updated)
+    return {"ok": True}
 
 
 @app.delete("/proposals")
@@ -2511,7 +2547,11 @@ def _delete_task(task_id: str):
         p.unlink()
 
 
-def _list_tasks(project: str | None = None, status: str | None = None) -> list[dict]:
+def _list_tasks(
+    project: str | None = None,
+    status: str | None = None,
+    include_archived: bool = False,
+) -> list[dict]:
     if not TASKS_DIR.exists():
         return []
     tasks = []
@@ -2521,6 +2561,8 @@ def _list_tasks(project: str | None = None, status: str | None = None) -> list[d
         try:
             t = json.loads(f.read_text())
         except (json.JSONDecodeError, OSError):
+            continue
+        if not include_archived and t.get("archived"):
             continue
         if project and t.get("project") != project:
             continue
@@ -2550,6 +2592,7 @@ class UpdateTask(BaseModel):
     test_command: str = ""
     lint_command: str = ""
     rubric: list[str] = []
+    archived: bool = False
 
 
 class VerifyTask(BaseModel):
@@ -2608,8 +2651,9 @@ async def create_task(body: CreateTask):
 async def list_tasks(
     project: Optional[str] = None,
     status: Optional[str] = None,
+    include_archived: bool = False,
 ):
-    tasks = _list_tasks(project, status)
+    tasks = _list_tasks(project, status, include_archived)
     return {"tasks": tasks, "count": len(tasks)}
 
 
@@ -2658,6 +2702,9 @@ async def update_task(task_id: str, body: UpdateTask):
         t["lint_command"] = body.lint_command
     if body.rubric:
         t["rubric"] = body.rubric
+    if body.archived:
+        t["archived"] = True
+        t["archived_at"] = time.time()
     _save_task(t)
     return {"ok": True}
 
@@ -5757,7 +5804,7 @@ function renderTasks() {
       container.innerHTML = '<div class="empty-state"><span class="icon">&#9776;</span>No ' + state.taskFilter + ' tasks</div>';
       return;
     }
-    filteredTasks.sort((a, b) => (taskOrder[a.status] || 9) - (taskOrder[b.status] || 9));
+    filteredTasks.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
     container.innerHTML = filteredTasks.map(t => renderTaskCard(t)).join('');
   }
 
@@ -5770,8 +5817,10 @@ function renderTasks() {
     else if (action === 'reject') rejectTask(btn.dataset.taskId, e);
     else if (action === 'retry') retryTask(btn.dataset.taskId, e);
     else if (action === 'delete') deleteTask(btn.dataset.taskId, e);
+    else if (action === 'archive-task') archiveTask(btn.dataset.taskId, e);
     else if (action === 'accept-proposal') approveProposal(btn.dataset.proposalId, e);
     else if (action === 'delete-proposal') deleteProposal(btn.dataset.proposalId, e);
+    else if (action === 'archive-proposal') archiveProposal(btn.dataset.proposalId, e);
   };
   restoreExpanded();
 }
@@ -5791,17 +5840,18 @@ function renderTaskCard(t) {
   // Action buttons based on status
   let actions = '';
   const tid = t.id;
+  const archiveBtn = '<button class="btn btn-xs btn-warning" data-action="archive-task" data-task-id="' + tid + '">Archive</button>';
   if (t.status === 'assigned') {
     actions = '<button class="btn btn-xs btn-success" data-action="approve" data-task-id="' + tid + '">Approve</button>' +
-      '<button class="btn btn-xs btn-error" data-action="reject" data-task-id="' + tid + '">Reject</button>';
+      '<button class="btn btn-xs btn-error" data-action="reject" data-task-id="' + tid + '">Reject</button>' + archiveBtn;
   } else if (t.status === 'rejected') {
     actions = '<button class="btn btn-xs btn-success" data-action="approve" data-task-id="' + tid + '">Approve</button>' +
-      '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
+      '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>' + archiveBtn;
   } else if (t.status === 'failed' || t.status === 'dead' || t.status === 'blocked') {
     actions = '<button class="btn btn-xs btn-warning" data-action="retry" data-task-id="' + tid + '">Retry</button>' +
-      '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
+      '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>' + archiveBtn;
   } else if (t.status === 'pending' || t.status === 'completed' || t.status === 'verified') {
-    actions = '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
+    actions = '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>' + archiveBtn;
   }
 
   // Description — full, no truncation
@@ -5965,6 +6015,7 @@ function renderProposalCard(p) {
     '<div class="item-actions">' +
       '<button class="btn btn-xs btn-success" data-action="accept-proposal" data-proposal-id="' + p.id + '">&#10003; Accept</button>' +
       '<button class="btn btn-xs btn-error" data-action="delete-proposal" data-proposal-id="' + p.id + '">&#10005; Delete</button>' +
+      '<button class="btn btn-xs btn-warning" data-action="archive-proposal" data-proposal-id="' + p.id + '">&#128451; Archive</button>' +
     '</div>' +
   '</div>';
 }
@@ -5975,7 +6026,8 @@ function renderProposals() {
     container.innerHTML = '<div class="empty-state"><span class="icon">&#128196;</span>No pending proposals</div>';
     return;
   }
-  container.innerHTML = proposalsData.map(p => renderProposalCard(p)).join('');
+  const sorted = [...proposalsData].sort((a, b) => (b.proposed_at || 0) - (a.proposed_at || 0));
+  container.innerHTML = sorted.map(p => renderProposalCard(p)).join('');
   container.onclick = function(e) {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
@@ -5983,6 +6035,7 @@ function renderProposals() {
     const action = btn.dataset.action;
     if (action === 'accept-proposal') approveProposal(id, e);
     else if (action === 'delete-proposal') deleteProposal(id, e);
+    else if (action === 'archive-proposal') archiveProposal(id, e);
     else if (action === 'select-proposal') { toggleSelectProposal(id, btn.checked); e.stopPropagation(); }
   };
 }
@@ -6035,6 +6088,32 @@ async function deleteTask(id, e) {
     toast('Task deleted', 'success');
     loadTasks();
   } catch(ex) { toast('Delete failed: ' + ex.message, 'error'); }
+}
+
+async function archiveTask(id, e) {
+  if (e) e.stopPropagation();
+  try {
+    await fetch(BASE + '/tasks/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ archived: true })
+    });
+    toast('Task archived', 'info');
+    loadTasks();
+  } catch(ex) { toast('Archive failed: ' + ex.message, 'error'); }
+}
+
+async function archiveProposal(id, e) {
+  if (e) e.stopPropagation();
+  try {
+    await fetch(BASE + '/proposals/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ archived: true })
+    });
+    toast('Proposal archived', 'info');
+    loadTasks();
+  } catch(ex) { toast('Archive failed: ' + ex.message, 'error'); }
 }
 
 // -- Proposal Actions --
