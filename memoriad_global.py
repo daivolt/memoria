@@ -6289,7 +6289,7 @@ function renderBrainActivity() {
     if (!el) return;
     const activity = d.activities || [];
     el.innerHTML = activity.slice().reverse().slice(-10).map((a: any) => {
-      const icon = a.action === 'file_write' ? '\ud83d\udcdd' : a.action === 'task_claim' ? '\ud83c\udfaf' : a.action === 'task_complete' ? '\u2705' : '\ud83d\udcac';
+      const icon = a.action === 'file_write' ? '[W]' : a.action === 'task_claim' ? '[C]' : a.action === 'task_complete' ? '[D]' : '[M]';
       return '<div style="display:flex;align-items:center;gap:4px;padding:2px 0;border-bottom:1px solid rgba(148,163,184,0.06);overflow:hidden;">' +
         '<span style="flex-shrink:0">' + icon + '</span>' +
         '<span style="font-weight:600;flex-shrink:0;color:#94a3b8">' + esc(a.agent || '?') + '</span>' +
@@ -6310,7 +6310,7 @@ function renderBrainMonitor() {
     const sys = d.system || {};
     el.innerHTML = agents.map((a: any) => {
       const barW = Math.min(Math.round(a.cpu) + 1, 20);
-      const bar = '\u2588'.repeat(barW) + '\u2591'.repeat(Math.max(0, 20 - barW));
+      const bar = '#'.repeat(barW) + '.'.repeat(Math.max(0, 20 - barW));
       return '<div style="display:flex;align-items:center;gap:4px;padding:1px 0;">' +
         '<span style="width:70px;flex-shrink:0;color:#94a3b8;overflow:hidden;text-overflow:ellipsis">' + esc(a.name) + '</span>' +
         '<span style="font-family:monospace;font-size:9px;color:' + (a.cpu > 50 ? '#f87171' : 'rgba(148,163,184,0.5)') + '">' + bar + '</span>' +
