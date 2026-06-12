@@ -6288,7 +6288,7 @@ function renderBrainActivity() {
     const el = document.getElementById('brainActivity');
     if (!el) return;
     const activity = d.activities || [];
-    el.innerHTML = activity.slice().reverse().slice(-10).map((a: any) => {
+    el.innerHTML = activity.slice().reverse().slice(-10).map(function(a) {
       const icon = a.action === 'file_write' ? '[W]' : a.action === 'task_claim' ? '[C]' : a.action === 'task_complete' ? '[D]' : '[M]';
       return '<div style="display:flex;align-items:center;gap:4px;padding:2px 0;border-bottom:1px solid rgba(148,163,184,0.06);overflow:hidden;">' +
         '<span style="flex-shrink:0">' + icon + '</span>' +
@@ -6308,7 +6308,7 @@ function renderBrainMonitor() {
     if (ts) ts.textContent = new Date().toLocaleTimeString();
     const agents = d.agents || [];
     const sys = d.system || {};
-    el.innerHTML = agents.map((a: any) => {
+    el.innerHTML = agents.map(function(a) {
       const barW = Math.min(Math.round(a.cpu) + 1, 20);
       const bar = '#'.repeat(barW) + '.'.repeat(Math.max(0, 20 - barW));
       return '<div style="display:flex;align-items:center;gap:4px;padding:1px 0;">' +
