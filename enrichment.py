@@ -28,6 +28,7 @@ LLM_URL = os.environ.get(
     "MEMORIA_LLM_URL", "http://localhost:11434/v1/chat/completions"
 )
 LLM_MODEL = os.environ.get("MEMORIA_LLM_MODEL", "deepseek-v4-flash:cloud")
+LLM_API_KEY = os.environ.get("MEMORIA_LLM_API_KEY", "")
 ENRICH_ENABLED = os.environ.get("MEMORIA_ENRICH_ENABLED", "true").lower() == "true"
 EXPANSION_WEIGHT = float(os.environ.get("MEMORIA_ENRICH_WEIGHT", "0.5"))
 MAX_DF_RATIO = float(os.environ.get("MEMORIA_ENRICH_DF_RATIO", "0.10"))
@@ -63,10 +64,16 @@ Query: {query}
 async def _post_chat(
     session: aiohttp.ClientSession, payload: dict, retries: int = ENRICH_MAX_RETRIES
 ) -> dict[str, Any]:
+    headers = {}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
     for attempt in range(retries):
         try:
             async with session.post(
-                LLM_URL, json=payload, timeout=aiohttp.ClientTimeout(total=60)
+                LLM_URL,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60),
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()

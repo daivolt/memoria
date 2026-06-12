@@ -3597,6 +3597,7 @@ async def get_config():
         "enrich_enabled": ENRICH_ENABLED,
         "enrich_llm_url": enrichment.LLM_URL,
         "enrich_llm_model": enrichment.LLM_MODEL,
+        "enrich_llm_api_key": enrichment.LLM_API_KEY,
         "enrich_weight": enrichment.EXPANSION_WEIGHT,
         "enrich_df_ratio": enrichment.MAX_DF_RATIO,
         "enrich_temperature": enrichment.ENRICH_TEMPERATURE,
@@ -3618,6 +3619,7 @@ class ConfigUpdate(BaseModel):
     enrich_enabled: Optional[bool] = None
     enrich_llm_url: Optional[str] = None
     enrich_llm_model: Optional[str] = None
+    enrich_llm_api_key: Optional[str] = None
     enrich_weight: Optional[float] = None
     enrich_df_ratio: Optional[float] = None
     enrich_temperature: Optional[float] = None
@@ -3650,6 +3652,8 @@ async def update_config(updates: ConfigUpdate):
         enrichment.LLM_URL = data["enrich_llm_url"]
     if "enrich_llm_model" in data:
         enrichment.LLM_MODEL = data["enrich_llm_model"]
+    if "enrich_llm_api_key" in data:
+        enrichment.LLM_API_KEY = data["enrich_llm_api_key"]
     if "enrich_weight" in data:
         enrichment.EXPANSION_WEIGHT = data["enrich_weight"]
     if "enrich_df_ratio" in data:
@@ -5259,6 +5263,15 @@ body {
       <div class="card mt-4">
         <div class="card-title">🧠 Enrichment — SIRA Search Enhancement</div>
         <div class="flex gap-2 mt-2" style="flex-wrap:wrap">
+          <div class="setting-row" style="flex:0 0 auto;min-width:160px">
+            <span class="label">Provider</span>
+            <select id="cfg_provider" onchange="onProviderChange()" style="font-size:12px;padding:2px 4px">
+              <option value="ollama">Ollama (Local)</option>
+              <option value="openai">OpenAI</option>
+              <option value="deepseek">DeepSeek</option>
+              <option value="custom">Custom</option>
+            </select>
+          </div>
           <div class="setting-row" style="flex:1;min-width:200px">
             <span class="label">LLM URL</span>
             <input type="text" id="cfg_enrich_llm_url" value="" data-key="enrich_llm_url" style="width:100%;font-size:12px">
@@ -5268,6 +5281,14 @@ body {
             <input type="text" id="cfg_enrich_llm_model" value="" data-key="enrich_llm_model" style="width:100%;font-size:12px">
           </div>
         </div>
+        <div class="flex gap-2 mt-2" style="flex-wrap:wrap">
+          <div class="setting-row" style="flex:1;min-width:300px">
+            <span class="label">API Key</span>
+            <div style="display:flex;gap:4px;flex:1">
+              <input type="password" id="cfg_enrich_llm_api_key" value="" data-key="enrich_llm_api_key" style="flex:1;font-size:12px" placeholder="sk-...">
+              <button class="btn btn-xs" onclick="toggleApiKeyVisibility()" title="Show/Hide">👁</button>
+            </div>
+          </div>
         <div class="flex gap-2 mt-2" style="flex-wrap:wrap">
           <div class="setting-row" style="flex:0 0 auto">
             <span class="label">Enabled</span>
@@ -6767,6 +6788,37 @@ function loadEnrichSettings() {
   el('cfg_enrich_weight').value = cfg.enrich_weight ?? 0.5;
   el('cfg_enrich_df_ratio').value = cfg.enrich_df_ratio ?? 0.1;
   el('cfg_enrich_temperature').value = cfg.enrich_temperature ?? 0.4;
+  const apiKey = cfg.enrich_llm_api_key || '';
+  el('cfg_enrich_llm_api_key').value = apiKey;
+  // Detect provider from URL
+  const url = (cfg.enrich_llm_url || '').toLowerCase();
+  let provider = 'custom';
+  if (url.includes('localhost:11434') || url.includes('127.0.0.1:11434')) provider = 'ollama';
+  else if (url.includes('api.openai.com')) provider = 'openai';
+  else if (url.includes('api.deepseek.com')) provider = 'deepseek';
+  el('cfg_provider').value = provider;
+}
+
+const PROVIDER_CONFIG = {
+  ollama: { url: 'http://localhost:11434/v1/chat/completions', model: 'deepseek-v4-flash:cloud' },
+  openai: { url: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o' },
+  deepseek: { url: 'https://api.deepseek.com/v1/chat/completions', model: 'deepseek-chat' },
+  custom: { url: '', model: '' },
+};
+
+function onProviderChange() {
+  const p = el('cfg_provider').value;
+  const cfg = PROVIDER_CONFIG[p];
+  if (!cfg) return;
+  if (p !== 'custom') {
+    el('cfg_enrich_llm_url').value = cfg.url;
+    el('cfg_enrich_llm_model').value = cfg.model;
+  }
+}
+
+function toggleApiKeyVisibility() {
+  const inp = el('cfg_enrich_llm_api_key');
+  inp.type = inp.type === 'password' ? 'text' : 'password';
 }
 
 async function loadEnrichStats() {
@@ -6825,6 +6877,8 @@ async function saveConfig() {
   if (llm_url) updates['enrich_llm_url'] = llm_url;
   const llm_model = el('cfg_enrich_llm_model').value.trim();
   if (llm_model) updates['enrich_llm_model'] = llm_model;
+  const apiKey = el('cfg_enrich_llm_api_key').value.trim();
+  if (apiKey) updates['enrich_llm_api_key'] = apiKey;
   try {
     await fetch(BASE + '/config', {
       method: 'PATCH',
