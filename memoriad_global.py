@@ -3623,20 +3623,39 @@ async def list_clients():
     return {"clients": clients, "count": len(clients)}
 
 
-@app.get("/static/{filename}")
-async def serve_static(filename: str):
-    path = Path(__file__).parent / "static" / filename
+PAPERS_DIR = Path(__file__).parent / "papers"
+
+
+@app.get("/papers")
+async def list_papers():
+    files = []
+    for f in sorted(PAPERS_DIR.iterdir()):
+        if f.is_file() and f.suffix.lower() in (".pdf", ".txt", ".md"):
+            files.append({"name": f.name, "size": f.stat().st_size})
+    return {"papers": files, "count": len(files)}
+
+
+@app.get("/papers/{filename}")
+async def get_paper(filename: str):
+    path = PAPERS_DIR / filename
     if not path.exists() or not path.is_file():
-        raise HTTPException(404)
-    content = path.read_bytes()
-    ct = "application/javascript"
-    if filename.endswith(".js"):
-        ct = "application/javascript"
-    elif filename.endswith(".css"):
-        ct = "text/css"
-    elif filename.endswith(".svg"):
-        ct = "image/svg+xml"
-    return Response(content=content, media_type=ct)
+        raise HTTPException(404, "paper not found")
+    if path.suffix.lower() == ".pdf":
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["pdftotext", "-layout", str(path), "-"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            text = result.stdout[:50000]
+            return {"name": filename, "text": text, "pages": 11}
+        except Exception as e:
+            raise HTTPException(500, f"pdf extraction failed: {e}")
+    else:
+        return {"name": filename, "text": path.read_text()[:50000]}
 
 
 @app.post("/clients")
