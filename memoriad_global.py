@@ -4933,6 +4933,14 @@ body {
               <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:rgba(108,92,231,0.7);margin-bottom:6px;">Signals</div>
               <div id="brainSignals" style="font-size:11px;font-family:var(--mono);color:#a0a0c0;display:flex;flex-direction:column;gap:3px;"></div>
             </div>
+            <div style="background:rgba(26,26,46,0.85);backdrop-filter:blur(8px);border:1px solid rgba(108,92,231,0.2);border-radius:8px;padding:10px 12px;margin-top:8px;">
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:rgba(108,92,231,0.7);margin-bottom:6px;">Activity</div>
+              <div id="brainActivity" style="font-size:10px;font-family:var(--mono);color:rgba(148,163,184,0.8);max-height:120px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;"></div>
+            </div>
+            <div style="background:rgba(26,26,46,0.85);backdrop-filter:blur(8px);border:1px solid rgba(108,92,231,0.2);border-radius:8px;padding:10px 12px;margin-top:8px;">
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:rgba(108,92,231,0.7);margin-bottom:6px;">Monitor <span class="text-muted text-sm" id="brainMonitorTs"></span></div>
+              <div id="brainMonitor" style="font-size:10px;font-family:var(--mono);color:rgba(148,163,184,0.8);display:flex;flex-direction:column;gap:2px;"></div>
+            </div>
           </div>
           <div id="brainTaskStrip" style="position:absolute;bottom:0;left:0;right:0;background:rgba(10,10,16,0.9);backdrop-filter:blur(8px);border-top:1px solid rgba(108,92,231,0.2);padding:6px 12px;display:flex;align-items:center;gap:12px;font-size:11px;cursor:pointer;" onclick="toggleBrainTasks()">
             <span id="brainTaskCounts" style="color:#a0a0c0;font-family:var(--mono);flex:1;"></span>
@@ -6000,6 +6008,8 @@ function loadBrain() {
     };
     brainAgentData = agents;
     renderBrainTasks(tasks);
+    renderBrainActivity();
+    renderBrainMonitor();
     document.getElementById('brainTs').textContent = new Date().toLocaleTimeString();
     updateSignalsPanel(cortex);
     if (!brainData) {
@@ -6022,7 +6032,7 @@ function loadBrain() {
       brainData.selectAll('g.node circle.glow').attr('fill', d => d.color + '22');
       brainData.selectAll('g.node text.nlabel').attr('fill', d => d.type === 'agent' ? d.color : '#e2e8f0');
     }
-  }).catch(() => { if (!brainData) renderD3Brain(W, H, {}, []); });
+  }).catch(() => { renderBrainActivity(); renderBrainMonitor(); if (!brainData) renderD3Brain(W, H, {}, []); });
 }
 
 function renderD3Brain(W, H, cortex, agents) {
@@ -6271,6 +6281,48 @@ function updateSignalsPanel(cortex) {
     }
   }
   el.innerHTML = items.map(s => '<div>' + s + '</div>').join('');
+}
+
+function renderBrainActivity() {
+  fetch(BASE + '/activity?limit=15').then(r => r.json()).then(d => {
+    const el = document.getElementById('brainActivity');
+    if (!el) return;
+    const activity = d.activities || [];
+    el.innerHTML = activity.slice().reverse().slice(-10).map((a: any) => {
+      const icon = a.action === 'file_write' ? '\ud83d\udcdd' : a.action === 'task_claim' ? '\ud83c\udfaf' : a.action === 'task_complete' ? '\u2705' : '\ud83d\udcac';
+      return '<div style="display:flex;align-items:center;gap:4px;padding:2px 0;border-bottom:1px solid rgba(148,163,184,0.06);overflow:hidden;">' +
+        '<span style="flex-shrink:0">' + icon + '</span>' +
+        '<span style="font-weight:600;flex-shrink:0;color:#94a3b8">' + esc(a.agent || '?') + '</span>' +
+        '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;color:rgba(148,163,184,0.7)">' + esc((a.detail || '').slice(0, 80)) + '</span>' +
+        '</div>';
+    }).join('');
+    if (!activity.length) el.innerHTML = '<div style="color:rgba(148,163,184,0.4);text-align:center;padding:8px;font-size:10px;">No activity yet</div>';
+  }).catch(() => {});
+}
+
+function renderBrainMonitor() {
+  fetch(BASE + '/monitor').then(r => r.json()).then(d => {
+    const el = document.getElementById('brainMonitor');
+    const ts = document.getElementById('brainMonitorTs');
+    if (!el) return;
+    if (ts) ts.textContent = new Date().toLocaleTimeString();
+    const agents = d.agents || [];
+    const sys = d.system || {};
+    el.innerHTML = agents.map((a: any) => {
+      const barW = Math.min(Math.round(a.cpu) + 1, 20);
+      const bar = '\u2588'.repeat(barW) + '\u2591'.repeat(Math.max(0, 20 - barW));
+      return '<div style="display:flex;align-items:center;gap:4px;padding:1px 0;">' +
+        '<span style="width:70px;flex-shrink:0;color:#94a3b8;overflow:hidden;text-overflow:ellipsis">' + esc(a.name) + '</span>' +
+        '<span style="font-family:monospace;font-size:9px;color:' + (a.cpu > 50 ? '#f87171' : 'rgba(148,163,184,0.5)') + '">' + bar + '</span>' +
+        '<span style="width:40px;text-align:right;flex-shrink:0;color:rgba(148,163,184,0.6);font-size:9px">' + a.cpu.toFixed(1) + '%</span>' +
+        '<span style="width:35px;text-align:right;flex-shrink:0;color:rgba(148,163,184,0.4);font-size:9px">' + a.rss_mb + 'MB</span>' +
+        '</div>';
+    }).join('');
+    if (sys.cpu_count) {
+      el.innerHTML += '<div style="margin-top:4px;padding-top:4px;border-top:1px solid rgba(148,163,184,0.1);font-size:9px;color:rgba(148,163,184,0.4)">' +
+        sys.cpu_count + ' CPUs \u00b7 ' + Math.round(sys.mem_used_mb / 1024) + '/' + Math.round(sys.mem_total_mb / 1024) + 'GB</div>';
+    }
+  }).catch(() => {});
 }
 
 function renderBrainTasks(tasks, skipCounts) {
