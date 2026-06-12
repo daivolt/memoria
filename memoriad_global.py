@@ -3558,6 +3558,65 @@ async def write_sidepane_file(body: FileWriteRequest):
     return {"path": body.path, "written": True}
 
 
+PROJECT_DIR = Path(__file__).parent
+
+
+@app.get("/project/files")
+async def list_project_files():
+    files = []
+    for f in sorted(PROJECT_DIR.rglob("*")):
+        if (
+            f.is_file()
+            and not any(p.startswith(".") for p in f.parts)
+            and "node_modules" not in f.parts
+            and "__pycache__" not in f.parts
+            and ".git" not in f.parts
+        ):
+            rel = f.relative_to(PROJECT_DIR)
+            files.append({"path": str(rel), "size": f.stat().st_size})
+    return {"files": files, "count": len(files)}
+
+
+@app.get("/project/files/{path:path}")
+async def read_project_file(path: str):
+    full_path = (PROJECT_DIR / path).resolve()
+    if not str(full_path).startswith(str(PROJECT_DIR.resolve())):
+        raise HTTPException(403, "path outside project")
+    if not full_path.exists() or not full_path.is_file():
+        raise HTTPException(404, "file not found")
+    if full_path.stat().st_size > 100 * 1024:
+        raise HTTPException(413, "file too large")
+    try:
+        text = full_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        raise HTTPException(500, f"read failed: {e}")
+    return {"path": path, "content": text, "size": len(text)}
+
+
+class FileProjectWrite(BaseModel):
+    content: str
+
+
+@app.post("/project/files/{path:path}")
+async def write_project_file(path: str, body: FileProjectWrite):
+    full_path = (PROJECT_DIR / path).resolve()
+    if not str(full_path).startswith(str(PROJECT_DIR.resolve())):
+        raise HTTPException(403, "path outside project")
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    full_path.write_text(body.content, encoding="utf-8")
+    return {"path": path, "written": True, "size": len(body.content)}
+
+
+@app.delete("/project/files/{path:path}")
+async def delete_project_file(path: str):
+    full_path = (PROJECT_DIR / path).resolve()
+    if not str(full_path).startswith(str(PROJECT_DIR.resolve())):
+        raise HTTPException(403, "path outside project")
+    if not full_path.exists():
+        raise HTTPException(404, "file not found")
+    full_path.unlink()
+    return {"path": path, "deleted": True}
+
 
 class ChitchatPause(BaseModel):
     from_name: str
