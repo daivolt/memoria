@@ -74,7 +74,7 @@ HTML=$(curl -s "http://localhost:$MEMORIA_PORT/" 2>/dev/null || echo "")
     if printf '%s' "$HTML" | grep -q 'drawBrainFrame'; then
       ISSUES="$ISSUES  dead drawBrainFrame code\n"
     fi
-    if ! printf '%s' "$HTML" | grep -q 'let s = esc(text)'; then
+    if ! grep -q 'let s = esc(text)' <<< "$HTML"; then
       ISSUES="$ISSUES  renderMarkdown missing esc()\n"
     fi
     if [ "$(printf '%s' "$HTML" | grep -c 'AbortController')" -eq 0 ]; then
