@@ -4533,9 +4533,30 @@ body {
 .proposal-card .text { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
 
 /* Enriched task card */
-.item-card .desc-preview { font-size: 12px; color: var(--text-secondary); margin-top: 4px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.item-card .desc-preview { font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.5; border-left: 2px solid var(--border); padding-left: 8px; }
 .item-card .rich-meta { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; color: var(--text-muted); margin-top: 4px; }
 .item-card .rich-meta span { display: flex; align-items: center; gap: 3px; }
+.item-card .field-row { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 6px; font-size: 11px; }
+.item-card .field-row .field { display: flex; gap: 4px; }
+.item-card .field-row .field-label { color: var(--text-muted); font-weight: 600; }
+.item-card .field-row .field-val { color: var(--text-secondary); }
+.item-card .inline-block { font-size: 11px; margin-top: 6px; padding: 6px 10px; border-radius: 4px; background: var(--bg-elevated); border: 1px solid var(--border); white-space: pre-wrap; word-break: break-word; max-height: 80px; overflow: hidden; }
+.item-card .inline-block.result-block { border-left: 3px solid var(--success); }
+.item-card .inline-block.error-block { border-left: 3px solid var(--error); color: var(--error); }
+.item-card .verify-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.item-card .verify-chip { font-size: 10px; padding: 2px 8px; border-radius: 3px; font-weight: 600; display: inline-flex; align-items: center; gap: 3px; }
+.item-card .verify-chip.pass { background: rgba(52,211,153,0.12); color: var(--success); }
+.item-card .verify-chip.fail { background: rgba(248,113,113,0.12); color: var(--error); }
+.item-card .verify-chip.neutral { background: rgba(156,163,175,0.12); color: var(--text-muted); }
+.item-card .verify-chip.warn { background: rgba(251,191,36,0.12); color: var(--warning); }
+.item-card .detail { display: none; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+.item-card .detail.open { display: block; }
+.item-card .detail pre { font-size: 11px; background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; margin-top: 4px; white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; font-family: var(--mono); color: var(--text-secondary); }
+.item-card .detail .detail-row { margin-bottom: 6px; }
+.item-card .detail .detail-label { font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 2px; }
+.item-card .rubric-list { list-style: none; padding: 0; margin: 4px 0 0; }
+.item-card .rubric-list li { font-size: 11px; color: var(--text-secondary); padding: 1px 0; }
+.item-card .rubric-list li::before { content: '\\2022 '; color: var(--text-muted); }
 
 /* Inline proposal (mixed into task list) */
 .item-card.item-proposal {
@@ -4914,6 +4935,7 @@ body {
             <span class="toggle-label">Auto</span>
           </label>
           <button class="btn btn-sm" id="clearProposalsBtn" style="display:none" onclick="clearProposals()">🗑 Clear All</button>
+          <button class="btn btn-sm" onclick="toggleAllDetails()" title="Expand/collapse all detail sections">&#9776; Toggle</button>
           <button class="btn btn-sm" onclick="createTask()" style="margin-left:4px">+ New</button>
         </div>
       </div>
@@ -5220,6 +5242,13 @@ function el(id) { return document.getElementById(id); }
 function toggleDetail(card) {
   const d = card.querySelector('.detail');
   if (d) d.classList.toggle('open');
+}
+function toggleAllDetails() {
+  const open = document.querySelectorAll('.item-card .detail.open').length;
+  document.querySelectorAll('.item-card .detail').forEach(d => {
+    if (open > 0) d.classList.remove('open');
+    else d.classList.add('open');
+  });
 }
 
 // -- Fetch Wrapper --
@@ -5587,60 +5616,126 @@ function renderTaskCard(t) {
   }
 
   // Description preview
-  const descPreview = t.description ? '<div class="desc-preview">' + esc(t.description).slice(0, 150) + '</div>' : '';
+  const descPreview = t.description ? '<div class="desc-preview">' + esc(t.description).slice(0, 200) + '</div>' : '';
 
-  // Verification info
-  let verifyHtml = '';
+  // Verification chips
+  let verifyChips = '';
   if (t.verification) {
     const v = t.verification;
-    const scoreColor = (v.score || 0) >= 0.8 ? 'var(--success)' : (v.score || 0) >= 0.5 ? 'var(--warning)' : 'var(--error)';
-    verifyHtml = '<span>&#9989; <span style="color:' + scoreColor + '">' + (v.score || 0).toFixed(1) + '</span>' +
-      (v.test_passed === true ? ' &#10003;test' : v.test_passed === false ? ' &#10007;test' : '') +
-      (v.lint_violations != null ? ' ' + v.lint_violations + 'viol' : '') +
-      '</span>';
+    const score = v.score != null ? v.score : 0;
+    const scoreClass = score >= 0.8 ? 'pass' : score >= 0.5 ? 'warn' : 'fail';
+    verifyChips = '<div class="verify-chips">' +
+      '<span class="verify-chip ' + scoreClass + '">&#9989; ' + score.toFixed(2) + '</span>' +
+      '<span class="verify-chip ' + (v.test_passed === true ? 'pass' : v.test_passed === false ? 'fail' : 'neutral') + '">' +
+        (v.test_passed === true ? '&#10003; test' : v.test_passed === false ? '&#10007; test' : '? test') + '</span>' +
+      '<span class="verify-chip ' + (v.lint_violations === 0 ? 'pass' : v.lint_violations > 0 ? 'fail' : 'neutral') + '">' +
+        (v.lint_violations != null ? v.lint_violations + ' lint viol.' : '? lint') + '</span>' +
+      '<span class="verify-chip neutral">&#128100; ' + esc(v.by || '?') + '</span>' +
+      (v.rubric_score != null ? '<span class="verify-chip ' + (v.rubric_score >= 0.8 ? 'pass' : 'fail') + '">rubric ' + v.rubric_score.toFixed(1) + '</span>' : '') +
+      '</div>';
   }
 
   // Error preview inline
-  const errorHtml = t.error ? '<span style="color:var(--error)">&#9888; ' + esc(t.error).slice(0, 80) + '</span>' : '';
+  const errorHtml = t.error ? '<div class="inline-block error-block">' + esc(t.error).slice(0, 200) + '</div>' : '';
 
-  return '<div class="item-card" onclick="toggleDetail(this)">' +
-    '<div class="top">' + dot(dotColor) + '<span class="title">' + esc(t.title) + '</span>' + tag(t.status + (t.status === 'dead' ? ' (' + (t.attempt_count || 0) + ')' : ''), statusColor) + '</div>' +
+  // Result preview inline
+  const resultHtml = t.result ? '<div class="inline-block result-block">' + esc(t.result).slice(0, 150) + '</div>' : '';
+
+  // Inline field rows
+  let fields = '';
+  fields += '<div class="field-row">' +
+    '<span class="field"><span class="field-label">ID:</span> <span class="field-val">' + esc(t.id) + '</span></span>' +
+    '<span class="field"><span class="field-label">Project:</span> <span class="field-val">' + esc(t.project) + '</span></span>' +
+    (t.assigned_to ? '<span class="field"><span class="field-label">Assigned:</span> <span class="field-val">' + esc(t.assigned_to) + '</span></span>' : '') +
+    '<span class="field"><span class="field-label">Created:</span> <span class="field-val">' + fmtTime(t.created_at) + '</span></span>' +
+    (t.assigned_at ? '<span class="field"><span class="field-label">Assigned at:</span> <span class="field-val">' + fmtTime(t.assigned_at) + '</span></span>' : '') +
+    '<span class="field"><span class="field-label">Attempts:</span> <span class="field-val">' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</span></span>' +
+    '</div>';
+
+  // Expandable detail section
+  let detail = '';
+  detail += '<div class="detail-row"><div class="detail-label">Full Description</div><pre>' + esc(t.description || '(none)') + '</pre></div>';
+  detail += '<div class="detail-row"><div class="detail-label">Result</div><pre>' + esc(t.result || '(none)') + '</pre></div>';
+  if (t.error) {
+    detail += '<div class="detail-row"><div class="detail-label">Error</div><pre style="color:var(--error)">' + esc(t.error) + '</pre></div>';
+  }
+  if (t.test_command) {
+    detail += '<div class="detail-row"><div class="detail-label">Test Command</div><pre>' + esc(t.test_command) + '</pre></div>';
+  }
+  if (t.lint_command) {
+    detail += '<div class="detail-row"><div class="detail-label">Lint Command</div><pre>' + esc(t.lint_command) + '</pre></div>';
+  }
+  if (t.rubric && t.rubric.length) {
+    detail += '<div class="detail-row"><div class="detail-label">Rubric (' + t.rubric.length + ' items)</div>' +
+      '<ul class="rubric-list">' + t.rubric.map(r => '<li>' + esc(r) + '</li>').join('') + '</ul></div>';
+  }
+  if (t.rollback_commit) {
+    detail += '<div class="detail-row"><div class="detail-label">Rollback Commit</div><pre>' + esc(t.rollback_commit) + '</pre></div>';
+  }
+  if (t.depends_on && t.depends_on.length) {
+    detail += '<div class="detail-row"><div class="detail-label">Depends On</div><pre>' + esc(t.depends_on.join(', ')) + '</pre></div>';
+  }
+  if (t.verification) {
+    const v = t.verification;
+    let vdetail = 'Score: ' + (v.score != null ? v.score : 'N/A') + '\n';
+    vdetail += 'Test passed: ' + (v.test_passed != null ? v.test_passed : 'N/A') + '\n';
+    vdetail += 'Lint violations: ' + (v.lint_violations != null ? v.lint_violations : 'N/A') + '\n';
+    vdetail += 'Rubric score: ' + (v.rubric_score != null ? v.rubric_score : 'N/A') + '\n';
+    vdetail += 'Verified by: ' + (v.by || 'N/A') + '\n';
+    vdetail += 'Verified at: ' + fmtTime(v.verified_at) + '\n';
+    if (v.rubric_detail && v.rubric_detail.length) {
+      vdetail += 'Rubric detail:\n' + v.rubric_detail.map(r => '  - ' + JSON.stringify(r)).join('\n') + '\n';
+    }
+    if (v.log) {
+      vdetail += '\n--- Verification Log ---\n' + v.log;
+    }
+    detail += '<div class="detail-row"><div class="detail-label">Verification Detail</div><pre>' + esc(vdetail) + '</pre></div>';
+  }
+
+  return '<div class="item-card">' +
+    '<div class="top" onclick="toggleDetail(this.parentElement)" style="cursor:pointer">' + dot(dotColor) + '<span class="title">' + esc(t.title) + '</span>' + tag(t.status + (t.status === 'dead' ? ' (' + (t.attempt_count || 0) + ')' : ''), statusColor) + '</div>' +
     descPreview +
+    resultHtml +
+    errorHtml +
+    fields +
+    verifyChips +
     '<div class="meta">' +
-      '<span>&#128230; ' + esc(t.project) + '</span>' +
-      (t.assigned_to ? '<span>&#128100; ' + esc(t.assigned_to).slice(0, 20) + '</span>' : '') +
       '<span>&#128197; ' + ago(t.created_at) + '</span>' +
-      '<span>&#128260; ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</span>' +
-      verifyHtml +
-      errorHtml +
     '</div>' +
-    '<div class="detail">' +
-      '<div><strong>ID:</strong> ' + esc(t.id) + '</div>' +
-      (t.description ? '<div class="mt-2"><strong>Description:</strong><pre>' + esc(t.description) + '</pre></div>' : '') +
-      (t.result ? '<div class="mt-2"><strong>Result:</strong><pre>' + esc(t.result).slice(0, 500) + '</pre></div>' : '') +
-      (t.error ? '<div class="mt-2"><strong style="color:var(--error)">Error:</strong><pre style="color:var(--error)">' + esc(t.error).slice(0, 500) + '</pre></div>' : '') +
-      (t.rollback_commit ? '<div class="mt-2"><strong>Rollback:</strong> ' + esc(t.rollback_commit).slice(0, 16) + '</div>' : '') +
-      '<div class="mt-2"><strong>Created:</strong> ' + fmtTime(t.created_at) + '</div>' +
-      (t.assigned_at ? '<div><strong>Assigned:</strong> ' + fmtTime(t.assigned_at) + '</div>' : '') +
-      '<div><strong>Attempts:</strong> ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</div>' +
-    '</div>' +
+    (detail ? '<div class="detail">' + detail + '</div>' : '') +
     (actions ? '<div class="item-actions">' + actions + '</div>' : '') +
     '</div>';
 }
 
 function renderProposalCard(p) {
+  const sourceLabel = (p.source || '').replace('chitchat_consolidation', 'chat replay').replace('hippocampal_consolidation', 'hippocampal').replace('deep_consolidation', 'deep scan');
+  let detail = '';
+  detail += '<div class="detail-row"><div class="detail-label">Full Text</div><pre>' + esc(p.text || '') + '</pre></div>';
+  detail += '<div class="detail-row"><div class="detail-label">Topic</div><pre>' + esc(p.topic || '') + '</pre></div>';
+  detail += '<div class="detail-row"><div class="detail-label">Source</div><pre>' + esc(p.source || 'unknown') + '</pre></div>';
+  detail += '<div class="detail-row"><div class="detail-label">Proposal ID</div><pre>' + esc(p.id) + '</pre></div>';
+  detail += '<div class="detail-row"><div class="detail-label">Proposed At</div><pre>' + fmtTime(p.proposed_at) + '</pre></div>';
+  if (p.hits) {
+    detail += '<div class="detail-row"><div class="detail-label">Hits</div><pre>' + p.hits + '</pre></div>';
+  }
+
   return '<div class="item-card item-proposal">' +
-    '<div class="top">' +
+    '<div class="top" onclick="toggleDetail(this.parentElement)" style="cursor:pointer">' +
       '<span class="item-type-badge">&#128196; PROPOSAL</span>' +
-      '<span class="id">' + esc(p.id).slice(0, 30) + '</span>' +
       tag(p.topic, 'warning') +
-      (p.source ? tag(p.source.replace('chitchat_consolidation', 'chat').replace('hippocampal_consolidation', 'hippo').replace('deep_consolidation', 'deep'), 'default') : '') +
+      (sourceLabel ? tag(sourceLabel, 'default') : '') +
     '</div>' +
-    '<div class="title" style="font-size:13px;color:var(--text-secondary);font-weight:400;margin-top:2px">' + esc(p.text || '').slice(0, 250) + '</div>' +
+    '<div class="desc-preview">' + esc(p.text || '').slice(0, 300) + '</div>' +
+    '<div class="field-row">' +
+      '<span class="field"><span class="field-label">ID:</span> <span class="field-val">' + esc(p.id) + '</span></span>' +
+      '<span class="field"><span class="field-label">Source:</span> <span class="field-val">' + esc(p.source || 'unknown') + '</span></span>' +
+      '<span class="field"><span class="field-label">Topic:</span> <span class="field-val">' + esc(p.topic) + '</span></span>' +
+    '</div>' +
     '<div class="meta">' +
-      '<span>&#128368; Proposed ' + ago(p.proposed_at) + '</span>' +
+      '<span>&#128368; Proposed ' + ago(p.proposed_at) + ' (' + fmtTime(p.proposed_at) + ')</span>' +
       (p.hits ? '<span>&#128073; ' + p.hits + ' hit' + (p.hits > 1 ? 's' : '') + '</span>' : '') +
     '</div>' +
+    (detail ? '<div class="detail">' + detail + '</div>' : '') +
     '<div class="item-actions">' +
       '<button class="btn btn-xs btn-success" data-action="accept-proposal" data-proposal-id="' + p.id + '">&#10003; Accept</button>' +
       '<button class="btn btn-xs btn-error" data-action="delete-proposal" data-proposal-id="' + p.id + '">&#10005; Delete</button>' +
