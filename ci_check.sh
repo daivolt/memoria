@@ -62,13 +62,19 @@ if [ -z "$HTML" ]; then
 else
   echo "(memoria at localhost:$MEMORIA_PORT)"
   ISSUES=""
-  if [ "$(printf '%s' "$HTML" | grep -c 'let brainTaskData')" -ne 1 ]; then
-    ISSUES="$ISSUES  duplicate let brainTaskData ($(printf '%s' "$HTML" | grep -c 'let brainTaskData') occurrences)\n"
+  if [ "$(echo "$HTML" | grep -c 'let brainTaskData')" -ne 1 ]; then
+    ISSUES="$ISSUES  duplicate let brainTaskData ($(echo "$HTML" | grep -c 'let brainTaskData') occurrences)\n"
+  fi
+  if echo "$HTML" | grep -q 'drawBrainFrame'; then
+    ISSUES="$ISSUES  dead drawBrainFrame code\n"
+  fi
+  if ! echo "$HTML" | grep -q 'AbortController'; then
+    ISSUES="$ISSUES  api() missing timeout — AbortController\n"
   fi
   if printf '%s' "$HTML" | grep -q 'drawBrainFrame'; then
     ISSUES="$ISSUES  dead drawBrainFrame code\n"
   fi
-  if ! printf '%s' "$HTML" | grep -q 'let s = esc(text)'; then
+  if ! echo "$HTML" | grep -q 'let s = esc(text)'; then
     ISSUES="$ISSUES  renderMarkdown missing esc()\n"
   fi
   if [ "$(printf '%s' "$HTML" | grep -c 'AbortController')" -eq 0 ]; then
