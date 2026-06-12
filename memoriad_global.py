@@ -4387,7 +4387,7 @@ body {
 .memory-rail { width: 3px; border-radius: 2px; flex-shrink: 0; background: var(--accent); opacity: 0.4; }
 
 /* Chat */
-.chat-layout { display: flex; gap: 16px; height: calc(100vh - var(--topbar-h) - 80px); }
+.chat-layout { display: flex; gap: 16px; flex: 1; min-height: 0; }
 .chat-rooms {
   width: 200px;
   flex-shrink: 0;
@@ -4395,6 +4395,7 @@ body {
   flex-direction: column;
   gap: 4px;
   overflow-y: auto;
+  min-height: 0;
 }
 .chat-panels { border-top: 1px solid var(--border); margin-top: 4px; padding: 4px 8px; flex-shrink: 0; }
 .chat-panel { margin-bottom: 6px; }
@@ -4531,6 +4532,25 @@ body {
 .proposal-card .src { font-size: 11px; color: var(--text-muted); }
 .proposal-card .text { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
 
+/* Enriched task card */
+.item-card .desc-preview { font-size: 12px; color: var(--text-secondary); margin-top: 4px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.item-card .rich-meta { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.item-card .rich-meta span { display: flex; align-items: center; gap: 3px; }
+
+/* Inline proposal (mixed into task list) */
+.item-card.item-proposal {
+  border-left: 3px solid var(--warning);
+  background: color-mix(in srgb, var(--bg-surface) 96%, var(--warning) 4%);
+}
+.item-card.item-proposal:hover { border-left-color: var(--warning); }
+.item-card.item-proposal .item-type-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  background: rgba(253,203,110,0.12); color: var(--warning);
+  font-size: 10px; font-weight: 700; padding: 1px 6px;
+  border-radius: 3px; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.item-card .item-actions { border-top: 1px solid var(--border); padding: 6px 12px 8px; display: flex; gap: 4px; flex-wrap: wrap; }
+
 /* Buttons */
 .btn {
   display: inline-flex;
@@ -4556,7 +4576,7 @@ body {
 .btn-error { background: var(--error); color: #fff; border-color: var(--error); }
 .btn-sm { padding: 4px 10px; font-size: 11px; }
 .btn-xs { padding: 2px 6px; font-size: 10px; line-height: 1.4; }
-.item-actions { border-top: 1px solid var(--border); }
+
 
 /* Filter buttons group */
 .filter-group { display: flex; gap: 4px; }
@@ -5197,6 +5217,10 @@ function ago(ts) {
 
 // -- Helpers --
 function el(id) { return document.getElementById(id); }
+function toggleDetail(card) {
+  const d = card.querySelector('.detail');
+  if (d) d.classList.toggle('open');
+}
 
 // -- Fetch Wrapper --
 async function api(path) {
@@ -5315,10 +5339,11 @@ function setConn(ok) {
 // ============================================
 async function loadOverview() {
   try {
-    const [health, agents, tasks, rooms] = await Promise.all([
+    const [health, agents, tasks, props, rooms] = await Promise.all([
       api('/health'),
       api('/agents'),
       api('/tasks'),
+      api('/proposals').catch(() => ({ proposals: [] })),
       api('/chitchat/rooms').catch(() => ({ rooms: [] }))
     ]);
     el('overviewTs').textContent = 'updated ' + ago(Date.now());
@@ -5326,14 +5351,16 @@ async function loadOverview() {
     const agentCount = agents.agents ? agents.agents.length : 0;
     const taskTotal = tasks.tasks ? tasks.tasks.length : 0;
     const taskDone = tasks.tasks ? tasks.tasks.filter(t => t.status === 'completed' || t.status === 'done').length : 0;
+    const proposalTotal = props.proposals ? props.proposals.length : 0;
     const roomCount = rooms.rooms ? rooms.rooms.length : 0;
     const memCount = health.sessions_indexed || 0;
 
     el('overviewStats').innerHTML =
       '<div class="stat-card"><div class="value accent">' + agentCount + '</div><div class="label">Agents</div><div class="sub">' + dot('active') + ' active</div></div>' +
       '<div class="stat-card"><div class="value">' + taskTotal + '</div><div class="label">Tasks</div><div class="sub success">' + taskDone + ' done</div>' + renderBar(taskTotal ? (taskDone / taskTotal * 100) : 0, 'success') + '</div>' +
-      '<div class="stat-card"><div class="value success">' + memCount + '</div><div class="label">Sessions</div><div class="sub"><span class="success">&check;</span> DB ready</div></div>' +
-      '<div class="stat-card"><div class="value warning">' + roomCount + '</div><div class="label">Rooms</div><div class="sub">' + (health.memoria_version || '') + '</div></div>';
+      '<div class="stat-card"><div class="value warning">' + proposalTotal + '</div><div class="label">Proposals</div><div class="sub">pending review</div></div>' +
+      '<div class="stat-card"><div class="value success">' + memCount + '</div><div class="label">Sessions</div><div class="sub"><span class="success">&check;</span> indexed</div></div>' +
+      '<div class="stat-card"><div class="value">' + roomCount + '</div><div class="label">Rooms</div><div class="sub">' + (health.memoria_version || '') + '</div></div>';
 
     const agentsEl = el('overviewAgents');
     if (agentCount === 0) {
@@ -5346,15 +5373,27 @@ async function loadOverview() {
     }
 
     const tasksEl = el('overviewTasks');
-    if (taskTotal === 0) {
-      tasksEl.innerHTML = '<div class="empty-state">No tasks</div>';
+    // Merge recent tasks + proposals into a unified feed
+    const recentTaskItems = (tasks.tasks || []).slice(-5).map(t => ({ _type: 'task', _ts: t.created_at || 0, _data: t }));
+    const recentPropItems = (props.proposals || []).slice(-3).map(p => ({ _type: 'proposal', _ts: p.proposed_at || 0, _data: p }));
+    const recentAll = [...recentTaskItems, ...recentPropItems].sort((a, b) => b._ts - a._ts).slice(0, 6);
+    if (!recentAll.length) {
+      tasksEl.innerHTML = '<div class="empty-state">No tasks or proposals</div>';
     } else {
-      const recent = tasks.tasks.slice(-5).reverse();
-      tasksEl.innerHTML = recent.map(t => '<div class="item-card">' +
-        '<div class="top">' + dot(t.status === 'completed' || t.status === 'done' ? 'active' : t.status === 'running' ? 'active' : t.status === 'failed' ? 'error' : 'pending') +
-        '<span class="title">' + esc(t.title).slice(0, 60) + '</span>' + tag(t.status, t.status === 'completed' || t.status === 'done' ? 'success' : t.status === 'running' ? 'accent' : t.status === 'failed' ? 'error' : 'warning') + '</div>' +
-        '<div class="meta"><span>&#128230; ' + esc(t.project) + '</span><span>' + ago(t.created_at) + '</span></div>' +
-        '</div>').join('');
+      tasksEl.innerHTML = recentAll.map(item => {
+        if (item._type === 'proposal') {
+          const p = item._data;
+          return '<div class="item-card item-proposal" style="padding:8px 12px">' +
+            '<div class="top"><span class="item-type-badge">&#128196; PROPOSAL</span>' + tag(p.topic, 'warning') + '<span style="font-size:12px;flex:1">' + esc(p.text || '').slice(0, 60) + '</span><span style="font-size:11px;color:var(--text-muted)">' + ago(p.proposed_at) + '</span></div>' +
+            '</div>';
+        }
+        const t = item._data;
+        return '<div class="item-card" style="padding:8px 12px">' +
+          '<div class="top">' + dot(t.status === 'completed' || t.status === 'done' ? 'active' : t.status === 'running' ? 'active' : t.status === 'failed' ? 'error' : 'pending') +
+          '<span class="title">' + esc(t.title).slice(0, 60) + '</span>' + tag(t.status, t.status === 'completed' || t.status === 'done' ? 'success' : t.status === 'running' ? 'accent' : t.status === 'failed' ? 'error' : 'warning') +
+          '<span style="font-size:11px;color:var(--text-muted)">' + ago(t.created_at) + '</span></div>' +
+          '</div>';
+      }).join('');
     }
 
     const roomsEl = el('overviewRooms');
@@ -5368,7 +5407,7 @@ async function loadOverview() {
 
     setConn(true);
     el('agentBadge').textContent = agentCount;
-    el('taskBadge').textContent = taskTotal;
+    el('taskBadge').textContent = taskTotal + (proposalTotal > 0 ? '+' + proposalTotal : '');
     el('chatBadge').textContent = roomCount;
   } catch(e) {
     setConn(false);
@@ -5459,7 +5498,7 @@ function setTaskFilter(f) {
   state.taskFilter = f;
   document.querySelectorAll('#taskFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
   const clearBtn = document.getElementById('clearProposalsBtn');
-  if (clearBtn) clearBtn.style.display = f === 'proposals' ? '' : 'none';
+  if (clearBtn) clearBtn.style.display = (f === 'proposals' && proposalsData.length > 0) ? '' : 'none';
   renderTasks();
 }
 
@@ -5469,112 +5508,153 @@ function renderTasks() {
     renderProposals();
     return;
   }
-  let list = tasksData;
+
+  // Filter tasks
+  let filteredTasks = tasksData;
   if (state.taskFilter !== 'all') {
-    list = list.filter(t => t.status === state.taskFilter
+    filteredTasks = tasksData.filter(t => t.status === state.taskFilter
       || (state.taskFilter === 'completed' && (t.status === 'done' || t.status === 'completed' || t.status === 'verified')));
   }
-  if (!list.length) {
-    container.innerHTML = '<div class="empty-state"><span class="icon">&#9776;</span>No ' + (state.taskFilter === 'all' ? '' : state.taskFilter + ' ') + 'tasks</div>';
-    return;
+
+  const taskOrder = { running: 0, in_progress: 0, pending: 1, assigned: 2, approved: 3, completed: 4, done: 4, verified: 4, failed: 5, blocked: 5, rejected: 6, dead: 7 };
+
+  // In "All" view: interleave proposals sorted by time
+  if (state.taskFilter === 'all') {
+    // Tag items for merging
+    const taskItems = filteredTasks.map(t => ({ _type: 'task', _ts: t.created_at || 0, _task: t }));
+    const propItems = proposalsData.map(p => ({ _type: 'proposal', _ts: p.proposed_at || 0, _proposal: p }));
+    const merged = [...taskItems, ...propItems].sort((a, b) => b._ts - a._ts);
+
+    if (!merged.length) {
+      container.innerHTML = '<div class="empty-state"><span class="icon">&#9776;</span>No tasks or proposals</div>';
+      return;
+    }
+
+    container.innerHTML = merged.map(item => {
+      if (item._type === 'proposal') return renderProposalCard(item._proposal);
+      return renderTaskCard(item._task);
+    }).join('');
+  } else {
+    // Filtered view: only tasks, sorted by status
+    if (!filteredTasks.length) {
+      container.innerHTML = '<div class="empty-state"><span class="icon">&#9776;</span>No ' + state.taskFilter + ' tasks</div>';
+      return;
+    }
+    filteredTasks.sort((a, b) => (taskOrder[a.status] || 9) - (taskOrder[b.status] || 9));
+    container.innerHTML = filteredTasks.map(t => renderTaskCard(t)).join('');
   }
-  const order = { running: 0, in_progress: 0, pending: 1, assigned: 2, approved: 3, completed: 4, done: 4, verified: 4, failed: 5, blocked: 5, rejected: 6, dead: 7 };
-  list.sort((a, b) => (order[a.status] || 9) - (order[b.status] || 9));
 
-  container.innerHTML = list.map(t => {
-    const statusColor = t.status === 'completed' || t.status === 'done' || t.status === 'verified' ? 'success'
-      : t.status === 'in_progress' || t.status === 'running' ? 'accent'
-      : t.status === 'failed' || t.status === 'dead' || t.status === 'blocked' ? 'error'
-      : t.status === 'rejected' ? 'error'
-      : t.status === 'approved' ? 'success'
-      : 'warning';
-    const dotColor = t.status === 'completed' || t.status === 'done' || t.status === 'verified' || t.status === 'approved' ? 'active'
-      : t.status === 'failed' || t.status === 'dead' || t.status === 'blocked' || t.status === 'rejected' ? 'error'
-      : t.status === 'in_progress' || t.status === 'running' ? 'active'
-      : 'pending';
-
-    // Action buttons based on status
-    let actions = '';
-    const tid = t.id;
-    if (t.status === 'assigned') {
-      actions = '<button class="btn btn-xs btn-success" data-action="approve" data-task-id="' + tid + '">Approve</button>' +
-        '<button class="btn btn-xs btn-error" data-action="reject" data-task-id="' + tid + '">Reject</button>';
-    } else if (t.status === 'rejected') {
-      actions = '<button class="btn btn-xs btn-success" data-action="approve" data-task-id="' + tid + '">Approve</button>' +
-        '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
-    } else if (t.status === 'failed' || t.status === 'dead' || t.status === 'blocked') {
-      actions = '<button class="btn btn-xs btn-warning" data-action="retry" data-task-id="' + tid + '">Retry</button>' +
-        '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
-    } else if (t.status === 'pending' || t.status === 'completed' || t.status === 'verified') {
-      actions = '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
-    }
-
-    // Verification info
-    let verifyHtml = '';
-    if (t.verification) {
-      const v = t.verification;
-      verifyHtml = '<div class="mt-2"><strong>&#9989; Verification:</strong> score=' + (v.score || 0).toFixed(2) +
-        ' test=' + (v.test_passed === true ? 'PASS' : v.test_passed === false ? 'FAIL' : '-') +
-        ' lint=' + (v.lint_violations != null ? v.lint_violations + ' viol.' : '-') +
-        ' by=' + esc(v.by || '?') +
-        '</div>';
-    }
-
-    return '<div class="item-card">' +
-      '<div class="top">' + dot(dotColor) + '<span class="title">' + esc(t.title) + '</span>' + tag(t.status + (t.status === 'dead' ? ' (' + (t.attempt_count || 0) + ')' : ''), statusColor) + '</div>' +
-      '<div class="meta">' +
-        '<span>&#128230; ' + esc(t.project) + '</span>' +
-        (t.assigned_to ? '<span>&#128100; ' + esc(t.assigned_to).slice(0, 20) + '</span>' : '') +
-        '<span>&#128197; ' + ago(t.created_at) + '</span>' +
-        '<span>&#128260; ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</span>' +
-      '</div>' +
-      '<div class="detail">' +
-        '<div><strong>ID:</strong> ' + esc(t.id) + '</div>' +
-        (t.description ? '<div class="mt-2"><strong>Description:</strong><pre>' + esc(t.description) + '</pre></div>' : '') +
-        (t.result ? '<div class="mt-2"><strong>Result:</strong><pre>' + esc(t.result).slice(0, 500) + '</pre></div>' : '') +
-        (t.error ? '<div class="mt-2"><strong style="color:var(--error)">Error:</strong><pre style="color:var(--error)">' + esc(t.error).slice(0, 500) + '</pre></div>' : '') +
-        (t.rollback_commit ? '<div class="mt-2"><strong>Rollback:</strong> ' + esc(t.rollback_commit).slice(0, 16) + '</div>' : '') +
-        verifyHtml +
-        '<div class="mt-2"><strong>Created:</strong> ' + fmtTime(t.created_at) + '</div>' +
-        (t.assigned_at ? '<div><strong>Assigned:</strong> ' + fmtTime(t.assigned_at) + '</div>' : '') +
-        '<div><strong>Attempts:</strong> ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</div>' +
-      '</div>' +
-      (actions ? '<div class="item-actions" style="padding:4px 12px 8px;display:flex;gap:4px">' + actions + '</div>' : '') +
-      '</div>';
-  }).join('');
   // Event delegation for task/proposal actions
   container.onclick = function(e) {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
-    const id = btn.dataset.taskId;
     const action = btn.dataset.action;
-    if (action === 'approve') approveTask(id, e);
-    else if (action === 'reject') rejectTask(id, e);
-    else if (action === 'retry') retryTask(id, e);
-    else if (action === 'delete') deleteTask(id, e);
+    if (action === 'approve') approveTask(btn.dataset.taskId, e);
+    else if (action === 'reject') rejectTask(btn.dataset.taskId, e);
+    else if (action === 'retry') retryTask(btn.dataset.taskId, e);
+    else if (action === 'delete') deleteTask(btn.dataset.taskId, e);
+    else if (action === 'accept-proposal') approveProposal(btn.dataset.proposalId, e);
+    else if (action === 'delete-proposal') deleteProposal(btn.dataset.proposalId, e);
   };
+}
+
+function renderTaskCard(t) {
+  const statusColor = t.status === 'completed' || t.status === 'done' || t.status === 'verified' ? 'success'
+    : t.status === 'in_progress' || t.status === 'running' ? 'accent'
+    : t.status === 'failed' || t.status === 'dead' || t.status === 'blocked' ? 'error'
+    : t.status === 'rejected' ? 'error'
+    : t.status === 'approved' ? 'success'
+    : 'warning';
+  const dotColor = t.status === 'completed' || t.status === 'done' || t.status === 'verified' || t.status === 'approved' ? 'active'
+    : t.status === 'failed' || t.status === 'dead' || t.status === 'blocked' || t.status === 'rejected' ? 'error'
+    : t.status === 'in_progress' || t.status === 'running' ? 'active'
+    : 'pending';
+
+  // Action buttons based on status
+  let actions = '';
+  const tid = t.id;
+  if (t.status === 'assigned') {
+    actions = '<button class="btn btn-xs btn-success" data-action="approve" data-task-id="' + tid + '">Approve</button>' +
+      '<button class="btn btn-xs btn-error" data-action="reject" data-task-id="' + tid + '">Reject</button>';
+  } else if (t.status === 'rejected') {
+    actions = '<button class="btn btn-xs btn-success" data-action="approve" data-task-id="' + tid + '">Approve</button>' +
+      '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
+  } else if (t.status === 'failed' || t.status === 'dead' || t.status === 'blocked') {
+    actions = '<button class="btn btn-xs btn-warning" data-action="retry" data-task-id="' + tid + '">Retry</button>' +
+      '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
+  } else if (t.status === 'pending' || t.status === 'completed' || t.status === 'verified') {
+    actions = '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
+  }
+
+  // Description preview
+  const descPreview = t.description ? '<div class="desc-preview">' + esc(t.description).slice(0, 150) + '</div>' : '';
+
+  // Verification info
+  let verifyHtml = '';
+  if (t.verification) {
+    const v = t.verification;
+    const scoreColor = (v.score || 0) >= 0.8 ? 'var(--success)' : (v.score || 0) >= 0.5 ? 'var(--warning)' : 'var(--error)';
+    verifyHtml = '<span>&#9989; <span style="color:' + scoreColor + '">' + (v.score || 0).toFixed(1) + '</span>' +
+      (v.test_passed === true ? ' &#10003;test' : v.test_passed === false ? ' &#10007;test' : '') +
+      (v.lint_violations != null ? ' ' + v.lint_violations + 'viol' : '') +
+      '</span>';
+  }
+
+  // Error preview inline
+  const errorHtml = t.error ? '<span style="color:var(--error)">&#9888; ' + esc(t.error).slice(0, 80) + '</span>' : '';
+
+  return '<div class="item-card" onclick="toggleDetail(this)">' +
+    '<div class="top">' + dot(dotColor) + '<span class="title">' + esc(t.title) + '</span>' + tag(t.status + (t.status === 'dead' ? ' (' + (t.attempt_count || 0) + ')' : ''), statusColor) + '</div>' +
+    descPreview +
+    '<div class="meta">' +
+      '<span>&#128230; ' + esc(t.project) + '</span>' +
+      (t.assigned_to ? '<span>&#128100; ' + esc(t.assigned_to).slice(0, 20) + '</span>' : '') +
+      '<span>&#128197; ' + ago(t.created_at) + '</span>' +
+      '<span>&#128260; ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</span>' +
+      verifyHtml +
+      errorHtml +
+    '</div>' +
+    '<div class="detail">' +
+      '<div><strong>ID:</strong> ' + esc(t.id) + '</div>' +
+      (t.description ? '<div class="mt-2"><strong>Description:</strong><pre>' + esc(t.description) + '</pre></div>' : '') +
+      (t.result ? '<div class="mt-2"><strong>Result:</strong><pre>' + esc(t.result).slice(0, 500) + '</pre></div>' : '') +
+      (t.error ? '<div class="mt-2"><strong style="color:var(--error)">Error:</strong><pre style="color:var(--error)">' + esc(t.error).slice(0, 500) + '</pre></div>' : '') +
+      (t.rollback_commit ? '<div class="mt-2"><strong>Rollback:</strong> ' + esc(t.rollback_commit).slice(0, 16) + '</div>' : '') +
+      '<div class="mt-2"><strong>Created:</strong> ' + fmtTime(t.created_at) + '</div>' +
+      (t.assigned_at ? '<div><strong>Assigned:</strong> ' + fmtTime(t.assigned_at) + '</div>' : '') +
+      '<div><strong>Attempts:</strong> ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</div>' +
+    '</div>' +
+    (actions ? '<div class="item-actions">' + actions + '</div>' : '') +
+    '</div>';
+}
+
+function renderProposalCard(p) {
+  return '<div class="item-card item-proposal">' +
+    '<div class="top">' +
+      '<span class="item-type-badge">&#128196; PROPOSAL</span>' +
+      '<span class="id">' + esc(p.id).slice(0, 30) + '</span>' +
+      tag(p.topic, 'warning') +
+      (p.source ? tag(p.source.replace('chitchat_consolidation', 'chat').replace('hippocampal_consolidation', 'hippo').replace('deep_consolidation', 'deep'), 'default') : '') +
+    '</div>' +
+    '<div class="title" style="font-size:13px;color:var(--text-secondary);font-weight:400;margin-top:2px">' + esc(p.text || '').slice(0, 250) + '</div>' +
+    '<div class="meta">' +
+      '<span>&#128368; Proposed ' + ago(p.proposed_at) + '</span>' +
+      (p.hits ? '<span>&#128073; ' + p.hits + ' hit' + (p.hits > 1 ? 's' : '') + '</span>' : '') +
+    '</div>' +
+    '<div class="item-actions">' +
+      '<button class="btn btn-xs btn-success" data-action="accept-proposal" data-proposal-id="' + p.id + '">&#10003; Accept</button>' +
+      '<button class="btn btn-xs btn-error" data-action="delete-proposal" data-proposal-id="' + p.id + '">&#10005; Delete</button>' +
+    '</div>' +
+  '</div>';
 }
 
 function renderProposals() {
   const container = el('taskList');
   if (!proposalsData.length) {
-    container.innerHTML = '<div class="empty-state"><span class="icon">&#128196;</span>No proposals</div>';
+    container.innerHTML = '<div class="empty-state"><span class="icon">&#128196;</span>No pending proposals</div>';
     return;
   }
-  container.innerHTML = proposalsData.map(p =>
-    '<div class="item-card">' +
-      '<div class="top"><span class="id">' + esc(p.id).slice(0, 30) + '</span>' + tag(p.topic, 'warning') + tag(p.source || '', 'default') + '</div>' +
-      '<div class="title">' + esc(p.text || '').slice(0, 200) + '</div>' +
-      '<div class="meta"><span>&#128368; ' + ago(p.proposed_at) + '</span></div>' +
-      '<div class="detail">' +
-        '<div class="mt-2">' + esc(p.text || '') + '</div>' +
-      '</div>' +
-      '<div class="item-actions" style="padding:4px 12px 8px;display:flex;gap:4px">' +
-        '<button class="btn btn-xs btn-success" data-action="accept-proposal" data-proposal-id="' + p.id + '">Accept</button>' +
-        '<button class="btn btn-xs btn-error" data-action="delete-proposal" data-proposal-id="' + p.id + '">Delete</button>' +
-      '</div>' +
-    '</div>'
-  ).join('');
+  container.innerHTML = proposalsData.map(p => renderProposalCard(p)).join('');
   container.onclick = function(e) {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
