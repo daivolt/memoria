@@ -5148,7 +5148,7 @@ body {
       <div class="bulk-toolbar" id="bulkToolbar">
         <input type="checkbox" class="select-check" id="selectAllCb" onchange="toggleSelectAll(this.checked)" title="Select all">
         <span class="count" id="bulkCount">0 selected</span>
-        <button class="btn btn-xs btn-success" onclick="bulkAccept()">&#10003; Accept</button>
+        <button class="btn btn-xs btn-success" id="bulkAcceptBtn" onclick="bulkAccept()">&#10003; Accept</button>
         <button class="btn btn-xs btn-warning" onclick="bulkArchive()">&#128451; Archive</button>
         <button class="btn btn-xs btn-error" onclick="bulkDelete()">&#10005; Delete</button>
         <button class="btn btn-xs" onclick="clearSelection()">Clear</button>
@@ -5732,8 +5732,12 @@ function renderAgents() {
 // ============================================
 let tasksData = [];
 let proposalsData = [];
-let selectedProposals = new Set();
+let selectedItems = new Set();
 let expandedCards = new Set();
+
+function selId(type, id) { return type + '::' + id; }
+function selType(key) { return key.split('::')[0]; }
+function selRawId(key) { return key.split('::')[1]; }
 
 async function loadTasks() {
   try {
@@ -5761,10 +5765,12 @@ function setTaskFilter(f) {
   document.querySelectorAll('#taskFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
   const clearBtn = document.getElementById('clearProposalsBtn');
   if (clearBtn) clearBtn.style.display = (f === 'proposals' && proposalsData.length > 0) ? '' : 'none';
-  // Show bulk toolbar when proposals are visible or items selected
+  // Show bulk toolbar whenever items exist in current view
   const bar = document.getElementById('bulkToolbar');
-  const proposalsVisible = (f === 'all' && proposalsData.length > 0) || f === 'proposals';
-  if (bar) bar.classList.toggle('visible', proposalsVisible || selectedProposals.size > 0);
+  const hasItems = (f === 'all' && (tasksData.length > 0 || proposalsData.length > 0))
+    || (f === 'proposals' && proposalsData.length > 0)
+    || (f !== 'all' && f !== 'proposals' && tasksData.filter(t => t.status === f || (f === 'completed' && (t.status === 'done' || t.status === 'completed' || t.status === 'verified'))).length > 0);
+  if (bar) bar.classList.toggle('visible', hasItems || selectedItems.size > 0);
   renderTasks();
 }
 
@@ -5823,7 +5829,7 @@ function renderTasks() {
     else if (action === 'accept-proposal') approveProposal(btn.dataset.proposalId, e);
     else if (action === 'delete-proposal') deleteProposal(btn.dataset.proposalId, e);
     else if (action === 'archive-proposal') archiveProposal(btn.dataset.proposalId, e);
-    else if (action === 'select-proposal') { toggleSelectProposal(btn.dataset.proposalId, btn.checked); e.stopPropagation(); }
+    else if (action === 'select-item') { toggleSelectItem(btn.dataset.itemType, btn.dataset.itemId, btn.checked); e.stopPropagation(); }
   };
   restoreExpanded();
   updateBulkToolbar();
@@ -5934,7 +5940,9 @@ function renderTaskCard(t) {
   }
 
   return '<div class="item-card">' +
-    '<div class="top" onclick="toggleDetail(this.parentElement)" style="cursor:pointer">' + dot(dotColor) + '<span class="title">' + esc(t.title) + '</span>' + tag(t.status + (t.status === 'dead' ? ' (' + (t.attempt_count || 0) + ')' : ''), statusColor) + '</div>' +
+    '<div class="top" onclick="toggleDetail(this.parentElement)" style="cursor:pointer">' +
+      '<input type="checkbox" class="select-check" data-action="select-item" data-item-type="task" data-item-id="' + esc(t.id) + '" title="Select" onclick="event.stopPropagation()">' +
+      dot(dotColor) + '<span class="title">' + esc(t.title) + '</span>' + tag(t.status + (t.status === 'dead' ? ' (' + (t.attempt_count || 0) + ')' : ''), statusColor) + '</div>' +
     descPreview +
     resultHtml +
     errorHtml +
@@ -5950,7 +5958,7 @@ function renderTaskCard(t) {
 
 function renderProposalCard(p) {
   const sourceLabel = (p.source || '').replace('chitchat_consolidation', 'chat replay').replace('hippocampal_consolidation', 'hippocampal').replace('deep_consolidation', 'deep scan');
-  const checked = selectedProposals.has(p.id) ? 'checked' : '';
+  const checked = selectedItems.has(selId('proposal', p.id)) ? 'checked' : '';
 
   // Build context blocks from p.context
   let ctxHtml = '';
@@ -6000,7 +6008,7 @@ function renderProposalCard(p) {
 
   return '<div class="item-card item-proposal">' +
     '<div class="top" onclick="toggleDetail(this.parentElement)" style="cursor:pointer">' +
-      '<input type="checkbox" class="select-check" ' + checked + ' data-action="select-proposal" data-proposal-id="' + esc(p.id) + '" title="Select for bulk action">' +
+      '<input type="checkbox" class="select-check" ' + checked + ' data-action="select-item" data-item-type="proposal" data-item-id="' + esc(p.id) + '" title="Select" onclick="event.stopPropagation()">' +
       '<span class="item-type-badge">&#128196; PROPOSAL</span>' +
       tag(p.topic, 'warning') +
       (sourceLabel ? tag(sourceLabel, 'default') : '') +
@@ -6040,7 +6048,7 @@ function renderProposals() {
     if (action === 'accept-proposal') approveProposal(id, e);
     else if (action === 'delete-proposal') deleteProposal(id, e);
     else if (action === 'archive-proposal') archiveProposal(id, e);
-    else if (action === 'select-proposal') { toggleSelectProposal(id, btn.checked); e.stopPropagation(); }
+    else if (action === 'select-item') { toggleSelectItem(btn.dataset.itemType, btn.dataset.itemId, btn.checked); e.stopPropagation(); }
   };
   updateBulkToolbar();
 }
@@ -6148,35 +6156,55 @@ async function clearProposals() {
   } catch(ex) { toast('Clear failed: ' + ex.message, 'error'); }
 }
 
-// -- Bulk Selection --
-function toggleSelectProposal(id, checked) {
-  if (checked) selectedProposals.add(id);
-  else selectedProposals.delete(id);
+// -- Bulk Selection (unified: tasks + proposals) --
+function toggleSelectItem(type, id, checked) {
+  const key = selId(type, id);
+  if (checked) selectedItems.add(key);
+  else selectedItems.delete(key);
   updateBulkToolbar();
 }
 function toggleSelectAll(checked) {
-  if (checked) proposalsData.forEach(p => selectedProposals.add(p.id));
-  else selectedProposals.clear();
+  selectedItems.clear();
+  if (checked) {
+    if (state.taskFilter === 'proposals') {
+      proposalsData.forEach(p => selectedItems.add(selId('proposal', p.id)));
+    } else {
+      const filtered = state.taskFilter === 'all' ? tasksData : tasksData.filter(t => t.status === state.taskFilter);
+      filtered.forEach(t => selectedItems.add(selId('task', t.id)));
+      if (state.taskFilter === 'all') proposalsData.forEach(p => selectedItems.add(selId('proposal', p.id)));
+    }
+  }
   updateBulkToolbar();
   renderTasks();
 }
 function clearSelection() {
-  selectedProposals.clear();
+  selectedItems.clear();
   updateBulkToolbar();
   renderTasks();
 }
 function updateBulkToolbar() {
-  const n = selectedProposals.size;
+  const n = selectedItems.size;
   const bar = document.getElementById('bulkToolbar');
   const cnt = document.getElementById('bulkCount');
   const cb = document.getElementById('selectAllCb');
-  const proposalsVisible = (state.taskFilter === 'all' && proposalsData.length > 0) || state.taskFilter === 'proposals';
-  if (bar) bar.classList.toggle('visible', n > 0 || proposalsVisible);
+  const hasProposals = [...selectedItems].some(k => selType(k) === 'proposal');
+  const visible = state.taskFilter === 'proposals'
+    || (state.taskFilter === 'all' && (tasksData.length > 0 || proposalsData.length > 0))
+    || (state.taskFilter !== 'all' && state.taskFilter !== 'proposals' && tasksData.some(t => t.status === state.taskFilter));
+  if (bar) bar.classList.toggle('visible', n > 0 || visible);
   if (cnt) cnt.textContent = n + ' selected';
-  if (cb) cb.checked = n > 0 && proposalsData.length > 0 && n === proposalsData.length;
+  // Count visible items for select-all state
+  let total = 0;
+  if (state.taskFilter === 'proposals') total = proposalsData.length;
+  else if (state.taskFilter === 'all') total = tasksData.length + proposalsData.length;
+  else total = tasksData.filter(t => t.status === state.taskFilter).length;
+  if (cb) cb.checked = n > 0 && n >= total;
+  // Hide Accept button if no proposals selected
+  const acceptBtn = document.getElementById('bulkAcceptBtn');
+  if (acceptBtn) acceptBtn.style.display = hasProposals ? '' : 'none';
 }
 async function bulkAccept() {
-  const ids = [...selectedProposals];
+  const ids = [...selectedItems].filter(k => selType(k) === 'proposal').map(selRawId);
   if (!ids.length) return;
   if (!confirm('Accept ' + ids.length + ' proposal(s)? Tasks will be created for each.')) return;
   try {
@@ -6187,42 +6215,47 @@ async function bulkAccept() {
     });
     const data = await res.json();
     toast(data.accepted + ' proposals accepted, ' + (ids.length - data.accepted) + ' failed', 'success');
-    selectedProposals.clear();
+    selectedItems.clear();
     updateBulkToolbar();
     loadTasks();
   } catch(ex) { toast('Bulk accept failed: ' + ex.message, 'error'); }
 }
 async function bulkDelete() {
-  const ids = [...selectedProposals];
-  if (!ids.length) return;
-  if (!confirm('Delete ' + ids.length + ' proposal(s)?')) return;
+  const items = [...selectedItems];
+  if (!items.length) return;
+  if (!confirm('Delete ' + items.length + ' item(s)?')) return;
   try {
-    const res = await fetch(BASE + '/proposals/delete-batch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids })
-    });
-    const data = await res.json();
-    toast(data.deleted + ' proposals deleted', 'success');
-    selectedProposals.clear();
+    const taskIds = items.filter(k => selType(k) === 'task').map(selRawId);
+    const propIds = items.filter(k => selType(k) === 'proposal').map(selRawId);
+    await Promise.all([
+      ...taskIds.map(id => fetch(BASE + '/tasks/' + encodeURIComponent(id), { method: 'DELETE' })),
+      propIds.length ? fetch(BASE + '/proposals/delete-batch', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: propIds })
+      }) : Promise.resolve(),
+    ]);
+    toast(items.length + ' item(s) deleted', 'success');
+    selectedItems.clear();
     updateBulkToolbar();
     loadTasks();
   } catch(ex) { toast('Bulk delete failed: ' + ex.message, 'error'); }
 }
 async function bulkArchive() {
-  const ids = [...selectedProposals];
-  if (!ids.length) return;
-  if (!confirm('Archive ' + ids.length + ' proposal(s)?')) return;
+  const items = [...selectedItems];
+  if (!items.length) return;
+  if (!confirm('Archive ' + items.length + ' item(s)?')) return;
   try {
-    await Promise.all(ids.map(id =>
-      fetch(BASE + '/proposals/' + encodeURIComponent(id), {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ archived: true })
-      })
-    ));
-    toast(ids.length + ' proposals archived', 'info');
-    selectedProposals.clear();
+    const taskIds = items.filter(k => selType(k) === 'task').map(selRawId);
+    const propIds = items.filter(k => selType(k) === 'proposal').map(selRawId);
+    await Promise.all([
+      ...taskIds.map(id => fetch(BASE + '/tasks/' + encodeURIComponent(id), {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ archived: true })
+      })),
+      ...propIds.map(id => fetch(BASE + '/proposals/' + encodeURIComponent(id), {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ archived: true })
+      })),
+    ]);
+    toast(items.length + ' item(s) archived', 'info');
+    selectedItems.clear();
     updateBulkToolbar();
     loadTasks();
   } catch(ex) { toast('Bulk archive failed: ' + ex.message, 'error'); }
