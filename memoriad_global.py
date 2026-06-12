@@ -1140,6 +1140,25 @@ async def _task_healer_loop():
                 failed_at = t.get("failed_at", 0)
                 if now - failed_at < TASK_HEAL_COOLDOWN:
                     continue
+                attempt_count = t.get("attempt_count") or 0
+                max_attempts = t.get("max_attempts") or 3
+                if attempt_count >= max_attempts:
+                    t["status"] = "dead"
+                    t["error"] = (
+                        f"dead: exhausted {attempt_count}/{max_attempts} attempts"
+                    )
+                    t["assigned_to"] = ""
+                    _save_task(t)
+                    await _events.broadcast(
+                        "task_dead",
+                        {
+                            "task_id": t["id"],
+                            "project": t.get("project", "unknown"),
+                            "title": t.get("title", "")[:100],
+                            "attempts": attempt_count,
+                        },
+                    )
+                    continue
                 t["status"] = "pending"
                 t["error"] = (
                     f"retry: previous agent {t.get('assigned_to', '?')} was stale"
@@ -2388,6 +2407,8 @@ async def create_task(body: CreateTask):
         "lint_command": body.lint_command,
         "rubric": body.rubric,
         "verification": None,
+        "attempt_count": 0,
+        "max_attempts": 3,
     }
     _save_task(task)
     if body.assigned_to:
@@ -2436,6 +2457,7 @@ async def update_task(task_id: str, body: UpdateTask):
             t["assigned_at"] = time.time()
             t["assigned_to"] = body.assigned_to or t.get("assigned_to", "")
             t["error"] = ""
+            t["attempt_count"] = (t.get("attempt_count") or 0) + 1
         if body.status in ("pending", "completed"):
             t["error"] = ""
     if body.assigned_to:
@@ -4774,6 +4796,7 @@ body {
             <button class="filter-btn" data-filter="running" onclick="setTaskFilter('running')">Running</button>
             <button class="filter-btn" data-filter="completed" onclick="setTaskFilter('completed')">Done</button>
             <button class="filter-btn" data-filter="failed" onclick="setTaskFilter('failed')">Failed</button>
+            <button class="filter-btn" data-filter="dead" onclick="setTaskFilter('dead')">Dead</button>
           </div>
           <button class="btn btn-sm" onclick="createTask()" style="margin-left:8px">+ New</button>
         </div>
@@ -5015,7 +5038,7 @@ function switchTab(n) {
   document.querySelector('.nav-item[data-tab="' + n + '"]')?.classList.add('active');
   document.getElementById('sidebar').classList.remove('open');
   location.hash = 'tab=' + n;
-  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, null, loadChat, loadSafety, loadSettings, loadBrainDelayed];
+  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, loadRecall, loadChat, loadSafety, loadSettings, loadBrainDelayed];
   if (loaders[n]) loaders[n]();
 }
 
@@ -5376,17 +5399,19 @@ function renderTasks() {
     container.innerHTML = '<div class="empty-state"><span class="icon">&#9776;</span>No tasks</div>';
     return;
   }
-  const order = { running: 0, pending: 1, active: 0, completed: 2, done: 2, failed: 3 };
+  const order = { running: 0, pending: 1, active: 0, completed: 2, done: 2, failed: 3, dead: 4 };
   list.sort((a, b) => (order[a.status] || 9) - (order[b.status] || 9));
 
   container.innerHTML = list.map(t => {
-    const s = t.status === 'completed' || t.status === 'done' ? 'active' : t.status === 'failed' ? 'error' : t.status === 'running' ? 'active' : 'pending';
+    const s = t.status === 'completed' || t.status === 'done' ? 'active' : t.status === 'failed' || t.status === 'dead' ? 'error' : t.status === 'running' ? 'active' : 'pending';
+    const statusColor = t.status === 'completed' || t.status === 'done' ? 'success' : t.status === 'running' ? 'accent' : t.status === 'failed' ? 'error' : t.status === 'dead' ? 'error' : 'warning';
     return '<div class="item-card" onclick="toggleDetail(this)">' +
-      '<div class="top">' + dot(s) + '<span class="title">' + esc(t.title) + '</span>' + tag(t.status, t.status === 'completed' || t.status === 'done' ? 'success' : t.status === 'running' ? 'accent' : t.status === 'failed' ? 'error' : 'warning') + '</div>' +
+      '<div class="top">' + dot(s) + '<span class="title">' + esc(t.title) + '</span>' + tag(t.status + (t.status === 'dead' ? ' (' + (t.attempt_count || 0) + ')' : ''), statusColor) + '</div>' +
       '<div class="meta">' +
         '<span>&#128230; ' + esc(t.project) + '</span>' +
         (t.assigned_to ? '<span>&#128100; ' + esc(t.assigned_to).slice(0, 20) + '</span>' : '') +
         '<span>&#128197; ' + ago(t.created_at) + '</span>' +
+        '<span>&#128260; ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + ' attempts</span>' +
       '</div>' +
       '<div class="detail">' +
         '<div><strong>ID:</strong> ' + esc(t.id) + '</div>' +
@@ -5396,6 +5421,7 @@ function renderTasks() {
         (t.rollback_commit ? '<div class="mt-2"><strong>Rollback:</strong> ' + esc(t.rollback_commit).slice(0, 16) + '</div>' : '') +
         '<div class="mt-2"><strong>Created:</strong> ' + fmtTime(t.created_at) + '</div>' +
         (t.assigned_at ? '<div><strong>Assigned:</strong> ' + fmtTime(t.assigned_at) + '</div>' : '') +
+        '<div><strong>Attempts:</strong> ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</div>' +
       '</div>' +
       '</div>';
   }).join('');
@@ -5469,6 +5495,31 @@ async function getProjects() {
 // ============================================
 // TAB 4: RECALL
 // ============================================
+async function loadRecall() {
+  try {
+    const data = await api('/recall?q=&limit=20');
+    const results = data.results || [];
+    const container = el('recallResults');
+    el('recallBadge').textContent = results.length;
+    if (!results.length) {
+      container.innerHTML = '<div class="empty-state"><span class="icon">&#9672;</span>No recent entries</div>';
+    } else {
+      container.innerHTML = '<div class="text-sm text-muted mb-2">' + results.length + ' recent entries</div>' +
+        '<div class="item-list">' +
+        results.map(r => '<div class="item-card">' +
+          '<div class="top">' + tag(r.source || r.project || 'memoria', 'accent') + (r.room ? tag('# ' + r.room, 'default') : '') + (r.from ? tag(r.from, 'success') : '') + '</div>' +
+          '<div class="title">' + esc(r.title || r.id || 'Entry') + '</div>' +
+          (r.summary ? '<div class="text-sm text-secondary mt-2">' + esc(r.summary).slice(0, 300) + '</div>' : '') +
+          (r.text ? '<div class="text-sm text-secondary mt-2">' + esc(r.text).slice(0, 300) + '</div>' : '') +
+          '<div class="meta"><span>&#128368; ' + ago(r.ts) + '</span></div>' +
+          '</div>').join('') +
+        '</div>';
+    }
+  } catch(e) {
+    el('recallResults').innerHTML = '<div class="empty-state error">Failed to load recall</div>';
+  }
+}
+
 async function doRecall() {
   const q = el('recallInput').value.trim();
   if (!q) return;
@@ -6380,6 +6431,7 @@ setInterval(() => {
   else if (state.tab === 1) loadAgents();
   else if (state.tab === 2) loadTasks();
   else if (state.tab === 3) loadMemory();
+  else if (state.tab === 4) loadRecall();
   else if (state.tab === 5) { loadChat(); loadRateLimit(); }
   else if (state.tab === 6) loadSafety();
   else if (state.tab === 7) { loadSettings(); }
