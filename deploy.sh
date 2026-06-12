@@ -23,7 +23,7 @@ if [ "${1:-}" = "--force" ]; then
   :
 else
   sleep 3  # let services stabilize
-  if ! bash "$MEMORIA_DIR/ci_check.sh" 2>/dev/null >/dev/null; then
+  if ! bash "$MEMORIA_DIR/ci_check.sh"; then
     ERR="${ERR}  ci_check.sh FAILED\n"
   fi
 fi
