@@ -5148,8 +5148,9 @@ body {
       <div class="bulk-toolbar" id="bulkToolbar">
         <input type="checkbox" class="select-check" id="selectAllCb" onchange="toggleSelectAll(this.checked)" title="Select all">
         <span class="count" id="bulkCount">0 selected</span>
-        <button class="btn btn-xs btn-success" onclick="bulkAccept()">&#10003; Accept Selected</button>
-        <button class="btn btn-xs btn-error" onclick="bulkDelete()">&#10005; Delete Selected</button>
+        <button class="btn btn-xs btn-success" onclick="bulkAccept()">&#10003; Accept</button>
+        <button class="btn btn-xs btn-warning" onclick="bulkArchive()">&#128451; Archive</button>
+        <button class="btn btn-xs btn-error" onclick="bulkDelete()">&#10005; Delete</button>
         <button class="btn btn-xs" onclick="clearSelection()">Clear</button>
       </div>
       <div class="item-list" id="taskList"></div>
@@ -5760,9 +5761,10 @@ function setTaskFilter(f) {
   document.querySelectorAll('#taskFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
   const clearBtn = document.getElementById('clearProposalsBtn');
   if (clearBtn) clearBtn.style.display = (f === 'proposals' && proposalsData.length > 0) ? '' : 'none';
-  // Show bulk toolbar when proposals filter active or items selected
+  // Show bulk toolbar when proposals are visible or items selected
   const bar = document.getElementById('bulkToolbar');
-  if (bar) bar.classList.toggle('visible', f === 'proposals' || selectedProposals.size > 0);
+  const proposalsVisible = (f === 'all' && proposalsData.length > 0) || f === 'proposals';
+  if (bar) bar.classList.toggle('visible', proposalsVisible || selectedProposals.size > 0);
   renderTasks();
 }
 
@@ -5821,8 +5823,10 @@ function renderTasks() {
     else if (action === 'accept-proposal') approveProposal(btn.dataset.proposalId, e);
     else if (action === 'delete-proposal') deleteProposal(btn.dataset.proposalId, e);
     else if (action === 'archive-proposal') archiveProposal(btn.dataset.proposalId, e);
+    else if (action === 'select-proposal') { toggleSelectProposal(btn.dataset.proposalId, btn.checked); e.stopPropagation(); }
   };
   restoreExpanded();
+  updateBulkToolbar();
 }
 
 function renderTaskCard(t) {
@@ -6202,6 +6206,24 @@ async function bulkDelete() {
     updateBulkToolbar();
     loadTasks();
   } catch(ex) { toast('Bulk delete failed: ' + ex.message, 'error'); }
+}
+async function bulkArchive() {
+  const ids = [...selectedProposals];
+  if (!ids.length) return;
+  if (!confirm('Archive ' + ids.length + ' proposal(s)?')) return;
+  try {
+    await Promise.all(ids.map(id =>
+      fetch(BASE + '/proposals/' + encodeURIComponent(id), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ archived: true })
+      })
+    ));
+    toast(ids.length + ' proposals archived', 'info');
+    selectedProposals.clear();
+    updateBulkToolbar();
+    loadTasks();
+  } catch(ex) { toast('Bulk archive failed: ' + ex.message, 'error'); }
 }
 
 async function toggleAutoApprove(enabled) {
