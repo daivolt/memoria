@@ -5495,17 +5495,18 @@ function renderTasks() {
 
     // Action buttons based on status
     let actions = '';
+    const tid = t.id;
     if (t.status === 'assigned') {
-      actions = '<button class="btn btn-xs btn-success" onclick="approveTask(\\'' + t.id + '\\',event)">Approve</button>' +
-        '<button class="btn btn-xs btn-error" onclick="rejectTask(\\'' + t.id + '\\',event)">Reject</button>';
+      actions = '<button class="btn btn-xs btn-success" data-action="approve" data-task-id="' + tid + '">Approve</button>' +
+        '<button class="btn btn-xs btn-error" data-action="reject" data-task-id="' + tid + '">Reject</button>';
     } else if (t.status === 'rejected') {
-      actions = '<button class="btn btn-xs btn-success" onclick="approveTask(\\'' + t.id + '\\',event)">Approve</button>' +
-        '<button class="btn btn-xs btn-error" onclick="deleteTask(\\'' + t.id + '\\',event)">Delete</button>';
+      actions = '<button class="btn btn-xs btn-success" data-action="approve" data-task-id="' + tid + '">Approve</button>' +
+        '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
     } else if (t.status === 'failed' || t.status === 'dead' || t.status === 'blocked') {
-      actions = '<button class="btn btn-xs btn-warning" onclick="retryTask(\\'' + t.id + '\\',event)">Retry</button>' +
-        '<button class="btn btn-xs btn-error" onclick="deleteTask(\\'' + t.id + '\\',event)">Delete</button>';
+      actions = '<button class="btn btn-xs btn-warning" data-action="retry" data-task-id="' + tid + '">Retry</button>' +
+        '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
     } else if (t.status === 'pending' || t.status === 'completed' || t.status === 'verified') {
-      actions = '<button class="btn btn-xs btn-error" onclick="deleteTask(\\'' + t.id + '\\',event)">Delete</button>';
+      actions = '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
     }
 
     // Verification info
@@ -5541,6 +5542,17 @@ function renderTasks() {
       (actions ? '<div class="item-actions" style="padding:4px 12px 8px;display:flex;gap:4px">' + actions + '</div>' : '') +
       '</div>';
   }).join('');
+  // Event delegation for task/proposal actions
+  container.onclick = function(e) {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const id = btn.dataset.taskId;
+    const action = btn.dataset.action;
+    if (action === 'approve') approveTask(id, e);
+    else if (action === 'reject') rejectTask(id, e);
+    else if (action === 'retry') retryTask(id, e);
+    else if (action === 'delete') deleteTask(id, e);
+  };
 }
 
 function renderProposals() {
@@ -5558,11 +5570,19 @@ function renderProposals() {
         '<div class="mt-2">' + esc(p.text || '') + '</div>' +
       '</div>' +
       '<div class="item-actions" style="padding:4px 12px 8px;display:flex;gap:4px">' +
-        '<button class="btn btn-xs btn-success" onclick="approveProposal(\\'' + p.id + '\\',event)">Accept</button>' +
-        '<button class="btn btn-xs btn-error" onclick="deleteProposal(\\'' + p.id + '\\',event)">Delete</button>' +
+        '<button class="btn btn-xs btn-success" data-action="accept-proposal" data-proposal-id="' + p.id + '">Accept</button>' +
+        '<button class="btn btn-xs btn-error" data-action="delete-proposal" data-proposal-id="' + p.id + '">Delete</button>' +
       '</div>' +
     '</div>'
   ).join('');
+  container.onclick = function(e) {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const id = btn.dataset.proposalId;
+    const action = btn.dataset.action;
+    if (action === 'accept-proposal') approveProposal(id, e);
+    else if (action === 'delete-proposal') deleteProposal(id, e);
+  };
 }
 
 // -- Task Actions --
@@ -5766,7 +5786,6 @@ async function loadRecall() {
     const data = await api('/recall?q=&limit=20');
     const results = data.results || [];
     const container = el('recallResults');
-    el('recallBadge').textContent = results.length;
     if (!results.length) {
       container.innerHTML = '<div class="empty-state"><span class="icon">&#9672;</span>No recent entries</div>';
     } else {
