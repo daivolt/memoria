@@ -3659,8 +3659,11 @@ async def post_activity(body: ActivityBody):
 
 
 @app.get("/activity")
-async def get_activity(limit: int = 50):
-    items = list(_activities)[-limit:]
+async def get_activity(limit: int = 50, room: Optional[str] = None):
+    items = list(_activities)
+    if room:
+        items = [a for a in items if a.get("room", "") == room]
+    items = items[-limit:]
     return {"activities": items, "count": len(items)}
 
 
@@ -4393,10 +4396,10 @@ body {
   gap: 4px;
   overflow-y: auto;
 }
-.chat-rooms-nav { border-top: 1px solid var(--border); margin-top: auto; padding-top: 4px; flex-shrink: 0; }
-.chat-rooms-nav .nav-item { padding: 6px 12px; font-size: 12px; border-left: 2px solid transparent; }
-.chat-rooms-nav .nav-item:hover { background: var(--bg-hover); }
-.chat-rooms-nav .nav-item.active { background: var(--accent-glow); border-left-color: var(--accent); }
+.chat-panels { border-top: 1px solid var(--border); margin-top: 4px; padding: 4px 8px; flex-shrink: 0; }
+.chat-panel { margin-bottom: 6px; }
+.chat-panel-title { font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em; color: rgba(108,92,231,0.6); margin-bottom: 3px; }
+.chat-panel-body { font-size: 10px; font-family: var(--mono); color: rgba(148,163,184,0.7); display: flex; flex-direction: column; gap: 2px; max-height: 100px; overflow-y: auto; }
 .chat-room {
   padding: 8px 12px;
   border-radius: var(--radius-xs);
@@ -4733,7 +4736,7 @@ body {
   .stats-grid { grid-template-columns: 1fr 1fr; }
   .chat-layout { flex-direction: column; }
   .chat-rooms { width: 100%; flex-direction: row; overflow-x: auto; }
-  .chat-rooms-nav { display: none; }
+  .chat-panels { display: none; }
   .settings-grid { grid-template-columns: 1fr; }
   .search-overlay { width: calc(100% - 40px); right: 20px; }
 }
@@ -4945,17 +4948,19 @@ body {
       <div class="chat-layout">
         <div class="chat-rooms">
           <div id="chatRoomList"></div>
-          <div class="chat-rooms-nav">
-            <div class="sidebar-label" style="padding:8px 12px 4px;font-size:9px;">Navigate</div>
-            <div class="nav-item" data-tab="0" onclick="switchTab(0)"><span class="icon">◉</span> Overview</div>
-            <div class="nav-item" data-tab="1" onclick="switchTab(1)"><span class="icon">●</span> Agents</div>
-            <div class="nav-item" data-tab="2" onclick="switchTab(2)"><span class="icon">☰</span> Tasks</div>
-            <div class="nav-item" data-tab="3" onclick="switchTab(3)"><span class="icon">◈</span> Memory</div>
-            <div class="nav-item" data-tab="4" onclick="switchTab(4)"><span class="icon">◎</span> Recall</div>
-            <div class="nav-item" data-tab="6" onclick="switchTab(6)"><span class="icon">🛡</span> Safety</div>
-            <div class="nav-item" data-tab="7" onclick="switchTab(7)"><span class="icon">⚙</span> Settings</div>
-            <div class="nav-item" data-tab="8" onclick="switchTab(8)"><span class="icon">🧠</span> Brain</div>
-            <div style="border-top:1px solid var(--border);margin:4px 12px;padding-top:4px;"></div>
+          <div class="chat-panels">
+            <div class="chat-panel">
+              <div class="chat-panel-title">Signals</div>
+              <div id="chatSignals" class="chat-panel-body"></div>
+            </div>
+            <div class="chat-panel">
+              <div class="chat-panel-title">Activity</div>
+              <div id="chatActivity" class="chat-panel-body"></div>
+            </div>
+            <div class="chat-panel">
+              <div class="chat-panel-title">Monitor</div>
+              <div id="chatMonitor" class="chat-panel-body"></div>
+            </div>
           </div>
         </div>
         <div class="chat-main">
@@ -5832,6 +5837,7 @@ async function loadChat() {
     };
     setConn(true);
     loadChatMessages();
+    updateChatPanels(state.chatRoom);
   } catch(e) {
     setConn(false);
     el('chatRoomList').innerHTML = '<div class="text-muted text-sm" style="padding:8px">Error loading rooms</div>';
@@ -5841,6 +5847,42 @@ async function loadChat() {
 function switchChatRoom(room) {
   state.chatRoom = room;
   loadChat();
+}
+
+async function updateChatPanels(room) {
+  try {
+    const [actRes, monRes] = await Promise.all([
+      api('/activity?room=' + encodeURIComponent(room) + '&limit=10'),
+      api('/monitor'),
+    ]);
+    // Activity panel
+    const acts = actRes.activities || [];
+    const actEl = document.getElementById('chatActivity');
+    if (actEl) {
+      actEl.innerHTML = acts.length
+        ? acts.slice().reverse().map(a =>
+            '<span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
+            esc((a.agent || '?').slice(0, 10)) + ' ' +
+            esc((a.detail || '').slice(0, 40)) +
+            '</span>'
+          ).join('')
+        : '<span style="color:rgba(148,163,184,0.4)">No activity</span>';
+    }
+    // Monitor panel
+    const ags = monRes.agents || [];
+    const monEl = document.getElementById('chatMonitor');
+    if (monEl) {
+      monEl.innerHTML = ags.length
+        ? ags.map(a =>
+            '<span>' +
+            esc(a.name.slice(0, 10)) + ' ' +
+            a.cpu.toFixed(1) + '% ' +
+            a.rss_mb + 'MB' +
+            '</span>'
+          ).join('')
+        : '<span style="color:rgba(148,163,184,0.4)">No agents</span>';
+    }
+  } catch(e) { /* panels are best-effort */ }
 }
 
 function renderMarkdown(text) {
