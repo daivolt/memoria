@@ -56,21 +56,30 @@ if [ -n "$ERR" ]; then echo; echo -e "$ERR"; fail; else pass; fi
 
 next "Dashboard JS bugs"
 HTML=$(curl -s "http://localhost:$MEMORIA_PORT/" 2>/dev/null || echo "")
-if [ -z "$HTML" ]; then
-  echo "(memoria down, skipping)"
-  pass
-else
-  echo "(memoria at localhost:$MEMORIA_PORT)"
-  ISSUES=""
-  if [ "$(echo "$HTML" | grep -c 'let brainTaskData')" -ne 1 ]; then
-    ISSUES="$ISSUES  duplicate let brainTaskData ($(echo "$HTML" | grep -c 'let brainTaskData') occurrences)\n"
-  fi
-  if echo "$HTML" | grep -q 'drawBrainFrame'; then
-    ISSUES="$ISSUES  dead drawBrainFrame code\n"
-  fi
-  if ! echo "$HTML" | grep -q 'AbortController'; then
-    ISSUES="$ISSUES  api() missing timeout — AbortController\n"
-  fi
+  # Retry HTML fetch up to 3 times (server may be slow)
+  for _ in 1 2 3; do
+    HTML=$(curl -s "http://localhost:$MEMORIA_PORT/" 2>/dev/null || echo "")
+    [ -n "$HTML" ] && break
+    sleep 2
+  done
+  if [ -z "$HTML" ]; then
+    echo "(memoria down, skipping)"
+    pass
+  else
+    echo "(memoria at localhost:$MEMORIA_PORT)"
+    ISSUES=""
+    if [ "$(printf '%s' "$HTML" | grep -c 'let brainTaskData')" -ne 1 ]; then
+      ISSUES="$ISSUES  duplicate let brainTaskData ($(printf '%s' "$HTML" | grep -c 'let brainTaskData') occurrences)\n"
+    fi
+    if printf '%s' "$HTML" | grep -q 'drawBrainFrame'; then
+      ISSUES="$ISSUES  dead drawBrainFrame code\n"
+    fi
+    if ! printf '%s' "$HTML" | grep -q 'let s = esc(text)'; then
+      ISSUES="$ISSUES  renderMarkdown missing esc()\n"
+    fi
+    if [ "$(printf '%s' "$HTML" | grep -c 'AbortController')" -eq 0 ]; then
+      ISSUES="$ISSUES  api() missing timeout — AbortController\n"
+    fi
   if printf '%s' "$HTML" | grep -q 'drawBrainFrame'; then
     ISSUES="$ISSUES  dead drawBrainFrame code\n"
   fi
@@ -78,9 +87,9 @@ else
     ISSUES="$ISSUES  renderMarkdown missing esc()\n"
   fi
   if [ "$(printf '%s' "$HTML" | grep -c 'AbortController')" -eq 0 ]; then
-    ISSUES="$ISSUES  api() missing timeout — AbortController\n"
-  fi
-  # JS syntax validation via node --check
+      ISSUES="$ISSUES  api() missing timeout — AbortController\n"
+    fi
+    # JS syntax validation via node --check
   JS_TMP=$(mktemp /tmp/memoria_js_XXXX.js)
   printf '%s' "$HTML" | python3 -c "
 import sys, re
