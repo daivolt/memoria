@@ -8,7 +8,7 @@ Type=simple
 ExecStart=/bin/bash /home/daivolt/conf/chitchat/researcher.sh
 Restart=on-failure
 RestartSec=5
-ReadWritePaths=/mnt/external-drive/code/memoria /home/daivolt/conf/chitchat
+ReadWritePaths=/mnt/external-drive/code /home/daivolt/conf/chitchat
 Environment=CHITCHAT_HOST=localhost
 Environment=MEMORIA_URL=http://localhost:19998
 

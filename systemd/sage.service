@@ -8,7 +8,7 @@ Type=simple
 ExecStart=/usr/bin/python3 /home/daivolt/conf/chitchat/sage.py
 Restart=on-failure
 RestartSec=5
-ReadWritePaths=/mnt/external-drive/code/memoria /home/daivolt/conf/chitchat
+ReadWritePaths=/mnt/external-drive/code /home/daivolt/conf/chitchat
 Environment=HOME=/home/daivolt
 Environment=CHITCHAT_HOST=localhost
 Environment=CHITCHAT_PORT=19999

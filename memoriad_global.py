@@ -3530,57 +3530,37 @@ async def set_rate_limit(body: RateLimitUpdate):
     return {"seconds": v}
 
 
-SIDEPANE_DIR = Path(__file__).parent / "sidepane"
+CODE_ROOT = Path("/mnt/external-drive/code")
 
 
-@app.get("/sidepane/files")
-async def list_sidepane_files():
+def _project_dir(room: str) -> Path:
+    d = CODE_ROOT / room
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+@app.get("/project/{room}/files")
+async def list_project_files(room: str):
+    pdir = _project_dir(room)
     files = []
-    for f in sorted(SIDEPANE_DIR.rglob("*")):
-        if f.is_file() and not f.name.startswith(".") and ".git" not in f.parts:
-            rel = f.relative_to(SIDEPANE_DIR)
-            files.append({"path": str(rel), "size": f.stat().st_size})
-    return {"files": files, "count": len(files)}
-
-
-class FileWriteRequest(BaseModel):
-    path: str
-    content: str
-
-
-@app.post("/sidepane/files")
-async def write_sidepane_file(body: FileWriteRequest):
-    full_path = SIDEPANE_DIR / body.path
-    if not str(full_path).startswith(str(SIDEPANE_DIR.resolve())):
-        raise HTTPException(403, "path outside sidepane directory")
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    full_path.write_text(body.content)
-    return {"path": body.path, "written": True}
-
-
-PROJECT_DIR = Path(__file__).parent
-
-
-@app.get("/project/files")
-async def list_project_files():
-    files = []
-    for f in sorted(PROJECT_DIR.rglob("*")):
+    for f in sorted(pdir.rglob("*")):
         if (
             f.is_file()
-            and not any(p.startswith(".") for p in f.parts)
+            and not any(x.startswith(".") for x in f.parts)
             and "node_modules" not in f.parts
             and "__pycache__" not in f.parts
             and ".git" not in f.parts
         ):
-            rel = f.relative_to(PROJECT_DIR)
+            rel = f.relative_to(pdir)
             files.append({"path": str(rel), "size": f.stat().st_size})
     return {"files": files, "count": len(files)}
 
 
-@app.get("/project/files/{path:path}")
-async def read_project_file(path: str):
-    full_path = (PROJECT_DIR / path).resolve()
-    if not str(full_path).startswith(str(PROJECT_DIR.resolve())):
+@app.get("/project/{room}/files/{path:path}")
+async def read_project_file(room: str, path: str):
+    pdir = _project_dir(room)
+    full_path = (pdir / path).resolve()
+    if not str(full_path).startswith(str(pdir.resolve())):
         raise HTTPException(403, "path outside project")
     if not full_path.exists() or not full_path.is_file():
         raise HTTPException(404, "file not found")
@@ -3590,32 +3570,34 @@ async def read_project_file(path: str):
         text = full_path.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         raise HTTPException(500, f"read failed: {e}")
-    return {"path": path, "content": text, "size": len(text)}
+    return {"path": path, "content": text, "size": len(text), "room": room}
 
 
 class FileProjectWrite(BaseModel):
     content: str
 
 
-@app.post("/project/files/{path:path}")
-async def write_project_file(path: str, body: FileProjectWrite):
-    full_path = (PROJECT_DIR / path).resolve()
-    if not str(full_path).startswith(str(PROJECT_DIR.resolve())):
+@app.post("/project/{room}/files/{path:path}")
+async def write_project_file(room: str, path: str, body: FileProjectWrite):
+    pdir = _project_dir(room)
+    full_path = (pdir / path).resolve()
+    if not str(full_path).startswith(str(pdir.resolve())):
         raise HTTPException(403, "path outside project")
     full_path.parent.mkdir(parents=True, exist_ok=True)
     full_path.write_text(body.content, encoding="utf-8")
-    return {"path": path, "written": True, "size": len(body.content)}
+    return {"path": path, "written": True, "size": len(body.content), "room": room}
 
 
-@app.delete("/project/files/{path:path}")
-async def delete_project_file(path: str):
-    full_path = (PROJECT_DIR / path).resolve()
-    if not str(full_path).startswith(str(PROJECT_DIR.resolve())):
+@app.delete("/project/{room}/files/{path:path}")
+async def delete_project_file(room: str, path: str):
+    pdir = _project_dir(room)
+    full_path = (pdir / path).resolve()
+    if not str(full_path).startswith(str(pdir.resolve())):
         raise HTTPException(403, "path outside project")
     if not full_path.exists():
         raise HTTPException(404, "file not found")
     full_path.unlink()
-    return {"path": path, "deleted": True}
+    return {"path": path, "deleted": True, "room": room}
 
 
 class ChitchatPause(BaseModel):
