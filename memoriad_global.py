@@ -5677,17 +5677,17 @@ function renderTaskCard(t) {
   }
   if (t.verification) {
     const v = t.verification;
-    let vdetail = 'Score: ' + (v.score != null ? v.score : 'N/A') + '\n';
-    vdetail += 'Test passed: ' + (v.test_passed != null ? v.test_passed : 'N/A') + '\n';
-    vdetail += 'Lint violations: ' + (v.lint_violations != null ? v.lint_violations : 'N/A') + '\n';
-    vdetail += 'Rubric score: ' + (v.rubric_score != null ? v.rubric_score : 'N/A') + '\n';
-    vdetail += 'Verified by: ' + (v.by || 'N/A') + '\n';
-    vdetail += 'Verified at: ' + fmtTime(v.verified_at) + '\n';
+    let vdetail = 'Score: ' + (v.score != null ? v.score : 'N/A') + '\\n';
+    vdetail += 'Test passed: ' + (v.test_passed != null ? v.test_passed : 'N/A') + '\\n';
+    vdetail += 'Lint violations: ' + (v.lint_violations != null ? v.lint_violations : 'N/A') + '\\n';
+    vdetail += 'Rubric score: ' + (v.rubric_score != null ? v.rubric_score : 'N/A') + '\\n';
+    vdetail += 'Verified by: ' + (v.by || 'N/A') + '\\n';
+    vdetail += 'Verified at: ' + fmtTime(v.verified_at) + '\\n';
     if (v.rubric_detail && v.rubric_detail.length) {
-      vdetail += 'Rubric detail:\n' + v.rubric_detail.map(r => '  - ' + JSON.stringify(r)).join('\n') + '\n';
+      vdetail += 'Rubric detail:\\n' + v.rubric_detail.map(r => '  - ' + JSON.stringify(r)).join('\\n') + '\\n';
     }
     if (v.log) {
-      vdetail += '\n--- Verification Log ---\n' + v.log;
+      vdetail += '\\n--- Verification Log ---\\n' + v.log;
     }
     detail += '<div class="detail-row"><div class="detail-label">Verification Detail</div><pre>' + esc(vdetail) + '</pre></div>';
   }
