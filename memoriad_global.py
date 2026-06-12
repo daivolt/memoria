@@ -5927,7 +5927,7 @@ function renderProposalCard(p) {
 
   return '<div class="item-card item-proposal">' +
     '<div class="top" onclick="toggleDetail(this.parentElement)" style="cursor:pointer">' +
-      '<input type="checkbox" class="select-check" ' + checked + ' onclick="event.stopPropagation(); toggleSelectProposal(\'' + esc(p.id) + '\', this.checked)" title="Select for bulk action">' +
+      '<input type="checkbox" class="select-check" ' + checked + ' data-action="select-proposal" data-proposal-id="' + esc(p.id) + '" title="Select for bulk action">' +
       '<span class="item-type-badge">&#128196; PROPOSAL</span>' +
       tag(p.topic, 'warning') +
       (sourceLabel ? tag(sourceLabel, 'default') : '') +
@@ -5964,6 +5964,7 @@ function renderProposals() {
     const action = btn.dataset.action;
     if (action === 'accept-proposal') approveProposal(id, e);
     else if (action === 'delete-proposal') deleteProposal(id, e);
+    else if (action === 'select-proposal') { toggleSelectProposal(id, btn.checked); e.stopPropagation(); }
   };
 }
 
