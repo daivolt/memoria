@@ -5569,7 +5569,11 @@ function renderProposals() {
 async function approveTask(id, e) {
   if (e) e.stopPropagation();
   try {
-    await api('/tasks/' + id, { method: 'PATCH', body: JSON.stringify({ status: 'approved' }) });
+    await fetch(BASE + '/tasks/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'approved' })
+    });
     toast('Task approved, agent notified', 'success');
     loadTasks();
   } catch(ex) { toast('Approve failed: ' + ex.message, 'error'); }
@@ -5578,7 +5582,11 @@ async function approveTask(id, e) {
 async function rejectTask(id, e) {
   if (e) e.stopPropagation();
   try {
-    await api('/tasks/' + id, { method: 'PATCH', body: JSON.stringify({ status: 'rejected' }) });
+    await fetch(BASE + '/tasks/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'rejected' })
+    });
     toast('Task rejected', 'warning');
     loadTasks();
   } catch(ex) { toast('Reject failed: ' + ex.message, 'error'); }
@@ -5587,7 +5595,11 @@ async function rejectTask(id, e) {
 async function retryTask(id, e) {
   if (e) e.stopPropagation();
   try {
-    await api('/tasks/' + id, { method: 'PATCH', body: JSON.stringify({ status: 'pending', error: '' }) });
+    await fetch(BASE + '/tasks/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'pending', error: '' })
+    });
     toast('Task retried, moved to pending', 'success');
     loadTasks();
   } catch(ex) { toast('Retry failed: ' + ex.message, 'error'); }
@@ -5851,10 +5863,20 @@ function switchChatRoom(room) {
 
 async function updateChatPanels(room) {
   try {
-    const [actRes, monRes] = await Promise.all([
+    const [actRes, monRes, cortexRes] = await Promise.all([
       api('/activity?room=' + encodeURIComponent(room) + '&limit=10'),
       api('/monitor'),
+      api('/cortex/status').catch(() => ({ cortex: {} })),
     ]);
+    const cortex = cortexRes.cortex || {};
+    // Signals panel
+    const sigEl = document.getElementById('chatSignals');
+    if (sigEl) {
+      sigEl.innerHTML =
+        '<span>&#9632; Q: <b>' + (cortex.q_table_size || 0) + '</b></span>' +
+        '<span>&#9632; Episodes: <b>' + (cortex.episodes || 0) + '</b></span>' +
+        '<span>&#9632; WM depth: <b>' + (cortex.wm_stack_depth || 0) + '</b></span>';
+    }
     // Activity panel
     const acts = actRes.activities || [];
     const actEl = document.getElementById('chatActivity');

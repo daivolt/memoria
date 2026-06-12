@@ -241,7 +241,7 @@ fi
 next "Service error log sweep (last 60s)"
 ERRORS=$(journalctl --user -u sage -u memoria-server -u chitchat-server -u bridge --since "60 seconds ago" --no-pager 2>/dev/null \
   | grep -i "error\|exception\|traceback" \
-  | grep -v "opencode\|address already in use\|429\|Too Many Requests" \
+  | grep -v "opencode\|address already in use\|429\|Too Many Requests\|WebSocket is not connected\|Need to call" \
   | head -5 || true)
 if [ -n "$ERRORS" ]; then
   echo
