@@ -1900,7 +1900,33 @@ async def accept_proposal(pid: str):
             )
         except Exception:
             pass
-    return {"ok": True, "moved_to": accepted["topic"]}
+    # Auto-create a task from accepted proposal
+    task_id = f"task_{uuid.uuid4().hex[:12]}"
+    task = {
+        "id": task_id,
+        "project": accepted.get("topic", "general")[:50],
+        "title": accepted["text"][:100],
+        "description": accepted["text"],
+        "status": "pending",
+        "assigned_to": "",
+        "depends_on": [],
+        "created_at": time.time(),
+        "assigned_at": None,
+        "result": "",
+        "error": "",
+        "rollback_commit": "",
+        "test_command": "",
+        "lint_command": "",
+        "rubric": [],
+        "verification": None,
+        "attempt_count": 0,
+        "max_attempts": 3,
+    }
+    _save_task(task)
+    _notify_chitchat(
+        f"task created from proposal: {task['title'][:100]} on '{task['project']}'"
+    )
+    return {"ok": True, "moved_to": accepted["topic"], "task_id": task_id}
 
 
 @app.delete("/proposals/{pid}")
@@ -2463,8 +2489,15 @@ async def update_task(task_id: str, body: UpdateTask):
             t["assigned_to"] = body.assigned_to or t.get("assigned_to", "")
             t["error"] = ""
             t["attempt_count"] = (t.get("attempt_count") or 0) + 1
+            _notify_chitchat(f"@{t['assigned_to']} task assigned: {t['title'][:100]}")
+        if body.status == "approved":
+            _notify_chitchat(
+                f"@{t.get('assigned_to', '?')} task approved: {t['title'][:100]}"
+            )
         if body.status in ("pending", "completed"):
             t["error"] = ""
+        if body.status == "rejected":
+            t["error"] = "rejected by gatekeeper"
     if body.assigned_to:
         t["assigned_to"] = body.assigned_to
         t["assigned_at"] = time.time()
@@ -2829,6 +2862,12 @@ async def _cortex_auction_loop():
                                 "winner": assignment,
                             },
                         )
+                        if _load_auto_approve():
+                            task["status"] = "approved"
+                            _save_task(task)
+                            _notify_chitchat(
+                                f"@{task['assigned_to']} task auto-approved: {task['title'][:100]}"
+                            )
         except Exception:
             pass
         await asyncio.sleep(15)
@@ -3555,6 +3594,35 @@ async def set_rate_limit(body: RateLimitUpdate):
     v = max(0.1, min(60.0, body.seconds))
     _save_rate_limit(v)
     return {"seconds": v}
+
+
+AUTO_APPROVE_FILE = CHITCHAT_DIR / "auto_approve.json"
+
+
+def _load_auto_approve() -> bool:
+    try:
+        return json.loads(AUTO_APPROVE_FILE.read_text()).get("enabled", False)
+    except Exception:
+        return False
+
+
+def _save_auto_approve(enabled: bool):
+    AUTO_APPROVE_FILE.write_text(json.dumps({"enabled": enabled}))
+
+
+class AutoApproveUpdate(BaseModel):
+    enabled: bool
+
+
+@app.get("/config/auto_approve")
+async def get_auto_approve():
+    return {"enabled": _load_auto_approve()}
+
+
+@app.post("/config/auto_approve")
+async def set_auto_approve(body: AutoApproveUpdate):
+    _save_auto_approve(body.enabled)
+    return {"enabled": body.enabled}
 
 
 _activities: deque = deque(maxlen=200)
@@ -4323,7 +4391,12 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  overflow-y: auto;
 }
+.chat-rooms-nav { border-top: 1px solid var(--border); margin-top: auto; padding-top: 4px; flex-shrink: 0; }
+.chat-rooms-nav .nav-item { padding: 6px 12px; font-size: 12px; border-left: 2px solid transparent; }
+.chat-rooms-nav .nav-item:hover { background: var(--bg-hover); }
+.chat-rooms-nav .nav-item.active { background: var(--accent-glow); border-left-color: var(--accent); }
 .chat-room {
   padding: 8px 12px;
   border-radius: var(--radius-xs);
@@ -4479,6 +4552,8 @@ body {
 .btn-warning { background: var(--warning); color: #1a1a2e; border-color: var(--warning); }
 .btn-error { background: var(--error); color: #fff; border-color: var(--error); }
 .btn-sm { padding: 4px 10px; font-size: 11px; }
+.btn-xs { padding: 2px 6px; font-size: 10px; line-height: 1.4; }
+.item-actions { border-top: 1px solid var(--border); }
 
 /* Filter buttons group */
 .filter-group { display: flex; gap: 4px; }
@@ -4496,6 +4571,10 @@ body {
 }
 .filter-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 .filter-btn.active { background: var(--accent-glow); color: var(--accent); border-color: var(--accent); }
+
+.auto-approve-toggle { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; padding: 0 8px; font-size: 12px; color: var(--text-muted); user-select: none; }
+.auto-approve-toggle input { width: 14px; height: 14px; cursor: pointer; accent-color: var(--accent); }
+.auto-approve-toggle .toggle-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
 
 /* Project selector */
 .project-select {
@@ -4654,6 +4733,7 @@ body {
   .stats-grid { grid-template-columns: 1fr 1fr; }
   .chat-layout { flex-direction: column; }
   .chat-rooms { width: 100%; flex-direction: row; overflow-x: auto; }
+  .chat-rooms-nav { display: none; }
   .settings-grid { grid-template-columns: 1fr; }
   .search-overlay { width: calc(100% - 40px); right: 20px; }
 }
@@ -4802,8 +4882,16 @@ body {
             <button class="filter-btn" data-filter="completed" onclick="setTaskFilter('completed')">Done</button>
             <button class="filter-btn" data-filter="failed" onclick="setTaskFilter('failed')">Failed</button>
             <button class="filter-btn" data-filter="dead" onclick="setTaskFilter('dead')">Dead</button>
+            <button class="filter-btn" data-filter="rejected" onclick="setTaskFilter('rejected')">Rejected</button>
+            <button class="filter-btn" data-filter="verified" onclick="setTaskFilter('verified')">Verified</button>
+            <button class="filter-btn" data-filter="proposals" onclick="setTaskFilter('proposals')">Proposals</button>
           </div>
-          <button class="btn btn-sm" onclick="createTask()" style="margin-left:8px">+ New</button>
+          <label class="auto-approve-toggle" title="Auto-approve assigned tasks">
+            <input type="checkbox" id="autoApproveCb" onchange="toggleAutoApprove(this.checked)">
+            <span class="toggle-label">Auto</span>
+          </label>
+          <button class="btn btn-sm" id="clearProposalsBtn" style="display:none" onclick="clearProposals()">🗑 Clear All</button>
+          <button class="btn btn-sm" onclick="createTask()" style="margin-left:4px">+ New</button>
         </div>
       </div>
       <div class="item-list" id="taskList"></div>
@@ -4855,7 +4943,21 @@ body {
         </div>
       </div>
       <div class="chat-layout">
-        <div class="chat-rooms" id="chatRoomList"></div>
+        <div class="chat-rooms">
+          <div id="chatRoomList"></div>
+          <div class="chat-rooms-nav">
+            <div class="sidebar-label" style="padding:8px 12px 4px;font-size:9px;">Navigate</div>
+            <div class="nav-item" data-tab="0" onclick="switchTab(0)"><span class="icon">◉</span> Overview</div>
+            <div class="nav-item" data-tab="1" onclick="switchTab(1)"><span class="icon">●</span> Agents</div>
+            <div class="nav-item" data-tab="2" onclick="switchTab(2)"><span class="icon">☰</span> Tasks</div>
+            <div class="nav-item" data-tab="3" onclick="switchTab(3)"><span class="icon">◈</span> Memory</div>
+            <div class="nav-item" data-tab="4" onclick="switchTab(4)"><span class="icon">◎</span> Recall</div>
+            <div class="nav-item" data-tab="6" onclick="switchTab(6)"><span class="icon">🛡</span> Safety</div>
+            <div class="nav-item" data-tab="7" onclick="switchTab(7)"><span class="icon">⚙</span> Settings</div>
+            <div class="nav-item" data-tab="8" onclick="switchTab(8)"><span class="icon">🧠</span> Brain</div>
+            <div style="border-top:1px solid var(--border);margin:4px 12px;padding-top:4px;"></div>
+          </div>
+        </div>
         <div class="chat-main">
           <div class="chat-messages" id="chatMessages"></div>
           <div class="chat-input-row">
@@ -4935,12 +5037,7 @@ body {
         <div class="card-title">Actions</div>
         <div class="flex gap-2 mt-2">
           <button class="btn btn-warning btn-sm" onclick="consolidateChat()">🔄 Consolidate</button>
-          <button class="btn btn-error btn-sm" onclick="clearProposals()">🗑 Clear Proposals</button>
         </div>
-      </div>
-      <div class="card mt-4">
-        <div class="card-title">Proposals</div>
-        <div id="proposalsList"></div>
       </div>
     </div>
     <!-- Tab 8: Brain Network -->
@@ -5330,10 +5427,21 @@ function renderAgents() {
 // TAB 2: TASKS
 // ============================================
 let tasksData = [];
+let proposalsData = [];
 
 async function loadTasks() {
   try {
-    tasksData = (await api('/tasks')).tasks || [];
+    const [taskRes, propRes, aaRes] = await Promise.all([
+      api('/tasks'),
+      api('/proposals'),
+      api('/config/auto_approve'),
+    ]);
+    tasksData = taskRes.tasks || [];
+    proposalsData = propRes.proposals || [];
+    if (aaRes && typeof aaRes.enabled !== 'undefined') {
+      const cb = document.getElementById('autoApproveCb');
+      if (cb) cb.checked = aaRes.enabled;
+    }
     renderTasks();
     setConn(true);
   } catch(e) {
@@ -5345,7 +5453,206 @@ async function loadTasks() {
 function setTaskFilter(f) {
   state.taskFilter = f;
   document.querySelectorAll('#taskFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
+  const clearBtn = document.getElementById('clearProposalsBtn');
+  if (clearBtn) clearBtn.style.display = f === 'proposals' ? '' : 'none';
   renderTasks();
+}
+
+function renderTasks() {
+  const container = el('taskList');
+  if (state.taskFilter === 'proposals') {
+    renderProposals();
+    return;
+  }
+  let list = tasksData;
+  if (state.taskFilter !== 'all') {
+    list = list.filter(t => t.status === state.taskFilter
+      || (state.taskFilter === 'completed' && (t.status === 'done' || t.status === 'completed' || t.status === 'verified')));
+  }
+  if (!list.length) {
+    container.innerHTML = '<div class="empty-state"><span class="icon">&#9776;</span>No ' + (state.taskFilter === 'all' ? '' : state.taskFilter + ' ') + 'tasks</div>';
+    return;
+  }
+  const order = { running: 0, in_progress: 0, pending: 1, assigned: 2, approved: 3, completed: 4, done: 4, verified: 4, failed: 5, blocked: 5, rejected: 6, dead: 7 };
+  list.sort((a, b) => (order[a.status] || 9) - (order[b.status] || 9));
+
+  container.innerHTML = list.map(t => {
+    const statusColor = t.status === 'completed' || t.status === 'done' || t.status === 'verified' ? 'success'
+      : t.status === 'in_progress' || t.status === 'running' ? 'accent'
+      : t.status === 'failed' || t.status === 'dead' || t.status === 'blocked' ? 'error'
+      : t.status === 'rejected' ? 'error'
+      : t.status === 'approved' ? 'success'
+      : 'warning';
+    const dotColor = t.status === 'completed' || t.status === 'done' || t.status === 'verified' || t.status === 'approved' ? 'active'
+      : t.status === 'failed' || t.status === 'dead' || t.status === 'blocked' || t.status === 'rejected' ? 'error'
+      : t.status === 'in_progress' || t.status === 'running' ? 'active'
+      : 'pending';
+
+    // Action buttons based on status
+    let actions = '';
+    if (t.status === 'assigned') {
+      actions = '<button class="btn btn-xs btn-success" onclick="approveTask(\\'' + t.id + '\\',event)">Approve</button>' +
+        '<button class="btn btn-xs btn-error" onclick="rejectTask(\\'' + t.id + '\\',event)">Reject</button>';
+    } else if (t.status === 'rejected') {
+      actions = '<button class="btn btn-xs btn-success" onclick="approveTask(\\'' + t.id + '\\',event)">Approve</button>' +
+        '<button class="btn btn-xs btn-error" onclick="deleteTask(\\'' + t.id + '\\',event)">Delete</button>';
+    } else if (t.status === 'failed' || t.status === 'dead' || t.status === 'blocked') {
+      actions = '<button class="btn btn-xs btn-warning" onclick="retryTask(\\'' + t.id + '\\',event)">Retry</button>' +
+        '<button class="btn btn-xs btn-error" onclick="deleteTask(\\'' + t.id + '\\',event)">Delete</button>';
+    } else if (t.status === 'pending' || t.status === 'completed' || t.status === 'verified') {
+      actions = '<button class="btn btn-xs btn-error" onclick="deleteTask(\\'' + t.id + '\\',event)">Delete</button>';
+    }
+
+    // Verification info
+    let verifyHtml = '';
+    if (t.verification) {
+      const v = t.verification;
+      verifyHtml = '<div class="mt-2"><strong>&#9989; Verification:</strong> score=' + (v.score || 0).toFixed(2) +
+        ' test=' + (v.test_passed === true ? 'PASS' : v.test_passed === false ? 'FAIL' : '-') +
+        ' lint=' + (v.lint_violations != null ? v.lint_violations + ' viol.' : '-') +
+        ' by=' + esc(v.by || '?') +
+        '</div>';
+    }
+
+    return '<div class="item-card">' +
+      '<div class="top">' + dot(dotColor) + '<span class="title">' + esc(t.title) + '</span>' + tag(t.status + (t.status === 'dead' ? ' (' + (t.attempt_count || 0) + ')' : ''), statusColor) + '</div>' +
+      '<div class="meta">' +
+        '<span>&#128230; ' + esc(t.project) + '</span>' +
+        (t.assigned_to ? '<span>&#128100; ' + esc(t.assigned_to).slice(0, 20) + '</span>' : '') +
+        '<span>&#128197; ' + ago(t.created_at) + '</span>' +
+        '<span>&#128260; ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</span>' +
+      '</div>' +
+      '<div class="detail">' +
+        '<div><strong>ID:</strong> ' + esc(t.id) + '</div>' +
+        (t.description ? '<div class="mt-2"><strong>Description:</strong><pre>' + esc(t.description) + '</pre></div>' : '') +
+        (t.result ? '<div class="mt-2"><strong>Result:</strong><pre>' + esc(t.result).slice(0, 500) + '</pre></div>' : '') +
+        (t.error ? '<div class="mt-2"><strong style="color:var(--error)">Error:</strong><pre style="color:var(--error)">' + esc(t.error).slice(0, 500) + '</pre></div>' : '') +
+        (t.rollback_commit ? '<div class="mt-2"><strong>Rollback:</strong> ' + esc(t.rollback_commit).slice(0, 16) + '</div>' : '') +
+        verifyHtml +
+        '<div class="mt-2"><strong>Created:</strong> ' + fmtTime(t.created_at) + '</div>' +
+        (t.assigned_at ? '<div><strong>Assigned:</strong> ' + fmtTime(t.assigned_at) + '</div>' : '') +
+        '<div><strong>Attempts:</strong> ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</div>' +
+      '</div>' +
+      (actions ? '<div class="item-actions" style="padding:4px 12px 8px;display:flex;gap:4px">' + actions + '</div>' : '') +
+      '</div>';
+  }).join('');
+}
+
+function renderProposals() {
+  const container = el('taskList');
+  if (!proposalsData.length) {
+    container.innerHTML = '<div class="empty-state"><span class="icon">&#128196;</span>No proposals</div>';
+    return;
+  }
+  container.innerHTML = proposalsData.map(p =>
+    '<div class="item-card">' +
+      '<div class="top"><span class="id">' + esc(p.id).slice(0, 30) + '</span>' + tag(p.topic, 'warning') + tag(p.source || '', 'default') + '</div>' +
+      '<div class="title">' + esc(p.text || '').slice(0, 200) + '</div>' +
+      '<div class="meta"><span>&#128368; ' + ago(p.proposed_at) + '</span></div>' +
+      '<div class="detail">' +
+        '<div class="mt-2">' + esc(p.text || '') + '</div>' +
+      '</div>' +
+      '<div class="item-actions" style="padding:4px 12px 8px;display:flex;gap:4px">' +
+        '<button class="btn btn-xs btn-success" onclick="approveProposal(\\'' + p.id + '\\',event)">Accept</button>' +
+        '<button class="btn btn-xs btn-error" onclick="deleteProposal(\\'' + p.id + '\\',event)">Delete</button>' +
+      '</div>' +
+    '</div>'
+  ).join('');
+}
+
+// -- Task Actions --
+async function approveTask(id, e) {
+  if (e) e.stopPropagation();
+  try {
+    await api('/tasks/' + id, { method: 'PATCH', body: JSON.stringify({ status: 'approved' }) });
+    toast('Task approved, agent notified', 'success');
+    loadTasks();
+  } catch(ex) { toast('Approve failed: ' + ex.message, 'error'); }
+}
+
+async function rejectTask(id, e) {
+  if (e) e.stopPropagation();
+  try {
+    await api('/tasks/' + id, { method: 'PATCH', body: JSON.stringify({ status: 'rejected' }) });
+    toast('Task rejected', 'warning');
+    loadTasks();
+  } catch(ex) { toast('Reject failed: ' + ex.message, 'error'); }
+}
+
+async function retryTask(id, e) {
+  if (e) e.stopPropagation();
+  try {
+    await api('/tasks/' + id, { method: 'PATCH', body: JSON.stringify({ status: 'pending', error: '' }) });
+    toast('Task retried, moved to pending', 'success');
+    loadTasks();
+  } catch(ex) { toast('Retry failed: ' + ex.message, 'error'); }
+}
+
+async function deleteTask(id, e) {
+  if (e) e.stopPropagation();
+  if (!confirm('Delete task ' + id.slice(0, 12) + '?')) return;
+  try {
+    await fetch(BASE + '/tasks/' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('Task deleted', 'success');
+    loadTasks();
+  } catch(ex) { toast('Delete failed: ' + ex.message, 'error'); }
+}
+
+// -- Proposal Actions --
+async function approveProposal(id, e) {
+  if (e) e.stopPropagation();
+  try {
+    await fetch(BASE + '/proposals/' + encodeURIComponent(id) + '/accept', { method: 'POST' });
+    toast('Proposal accepted, task created', 'success');
+    loadTasks();
+  } catch(ex) { toast('Accept failed: ' + ex.message, 'error'); }
+}
+
+async function deleteProposal(id, e) {
+  if (e) e.stopPropagation();
+  try {
+    await fetch(BASE + '/proposals/' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('Proposal deleted', 'success');
+    loadTasks();
+  } catch(ex) { toast('Delete failed: ' + ex.message, 'error'); }
+}
+
+async function clearProposals() {
+  try {
+    await fetch(BASE + '/proposals?confirm=true', { method: 'DELETE' });
+    toast('All proposals cleared', 'success');
+    loadTasks();
+  } catch(ex) { toast('Clear failed: ' + ex.message, 'error'); }
+}
+
+async function toggleAutoApprove(enabled) {
+  try {
+    await fetch(BASE + '/config/auto_approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled })
+    });
+    toast('Auto-approve ' + (enabled ? 'ON' : 'OFF'), 'success');
+  } catch(ex) { toast('Failed: ' + ex.message, 'error'); }
+}
+
+function createTask() {
+  const title = prompt('Task title:');
+  if (!title || !title.trim()) return;
+  const desc = prompt('Description (optional):');
+  const project = prompt('Project (default: memoria):') || 'memoria';
+  fetch(BASE + '/tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: title.trim(), description: (desc || '').trim(), project })
+  }).then(r => r.json()).then(data => {
+    if (data.id) {
+      toast('Task created: ' + data.id.slice(0, 12), 'success');
+      loadTasks();
+    } else {
+      toast('Create failed', 'error');
+    }
+  }).catch(e => toast('Create failed: ' + e.message, 'error'));
 }
 
 function setChatFilter(f) {
@@ -5373,69 +5680,6 @@ async function loadRateLimit() {
       el('rateLabel').textContent = parseFloat(data.seconds).toFixed(1) + 's';
     }
   } catch(e) { /* use default */ }
-}
-
-function createTask() {
-  const title = prompt('Task title:');
-  if (!title || !title.trim()) return;
-  const desc = prompt('Description (optional):');
-  const project = 'memoria';
-  fetch(BASE + '/tasks', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: title.trim(), description: (desc || '').trim(), project })
-  }).then(r => r.json()).then(data => {
-    if (data.id) {
-      toast('Task created: ' + data.id.slice(0, 12), 'success');
-      loadTasks();
-    } else {
-      toast('Create failed', 'error');
-    }
-  }).catch(e => toast('Create failed: ' + e.message, 'error'));
-}
-
-function renderTasks() {
-  let list = tasksData;
-  if (state.taskFilter !== 'all') {
-    list = list.filter(t => t.status === state.taskFilter || (state.taskFilter === 'completed' && (t.status === 'done' || t.status === 'completed')));
-  }
-  const container = el('taskList');
-  if (!list.length) {
-    container.innerHTML = '<div class="empty-state"><span class="icon">&#9776;</span>No tasks</div>';
-    return;
-  }
-  const order = { running: 0, pending: 1, active: 0, completed: 2, done: 2, failed: 3, dead: 4 };
-  list.sort((a, b) => (order[a.status] || 9) - (order[b.status] || 9));
-
-  container.innerHTML = list.map(t => {
-    const s = t.status === 'completed' || t.status === 'done' ? 'active' : t.status === 'failed' || t.status === 'dead' ? 'error' : t.status === 'running' ? 'active' : 'pending';
-    const statusColor = t.status === 'completed' || t.status === 'done' ? 'success' : t.status === 'running' ? 'accent' : t.status === 'failed' ? 'error' : t.status === 'dead' ? 'error' : 'warning';
-    return '<div class="item-card" onclick="toggleDetail(this)">' +
-      '<div class="top">' + dot(s) + '<span class="title">' + esc(t.title) + '</span>' + tag(t.status + (t.status === 'dead' ? ' (' + (t.attempt_count || 0) + ')' : ''), statusColor) + '</div>' +
-      '<div class="meta">' +
-        '<span>&#128230; ' + esc(t.project) + '</span>' +
-        (t.assigned_to ? '<span>&#128100; ' + esc(t.assigned_to).slice(0, 20) + '</span>' : '') +
-        '<span>&#128197; ' + ago(t.created_at) + '</span>' +
-        '<span>&#128260; ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + ' attempts</span>' +
-      '</div>' +
-      '<div class="detail">' +
-        '<div><strong>ID:</strong> ' + esc(t.id) + '</div>' +
-        (t.description ? '<div class="mt-2"><strong>Description:</strong><pre>' + esc(t.description) + '</pre></div>' : '') +
-        (t.result ? '<div class="mt-2"><strong>Result:</strong><pre>' + esc(t.result).slice(0, 500) + '</pre></div>' : '') +
-        (t.error ? '<div class="mt-2"><strong style="color:var(--error)">Error:</strong><pre style="color:var(--error)">' + esc(t.error).slice(0, 500) + '</pre></div>' : '') +
-        (t.rollback_commit ? '<div class="mt-2"><strong>Rollback:</strong> ' + esc(t.rollback_commit).slice(0, 16) + '</div>' : '') +
-        '<div class="mt-2"><strong>Created:</strong> ' + fmtTime(t.created_at) + '</div>' +
-        (t.assigned_at ? '<div><strong>Assigned:</strong> ' + fmtTime(t.assigned_at) + '</div>' : '') +
-        '<div><strong>Attempts:</strong> ' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</div>' +
-      '</div>' +
-      '</div>';
-  }).join('');
-}
-
-// -- Toggle Detail --
-function toggleDetail(el) {
-  const d = el.querySelector('.detail');
-  if (d) d.classList.toggle('open');
 }
 
 // ============================================
@@ -5827,7 +6071,6 @@ async function loadSettings() {
     loadEnrichSettings();
     loadEnrichStats();
     setConn(true);
-    loadProposals();
   } catch(e) {
     setConn(false);
     el('configGrid').innerHTML = '<div class="empty-state error">' + esc(e.message) + '</div>';
@@ -5932,64 +6175,10 @@ async function triggerRescanPapers() {
   }
 }
 
-async function loadProposals() {
-  try {
-    const data = await api('/proposals');
-    state.proposals = data.proposals || [];
-    const container = el('proposalsList');
-    if (!state.proposals.length) {
-      container.innerHTML = '<div class="text-muted text-sm">No pending proposals</div>';
-    } else {
-      container.innerHTML = state.proposals.map(p =>
-        '<div class="proposal-card">' +
-          '<div class="top"><span class="id">' + esc(p.id).slice(0, 30) + '</span><span class="topic">' + tag(p.topic, 'warning') + '</span><span class="src">' + esc(p.source || '') + '</span></div>' +
-          '<div class="text">' + esc(p.text || '').slice(0, 200) + '</div>' +
-          '<div class="flex gap-2 mt-2">' +
-            '<button class="btn btn-sm btn-success proposal-accept" data-id="' + esc(p.id) + '">Accept</button>' +
-            '<button class="btn btn-sm btn-error proposal-delete" data-id="' + esc(p.id) + '">Delete</button>' +
-          '</div>' +
-        '</div>'
-      ).join('');
-      container.onclick = function(e) {
-        const accept = e.target.closest('.proposal-accept');
-        if (accept) acceptProposal(accept.dataset.id);
-        const del = e.target.closest('.proposal-delete');
-        if (del) deleteProposal(del.dataset.id);
-      };
-    }
-  } catch(e) {
-    el('proposalsList').innerHTML = '<div class="text-muted text-sm">Error: ' + esc(e.message) + '</div>';
-  }
-}
-
-async function acceptProposal(id) {
-  try {
-    await fetch(BASE + '/proposals/' + encodeURIComponent(id) + '/accept', { method: 'POST' });
-    toast('Proposal accepted', 'success');
-    loadProposals();
-  } catch(e) { toast('Failed: ' + e.message, 'error'); }
-}
-
-async function deleteProposal(id) {
-  try {
-    await fetch(BASE + '/proposals/' + encodeURIComponent(id), { method: 'DELETE' });
-    toast('Proposal deleted', 'success');
-    loadProposals();
-  } catch(e) { toast('Failed: ' + e.message, 'error'); }
-}
-
 async function consolidateChat() {
   try {
     await fetch(BASE + '/chitchat/consolidate', { method: 'POST' });
     toast('Consolidation triggered', 'success');
-  } catch(e) { toast('Failed: ' + e.message, 'error'); }
-}
-
-async function clearProposals() {
-  try {
-    await fetch(BASE + '/proposals?confirm=true', { method: 'DELETE' });
-    toast('Proposals cleared', 'success');
-    loadProposals();
   } catch(e) { toast('Failed: ' + e.message, 'error'); }
 }
 
