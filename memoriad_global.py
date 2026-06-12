@@ -6042,6 +6042,7 @@ function renderProposals() {
     else if (action === 'archive-proposal') archiveProposal(id, e);
     else if (action === 'select-proposal') { toggleSelectProposal(id, btn.checked); e.stopPropagation(); }
   };
+  updateBulkToolbar();
 }
 
 // -- Task Actions --
@@ -6169,7 +6170,8 @@ function updateBulkToolbar() {
   const bar = document.getElementById('bulkToolbar');
   const cnt = document.getElementById('bulkCount');
   const cb = document.getElementById('selectAllCb');
-  if (bar) bar.classList.toggle('visible', n > 0);
+  const proposalsVisible = (state.taskFilter === 'all' && proposalsData.length > 0) || state.taskFilter === 'proposals';
+  if (bar) bar.classList.toggle('visible', n > 0 || proposalsVisible);
   if (cnt) cnt.textContent = n + ' selected';
   if (cb) cb.checked = n > 0 && proposalsData.length > 0 && n === proposalsData.length;
 }
