@@ -3530,6 +3530,103 @@ async def set_rate_limit(body: RateLimitUpdate):
     return {"seconds": v}
 
 
+_activities: deque = deque(maxlen=200)
+
+SERVICE_AGENTS = {
+    "orchestrator": "orchestrator.service",
+    "researcher": "researcher.service",
+    "builder": "builder.service",
+    "mini": "mini.service",
+    "worker": "memoria-worker.service",
+    "sage": "sage.service",
+    "pilosopher": "pilosopher.service",
+}
+
+
+class ActivityBody(BaseModel):
+    agent: str
+    room: str = ""
+    action: str
+    detail: str = ""
+
+
+@app.post("/activity")
+async def post_activity(body: ActivityBody):
+    event = {
+        "agent": body.agent,
+        "room": body.room,
+        "action": body.action,
+        "detail": body.detail,
+        "ts": time.time(),
+    }
+    _activities.append(event)
+    return {"ok": True}
+
+
+@app.get("/activity")
+async def get_activity(limit: int = 50):
+    items = list(_activities)[-limit:]
+    return {"activities": items, "count": len(items)}
+
+
+@app.get("/monitor")
+async def get_monitor():
+    agents = []
+    total_cpu = 0.0
+    total_mem = 0.0
+    for name, svc in SERVICE_AGENTS.items():
+        try:
+            pid = subprocess.run(
+                ["systemctl", "--user", "show", svc, "-p", "MainPID", "--value"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            if pid and pid != "0":
+                out = subprocess.run(
+                    ["ps", "-p", pid, "-o", "%cpu=,%mem=,rss=", "--no-headers"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                ).stdout.strip()
+                if out:
+                    parts = out.split()
+                    cpu = float(parts[0]) if len(parts) > 0 else 0.0
+                    mem = float(parts[1]) if len(parts) > 1 else 0.0
+                    rss_kb = int(parts[2]) if len(parts) > 2 else 0
+                    agents.append(
+                        {
+                            "name": name,
+                            "pid": int(pid),
+                            "cpu": cpu,
+                            "mem": mem,
+                            "rss_mb": round(rss_kb / 1024, 1),
+                        }
+                    )
+                    total_cpu += cpu
+                    total_mem += mem
+        except Exception:
+            pass
+    try:
+        meminfo = {}
+        for line in open("/proc/meminfo"):
+            k, v = line.split(":")
+            meminfo[k.strip()] = int(v.strip().split()[0]) // 1024
+        sys_mem_total = meminfo.get("MemTotal", 0)
+        sys_mem_avail = meminfo.get("MemAvailable", 0)
+        sys_mem_used = sys_mem_total - sys_mem_avail
+    except Exception:
+        sys_mem_total = sys_mem_used = 0
+    return {
+        "agents": agents,
+        "system": {
+            "cpu_count": os.cpu_count() or 0,
+            "mem_total_mb": sys_mem_total,
+            "mem_used_mb": sys_mem_used,
+        },
+    }
+
+
 CODE_ROOT = Path("/mnt/external-drive/code")
 
 
