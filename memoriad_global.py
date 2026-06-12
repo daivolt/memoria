@@ -3530,6 +3530,35 @@ async def set_rate_limit(body: RateLimitUpdate):
     return {"seconds": v}
 
 
+SIDEPANE_DIR = Path(__file__).parent / "sidepane"
+
+
+@app.get("/sidepane/files")
+async def list_sidepane_files():
+    files = []
+    for f in sorted(SIDEPANE_DIR.rglob("*")):
+        if f.is_file() and not f.name.startswith(".") and ".git" not in f.parts:
+            rel = f.relative_to(SIDEPANE_DIR)
+            files.append({"path": str(rel), "size": f.stat().st_size})
+    return {"files": files, "count": len(files)}
+
+
+class FileWriteRequest(BaseModel):
+    path: str
+    content: str
+
+
+@app.post("/sidepane/files")
+async def write_sidepane_file(body: FileWriteRequest):
+    full_path = SIDEPANE_DIR / body.path
+    if not str(full_path).startswith(str(SIDEPANE_DIR.resolve())):
+        raise HTTPException(403, "path outside sidepane directory")
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    full_path.write_text(body.content)
+    return {"path": body.path, "written": True}
+
+
+
 class ChitchatPause(BaseModel):
     from_name: str
 
