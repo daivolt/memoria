@@ -10,7 +10,7 @@ Restart=on-failure
 RestartSec=5
 ReadWritePaths=/mnt/external-drive/code /home/daivolt/conf/chitchat
 Environment=CHITCHAT_HOST=localhost
-Environment=CHITCHAT_ROOMS=general,brainstorm
+Environment=CHITCHAT_ROOMS=general,brainstorm,sidepane
 Environment=MEMORIA_URL=http://localhost:19998
 
 [Install]
