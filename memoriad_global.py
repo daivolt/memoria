@@ -4533,7 +4533,7 @@ body {
 .proposal-card .text { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
 
 /* Enriched task card */
-.item-card .desc-preview { font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.5; border-left: 2px solid var(--border); padding-left: 8px; }
+.item-card .desc-preview { font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.5; border-left: 2px solid var(--border); padding-left: 8px; white-space: pre-wrap; word-break: break-word; }
 .item-card .rich-meta { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; color: var(--text-muted); margin-top: 4px; }
 .item-card .rich-meta span { display: flex; align-items: center; gap: 3px; }
 .item-card .field-row { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 6px; font-size: 11px; }
@@ -5615,8 +5615,8 @@ function renderTaskCard(t) {
     actions = '<button class="btn btn-xs btn-error" data-action="delete" data-task-id="' + tid + '">Delete</button>';
   }
 
-  // Description preview
-  const descPreview = t.description ? '<div class="desc-preview">' + esc(t.description).slice(0, 200) + '</div>' : '';
+  // Description — full, no truncation
+  const descPreview = t.description ? '<div class="desc-preview">' + esc(t.description) + '</div>' : '';
 
   // Verification chips
   let verifyChips = '';
@@ -5635,13 +5635,13 @@ function renderTaskCard(t) {
       '</div>';
   }
 
-  // Error preview inline
-  const errorHtml = t.error ? '<div class="inline-block error-block">' + esc(t.error).slice(0, 200) + '</div>' : '';
+  // Error — full, no truncation
+  const errorHtml = t.error ? '<div class="inline-block error-block">' + esc(t.error) + '</div>' : '';
 
-  // Result preview inline
-  const resultHtml = t.result ? '<div class="inline-block result-block">' + esc(t.result).slice(0, 150) + '</div>' : '';
+  // Result — full, no truncation
+  const resultHtml = t.result ? '<div class="inline-block result-block">' + esc(t.result) + '</div>' : '';
 
-  // Inline field rows
+  // Inline field rows — all metadata
   let fields = '';
   fields += '<div class="field-row">' +
     '<span class="field"><span class="field-label">ID:</span> <span class="field-val">' + esc(t.id) + '</span></span>' +
@@ -5650,15 +5650,13 @@ function renderTaskCard(t) {
     '<span class="field"><span class="field-label">Created:</span> <span class="field-val">' + fmtTime(t.created_at) + '</span></span>' +
     (t.assigned_at ? '<span class="field"><span class="field-label">Assigned at:</span> <span class="field-val">' + fmtTime(t.assigned_at) + '</span></span>' : '') +
     '<span class="field"><span class="field-label">Attempts:</span> <span class="field-val">' + (t.attempt_count || 0) + '/' + (t.max_attempts || 3) + '</span></span>' +
+    (t.failed_at ? '<span class="field"><span class="field-label">Failed at:</span> <span class="field-val">' + fmtTime(t.failed_at) + '</span></span>' : '') +
+    (t.payload && t.payload.cortex_reward != null ? '<span class="field"><span class="field-label">CORTEX reward:</span> <span class="field-val">' + t.payload.cortex_reward + '</span></span>' : '') +
+    (t.depends_on && t.depends_on.length ? '<span class="field"><span class="field-label">Depends on:</span> <span class="field-val">' + t.depends_on.join(', ') + '</span></span>' : '') +
     '</div>';
 
-  // Expandable detail section
+  // Expandable detail section — everything not shown inline
   let detail = '';
-  detail += '<div class="detail-row"><div class="detail-label">Full Description</div><pre>' + esc(t.description || '(none)') + '</pre></div>';
-  detail += '<div class="detail-row"><div class="detail-label">Result</div><pre>' + esc(t.result || '(none)') + '</pre></div>';
-  if (t.error) {
-    detail += '<div class="detail-row"><div class="detail-label">Error</div><pre style="color:var(--error)">' + esc(t.error) + '</pre></div>';
-  }
   if (t.test_command) {
     detail += '<div class="detail-row"><div class="detail-label">Test Command</div><pre>' + esc(t.test_command) + '</pre></div>';
   }
@@ -5672,8 +5670,8 @@ function renderTaskCard(t) {
   if (t.rollback_commit) {
     detail += '<div class="detail-row"><div class="detail-label">Rollback Commit</div><pre>' + esc(t.rollback_commit) + '</pre></div>';
   }
-  if (t.depends_on && t.depends_on.length) {
-    detail += '<div class="detail-row"><div class="detail-label">Depends On</div><pre>' + esc(t.depends_on.join(', ')) + '</pre></div>';
+  if (t.payload && Object.keys(t.payload).length) {
+    detail += '<div class="detail-row"><div class="detail-label">Payload</div><pre>' + esc(JSON.stringify(t.payload, null, 2)) + '</pre></div>';
   }
   if (t.verification) {
     const v = t.verification;
@@ -5709,33 +5707,23 @@ function renderTaskCard(t) {
 
 function renderProposalCard(p) {
   const sourceLabel = (p.source || '').replace('chitchat_consolidation', 'chat replay').replace('hippocampal_consolidation', 'hippocampal').replace('deep_consolidation', 'deep scan');
-  let detail = '';
-  detail += '<div class="detail-row"><div class="detail-label">Full Text</div><pre>' + esc(p.text || '') + '</pre></div>';
-  detail += '<div class="detail-row"><div class="detail-label">Topic</div><pre>' + esc(p.topic || '') + '</pre></div>';
-  detail += '<div class="detail-row"><div class="detail-label">Source</div><pre>' + esc(p.source || 'unknown') + '</pre></div>';
-  detail += '<div class="detail-row"><div class="detail-label">Proposal ID</div><pre>' + esc(p.id) + '</pre></div>';
-  detail += '<div class="detail-row"><div class="detail-label">Proposed At</div><pre>' + fmtTime(p.proposed_at) + '</pre></div>';
-  if (p.hits) {
-    detail += '<div class="detail-row"><div class="detail-label">Hits</div><pre>' + p.hits + '</pre></div>';
-  }
 
   return '<div class="item-card item-proposal">' +
     '<div class="top" onclick="toggleDetail(this.parentElement)" style="cursor:pointer">' +
       '<span class="item-type-badge">&#128196; PROPOSAL</span>' +
       tag(p.topic, 'warning') +
       (sourceLabel ? tag(sourceLabel, 'default') : '') +
+      '<span class="id" style="font-size:11px;color:var(--text-muted)">' + esc(p.id) + '</span>' +
     '</div>' +
-    '<div class="desc-preview">' + esc(p.text || '').slice(0, 300) + '</div>' +
+    '<div class="desc-preview">' + esc(p.text || '') + '</div>' +
     '<div class="field-row">' +
-      '<span class="field"><span class="field-label">ID:</span> <span class="field-val">' + esc(p.id) + '</span></span>' +
-      '<span class="field"><span class="field-label">Source:</span> <span class="field-val">' + esc(p.source || 'unknown') + '</span></span>' +
       '<span class="field"><span class="field-label">Topic:</span> <span class="field-val">' + esc(p.topic) + '</span></span>' +
+      '<span class="field"><span class="field-label">Source:</span> <span class="field-val">' + esc(p.source || 'unknown') + '</span></span>' +
+      (p.hits ? '<span class="field"><span class="field-label">Hits:</span> <span class="field-val">' + p.hits + '</span></span>' : '') +
     '</div>' +
     '<div class="meta">' +
       '<span>&#128368; Proposed ' + ago(p.proposed_at) + ' (' + fmtTime(p.proposed_at) + ')</span>' +
-      (p.hits ? '<span>&#128073; ' + p.hits + ' hit' + (p.hits > 1 ? 's' : '') + '</span>' : '') +
     '</div>' +
-    (detail ? '<div class="detail">' + detail + '</div>' : '') +
     '<div class="item-actions">' +
       '<button class="btn btn-xs btn-success" data-action="accept-proposal" data-proposal-id="' + p.id + '">&#10003; Accept</button>' +
       '<button class="btn btn-xs btn-error" data-action="delete-proposal" data-proposal-id="' + p.id + '">&#10005; Delete</button>' +
