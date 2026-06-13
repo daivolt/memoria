@@ -90,6 +90,11 @@ def _default_data() -> dict:
             "model": "deepseek-v4-flash",
         },
         "llm_locked": True,
+        "loadbalancer_url": "http://100.121.245.69:8000/v1",
+        "routes": {
+            "default": "deepseek/deepseek-v4-flash",
+            "enrichment": "deepseek/deepseek-v4-flash",
+        },
     }
 
 
@@ -194,18 +199,87 @@ def set_llm_locked(locked: bool):
     sync_enrichment()
 
 
+def get_loadbalancer_url() -> str:
+    data = load_data()
+    return data.get("loadbalancer_url", "http://100.121.245.69:8000/v1").rstrip("/")
+
+
+def get_route(name: str) -> str | None:
+    data = load_data()
+    routes = data.get("routes", {})
+    if name in routes:
+        return routes[name]
+    return routes.get("default")
+
+
+def set_route(name: str, route_str: str):
+    data = load_data()
+    if "routes" not in data:
+        data["routes"] = {}
+    data["routes"][name] = route_str
+    save_data(data)
+
+
+def get_routes() -> dict:
+    return load_data().get("routes", {})
+
+
+def _resolve_route_str(
+    route_str: str, all_providers: dict, lb_url: str
+) -> tuple[str, str, str]:
+    if "/" in route_str:
+        pid, model = route_str.split("/", 1)
+        prov = all_providers.get(pid)
+        if prov:
+            return _ensure_chat_url(prov["base_url"]), model, prov.get("api_key", "")
+        return "", model, ""
+    url = lb_url.rstrip("/")
+    if "/chat/completions" not in url:
+        if "/v1/" in url or url.endswith("/v1"):
+            url += "/chat/completions"
+        else:
+            url += "/v1/chat/completions"
+    return url, route_str, ""
+
+
+def resolve_route(name: str) -> tuple[str, str, str]:
+    data = load_data()
+    all_providers = {p["id"]: p for p in data.get("providers", [])}
+    lb_url = data.get("loadbalancer_url", "http://100.121.245.69:8000/v1")
+    routes = data.get("routes", {})
+    route_str = routes.get(name) or routes.get("default")
+    if route_str:
+        return _resolve_route_str(route_str, all_providers, lb_url)
+    cur = data.get("current", {})
+    pid = cur.get("provider_id", "")
+    model = cur.get("model", "")
+    if pid and pid in all_providers:
+        prov = all_providers[pid]
+        return _ensure_chat_url(prov["base_url"]), model, prov.get("api_key", "")
+    return "", "", ""
+
+
 def sync_enrichment():
     """Sync enrichment.LLM_URL, LLM_MODEL, LLM_API_KEY, LLM_LOCKED from providers.json."""
     import enrichment
 
     data = load_data()
     all_providers = {p["id"]: p for p in data.get("providers", [])}
-    cur = data.get("current", {})
-    pid = cur.get("provider_id", "")
-    model = cur.get("model", "")
+    lb_url = data.get("loadbalancer_url", "http://100.121.245.69:8000/v1")
+    routes = data.get("routes", {})
+    route_str = routes.get("enrichment") or routes.get("default")
     enrichment.LLM_LOCKED = data.get("llm_locked", True)
-    if pid and pid in all_providers:
-        prov = all_providers[pid]
-        enrichment.LLM_URL = _ensure_chat_url(prov["base_url"])
+    if route_str:
+        url, model, key = _resolve_route_str(route_str, all_providers, lb_url)
+        enrichment.LLM_URL = url
         enrichment.LLM_MODEL = model
-        enrichment.LLM_API_KEY = prov.get("api_key", "")
+        enrichment.LLM_API_KEY = key
+    else:
+        cur = data.get("current", {})
+        pid = cur.get("provider_id", "")
+        model = cur.get("model", "")
+        if pid and pid in all_providers:
+            prov = all_providers[pid]
+            enrichment.LLM_URL = _ensure_chat_url(prov["base_url"])
+            enrichment.LLM_MODEL = model
+            enrichment.LLM_API_KEY = prov.get("api_key", "")

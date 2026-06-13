@@ -3848,6 +3848,29 @@ async def set_llm_lock(body: LLMLockBody):
     return {"ok": True, "locked": body.locked}
 
 
+class RouteBody(BaseModel):
+    route: str
+
+
+@app.get("/routes")
+async def get_all_routes():
+    return {"ok": True, "routes": providers.get_routes()}
+
+
+@app.get("/routes/{name}")
+async def get_named_route(name: str):
+    r = providers.get_route(name)
+    return {"ok": True, "name": name, "route": r}
+
+
+@app.put("/routes/{name}")
+async def set_named_route(name: str, body: RouteBody):
+    providers.set_route(name, body.route)
+    if name == "enrichment":
+        providers.sync_enrichment()
+    return {"ok": True, "name": name, "route": body.route}
+
+
 @app.post("/providers/seed")
 async def seed_providers():
     """Re-seed providers from loadbalancer.env, preserving API keys for existing entries."""
@@ -5560,6 +5583,11 @@ body {
           <button class="btn btn-sm" onclick="loadProviders()">🔄 Refresh</button>
         </div>
       </div>
+      <div class="card mt-4">
+        <div class="card-title">🛣️ Routes</div>
+        <div class="text-sm text-muted mb-2" style="margin-bottom:6px">Per-agent LLM assignment. Format: <code>provider/model</code> for direct, <code>qa-auto</code>/<code>qa-best</code>/<code>qa-fast</code> for loadbalancer.</div>
+        <div id="routesList" style="font-size:11px"></div>
+      </div>
     </div>
     <!-- Provider Editor Modal -->
     <div class="modal-overlay" id="providerModal" style="display:none" onclick="if(event.target===this)closeProviderModal()">
@@ -7076,6 +7104,7 @@ async function loadSettings() {
     state.config = await api('/config');
     await loadProviders();
     await loadLLMLock();
+    await loadRoutes();
     renderConfig();
     loadEnrichSettings();
     loadEnrichStats();
@@ -7495,6 +7524,60 @@ async function testProvider() {
   } finally {
     btn.disabled = false;
     btn.textContent = orig;
+  }
+}
+
+// ============================================
+// ROUTES
+// ============================================
+async function loadRoutes() {
+  try {
+    const data = await api('/routes');
+    const routes = data.routes || {};
+    const container = el('routesList');
+    const agentNames = Object.keys(routes).sort();
+    if (!agentNames.length) {
+      container.innerHTML = '<span class="text-muted">No routes configured</span>';
+      return;
+    }
+    container.innerHTML = '<table style="width:100%;border-collapse:collapse">' +
+      agentNames.map(function(name) {
+        const r = routes[name];
+        const isBalancer = r.indexOf('/') === -1;
+        const badge = isBalancer ? '<span class="badge" style="background:#6c5ce7;color:#fff">balancer</span>' : '<span class="badge badge-accent">direct</span>';
+        return '<tr style="border-bottom:1px solid var(--border)">' +
+          '<td style="padding:4px 6px;font-weight:600">' + esc(name) + '</td>' +
+          '<td style="padding:4px 6px">' + badge + '</td>' +
+          '<td style="padding:4px 6px;font-family:var(--mono);font-size:11px">' + esc(r) + '</td>' +
+          '<td style="padding:4px 6px">' +
+            '<input type="text" id="route_input_' + esc(name) + '" value="' + esc(r) + '" style="width:180px;font-size:11px;font-family:var(--mono);padding:2px 4px" placeholder="provider/model or qa-auto">' +
+          '</td>' +
+          '<td style="padding:4px 6px">' +
+            '<button class="btn btn-xs" onclick="saveRoute(\'' + esc(name) + '\')">💾</button>' +
+          '</td></tr>';
+      }).join('') +
+      '</table>' +
+      '<div class="text-sm text-muted mt-1">Format: <code>provider_id/model</code> for direct provider, <code>qa-auto</code>/<code>qa-best</code>/<code>qa-fast</code> or any model name for loadbalancer.</div>';
+  } catch(e) {
+    el('routesList').innerHTML = '<span class="error">Failed to load routes</span>';
+  }
+}
+
+async function saveRoute(name) {
+  const input = el('route_input_' + name);
+  const route = input.value.trim();
+  if (!route) return;
+  try {
+    const resp = await fetch(BASE + '/routes/' + encodeURIComponent(name), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ route: route })
+    });
+    if (!resp.ok) throw new Error('save failed');
+    await loadRoutes();
+    toast('Route saved for ' + name, 'success');
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
   }
 }
 
