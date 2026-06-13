@@ -6676,15 +6676,15 @@ async function loadChat() {
     sel.innerHTML = state.chatRooms.map(r => {
       const rr = data.rooms.find(rr => rr.room === r);
       const paused = rr && rr.paused_by;
-      return '<div class="chat-room' + (r === state.chatRoom ? ' active' : '') + '" data-room="' + esc(r) + '" oncontextmenu="showRoomMenu(event,\\'' + esc(r) + '\\')">' +
+      return '<div class="chat-room' + (r === state.chatRoom ? ' active' : '') + '" data-room="' + esc(r) + '" oncontextmenu="showRoomMenu(event,' + "'" + esc(r) + "'" + ')">' +
         '<span class="room-name">' + (paused ? '\u23f8 ' : '') + esc(r) + '</span>' +
         '<span class="count">' + (rr?.messages || 0) + '</span>' +
         '<span class="room-actions">' +
           (paused
-            ? '<button onclick="event.stopPropagation();resumeRoom(\\'' + esc(r) + '\\')" title="Resume">\u25b6</button>'
-            : (r !== 'general' ? '<button onclick="event.stopPropagation();pauseRoom(\\'' + esc(r) + '\\')" title="Pause">\u23f8</button>' : '')) +
-          '<button onclick="event.stopPropagation();renameRoom(\\'' + esc(r) + '\\')" title="Rename">\u270f</button>' +
-          '<button onclick="event.stopPropagation();deleteRoom(\\'' + esc(r) + '\\')" title="Delete">\u2716</button>' +
+            ? '<button onclick="event.stopPropagation();resumeRoom(' + "'" + esc(r) + "'" + ')" title="Resume">\u25b6</button>'
+            : (r !== 'general' ? '<button onclick="event.stopPropagation();pauseRoom(' + "'" + esc(r) + "'" + ')" title="Pause">\u23f8</button>' : '')) +
+          '<button onclick="event.stopPropagation();renameRoom(' + "'" + esc(r) + "'" + ')" title="Rename">\u270f</button>' +
+          '<button onclick="event.stopPropagation();deleteRoom(' + "'" + esc(r) + "'" + ')" title="Delete">\u2716</button>' +
         '</span>' +
       '</div>';
     }).join('');
