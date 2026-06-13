@@ -68,6 +68,7 @@ except ImportError:
 import stats
 import pg
 import enrichment
+import providers
 
 # ── Paths ──────────────────────────────────────────────────────
 
@@ -878,6 +879,7 @@ async def _deep_consolidate():
 async def lifespan(app: FastAPI):
     _init_index()
     federation._init_federation(WORKDIR)
+    providers.sync_enrichment()
     global \
         _pool, \
         _poll_task, \
@@ -3661,8 +3663,12 @@ async def update_config(updates: ConfigUpdate):
         enrichment.ENRICH_ENABLED = data["enrich_enabled"]
     if "enrich_llm_url" in data:
         url = data["enrich_llm_url"]
-        if url and "/chat/completions" not in url and "/v1/" not in url:
-            url = url.rstrip("/") + "/v1/chat/completions"
+        if url and "/chat/completions" not in url:
+            url = url.rstrip("/")
+            if "/v1/" in url or url.endswith("/v1"):
+                url += "/chat/completions"
+            else:
+                url += "/v1/chat/completions"
         enrichment.LLM_URL = url
     if "enrich_llm_model" in data:
         enrichment.LLM_MODEL = data["enrich_llm_model"]
@@ -3698,6 +3704,103 @@ async def enrichment_stats():
 @app.get("/enrichment/pipeline-log")
 async def enrichment_pipeline_log(limit: int = 50):
     return {"ok": True, "entries": enrichment.pipeline_log(limit=limit)}
+
+
+# ── Provider Management ────────────────────────────────────────
+
+
+class ProviderEntry(BaseModel):
+    id: str
+    name: str = ""
+    base_url: str
+    api_key: str = ""
+    enabled: bool = True
+
+
+class ProviderCurrent(BaseModel):
+    provider_id: str
+    model: str
+
+
+class ProviderUpdate(BaseModel):
+    name: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+@app.get("/providers")
+async def get_providers():
+    return {
+        "ok": True,
+        "providers": providers.get_providers(),
+        "current": providers.get_current(),
+    }
+
+
+@app.post("/providers")
+async def create_provider(body: ProviderEntry):
+    try:
+        entry = providers.add_provider(body.model_dump())
+        return {"ok": True, "provider": entry}
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.patch("/providers/{provider_id}")
+async def update_provider(provider_id: str, body: ProviderUpdate):
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    entry = providers.update_provider(provider_id, updates)
+    if entry is None:
+        raise HTTPException(404, "provider not found")
+    return {"ok": True, "provider": entry}
+
+
+@app.delete("/providers/{provider_id}")
+async def delete_provider(provider_id: str):
+    if providers.delete_provider(provider_id):
+        return {"ok": True}
+    raise HTTPException(404, "provider not found")
+
+
+@app.patch("/providers/current")
+async def set_current_provider(body: ProviderCurrent):
+    providers.set_current(body.provider_id, body.model)
+    # Sync enrichment module with new provider
+    data = providers.load_data()
+    all_providers = {p["id"]: p for p in data.get("providers", [])}
+    cur = data.get("current", {})
+    pid = cur.get("provider_id", "")
+    model = cur.get("model", "")
+    if pid and pid in all_providers:
+        prov = all_providers[pid]
+        url = prov["base_url"]
+        if url and "/chat/completions" not in url:
+            url = url.rstrip("/")
+            if "/v1/" in url or url.endswith("/v1"):
+                url += "/chat/completions"
+            else:
+                url += "/v1/chat/completions"
+        enrichment.LLM_URL = url
+        enrichment.LLM_MODEL = model
+        enrichment.LLM_API_KEY = prov.get("api_key", "")
+    return {"ok": True}
+
+
+@app.post("/providers/seed")
+async def seed_providers():
+    """Re-seed providers from loadbalancer.env, preserving API keys for existing entries."""
+    from providers import _default_providers
+
+    fresh = _default_providers()
+    data = providers.load_data()
+    existing = {p["id"]: p for p in data.get("providers", [])}
+    for p in fresh:
+        if p["id"] in existing:
+            p["api_key"] = existing[p["id"]]["api_key"]
+    data["providers"] = fresh
+    providers.save_data(data)
+    return {"ok": True, "providers": fresh}
 
 
 @app.post("/enrichment/reindex")
@@ -5382,6 +5485,48 @@ body {
           <span style="color:var(--text-muted)">Loading...</span>
         </div>
       </div>
+      <div class="card mt-4">
+        <div class="card-title">🔑 Providers</div>
+        <div id="providerList" class="mt-2" style="font-size:12px"></div>
+        <div class="flex gap-2 mt-2">
+          <button class="btn btn-accent btn-sm" onclick="showAddProvider()">+ Add</button>
+          <button class="btn btn-sm" onclick="loadProviders()">🔄 Refresh</button>
+        </div>
+      </div>
+    </div>
+    <!-- Provider Editor Modal -->
+    <div class="modal-overlay" id="providerModal" style="display:none" onclick="if(event.target===this)closeProviderModal()">
+      <div class="modal" style="max-width:500px">
+        <button class="modal-close" onclick="closeProviderModal()">×</button>
+        <h3 id="providerModalTitle">Add Provider</h3>
+        <div class="flex-column gap-2 mt-2" style="display:flex;flex-direction:column;gap:8px">
+          <div class="setting-row">
+            <span class="label">ID</span>
+            <input type="text" id="pm_id" style="flex:1;font-size:12px" placeholder="e.g. my-provider">
+          </div>
+          <div class="setting-row">
+            <span class="label">Name</span>
+            <input type="text" id="pm_name" style="flex:1;font-size:12px" placeholder="My Provider">
+          </div>
+          <div class="setting-row">
+            <span class="label">Base URL</span>
+            <input type="text" id="pm_base_url" style="flex:1;font-size:12px" placeholder="https://api.example.com/v1">
+          </div>
+          <div class="setting-row">
+            <span class="label">API Key</span>
+            <input type="password" id="pm_api_key" style="flex:1;font-size:12px" placeholder="sk-...">
+          </div>
+          <div class="setting-row">
+            <span class="label">Enabled</span>
+            <input type="checkbox" id="pm_enabled" checked style="width:20px;height:20px">
+          </div>
+        </div>
+        <div class="flex gap-2 mt-3" style="justify-content:flex-end">
+          <button class="btn btn-sm" onclick="closeProviderModal()">Cancel</button>
+          <button class="btn btn-accent btn-sm" id="providerModalSaveBtn" onclick="saveProvider()">Save</button>
+        </div>
+        <input type="hidden" id="pm_edit_id" value="">
+      </div>
     </div>
     <!-- Tab 8: Brain Network -->
       <div class="tab-content" id="tab8">
@@ -6845,9 +6990,23 @@ async function createSnapshot() {
 // ============================================
 // TAB 7: SETTINGS
 // ============================================
+let _providersList = [];
+let _currentProvider = { provider_id: '', model: '' };
+
+async function loadProviders() {
+  try {
+    const data = await api('/providers');
+    if (data.ok) {
+      _providersList = data.providers || [];
+      _currentProvider = data.current || { provider_id: '', model: '' };
+    }
+  } catch(e) { /* silent */ }
+}
+
 async function loadSettings() {
   try {
     state.config = await api('/config');
+    await loadProviders();
     renderConfig();
     loadEnrichSettings();
     loadEnrichStats();
@@ -6870,30 +7029,36 @@ function loadEnrichSettings() {
   el('cfg_enrich_idle_min').value = cfg.enrich_idle_min ?? 0;
   const apiKey = cfg.enrich_llm_api_key || '';
   el('cfg_enrich_llm_api_key').value = apiKey;
-  // Detect provider from URL
-  const url = (cfg.enrich_llm_url || '').toLowerCase();
-  let provider = 'custom';
-  if (url.includes('localhost:11434') || url.includes('127.0.0.1:11434')) provider = 'ollama';
-  else if (url.includes('api.openai.com')) provider = 'openai';
-  else if (url.includes('api.deepseek.com')) provider = 'deepseek';
-  el('cfg_provider').value = provider;
+  // Populate provider dropdown from loaded providers
+  const sel = el('cfg_provider');
+  sel.innerHTML = _providersList
+    .filter(function(p) { return p.enabled !== false; })
+    .map(function(p) { return '<option value="' + esc(p.id) + '">' + esc(p.name || p.id) + '</option>'; })
+    .join('');
+  sel.innerHTML += '<option value="custom">Custom</option>';
+  // Select current provider if known
+  if (_currentProvider.provider_id && sel.querySelector('option[value="' + _currentProvider.provider_id + '"]')) {
+    sel.value = _currentProvider.provider_id;
+    applyProviderFields(_currentProvider.provider_id, _currentProvider.model);
+  }
 }
 
-const PROVIDER_CONFIG = {
-  ollama: { url: 'http://localhost:11434/v1/chat/completions', model: 'deepseek-v4-flash:cloud' },
-  openai: { url: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o' },
-  deepseek: { url: 'https://api.deepseek.com/v1/chat/completions', model: 'deepseek-chat' },
-  custom: { url: '', model: '' },
-};
+function applyProviderFields(providerId, model) {
+  const p = _providersList.find(function(p) { return p.id === providerId; });
+  if (!p) return;
+  const base = p.base_url.replace(/\/+$/, '');
+  const url = base.includes('/v1/') || base.endsWith('/v1')
+    ? base + '/chat/completions'
+    : base + '/v1/chat/completions';
+  el('cfg_enrich_llm_url').value = url;
+  el('cfg_enrich_llm_api_key').value = p.api_key || '';
+  if (model) el('cfg_enrich_llm_model').value = model;
+}
 
 function onProviderChange() {
-  const p = el('cfg_provider').value;
-  const cfg = PROVIDER_CONFIG[p];
-  if (!cfg) return;
-  if (p !== 'custom') {
-    el('cfg_enrich_llm_url').value = cfg.url;
-    el('cfg_enrich_llm_model').value = cfg.model;
-  }
+  const pid = el('cfg_provider').value;
+  if (pid === 'custom') return;
+  applyProviderFields(pid, '');
 }
 
 function toggleApiKeyVisibility() {
@@ -7046,6 +7211,16 @@ async function saveConfig() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updates)
     });
+    // Sync current provider selection
+    const pid = el('cfg_provider').value;
+    if (pid && pid !== 'custom') {
+      const model = el('cfg_enrich_llm_model').value.trim();
+      await fetch(BASE + '/providers/current', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider_id: pid, model: model || 'deepseek-v4-flash' })
+      });
+    }
     toast('Config saved', 'success');
   } catch(e) {
     toast('Save failed: ' + e.message, 'error');
@@ -7077,6 +7252,116 @@ async function consolidateChat() {
     await fetch(BASE + '/chitchat/consolidate', { method: 'POST' });
     toast('Consolidation triggered', 'success');
   } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+// ============================================
+// PROVIDER MANAGEMENT
+// ============================================
+function renderProviderList() {
+  const container = el('providerList');
+  if (!_providersList.length) {
+    container.innerHTML = '<span class="text-muted">No providers configured</span>';
+    return;
+  }
+  container.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:11px">' +
+    _providersList.map(function(p) {
+      return '<tr style="border-bottom:1px solid var(--border)">' +
+        '<td style="padding:4px 6px"><b>' + esc(p.name || p.id) + '</b>' +
+          (p.id === _currentProvider.provider_id ? ' <span class="badge badge-accent">active</span>' : '') +
+        '</td>' +
+        '<td style="padding:4px 6px;font-family:var(--mono);font-size:10px;color:var(--text-muted);max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + esc(p.base_url) + '">' + esc(p.base_url) + '</td>' +
+        '<td style="padding:4px 6px;color:' + (p.api_key ? 'var(--text-muted)' : 'var(--danger)') + '">' +
+          (p.api_key ? '✓ key' : 'no key') +
+        '</td>' +
+        '<td style="padding:4px 6px;white-space:nowrap">' +
+          '<button class="btn btn-xs" onclick="editProvider(\'' + esc(p.id) + '\')" title="Edit">✎</button> ' +
+          '<button class="btn btn-xs btn-warning" onclick="deleteProvider(\'' + esc(p.id) + '\')" title="Delete">✕</button>' +
+        '</td></tr>';
+    }).join('') +
+    '</table>';
+}
+
+function showAddProvider() {
+  el('providerModalTitle').textContent = 'Add Provider';
+  el('pm_id').value = '';
+  el('pm_id').disabled = false;
+  el('pm_name').value = '';
+  el('pm_base_url').value = '';
+  el('pm_api_key').value = '';
+  el('pm_enabled').checked = true;
+  el('pm_edit_id').value = '';
+  el('providerModal').style.display = 'flex';
+}
+
+function closeProviderModal() {
+  el('providerModal').style.display = 'none';
+}
+
+async function saveProvider() {
+  const id = el('pm_id').value.trim();
+  const name = el('pm_name').value.trim();
+  const base_url = el('pm_base_url').value.trim();
+  const api_key = el('pm_api_key').value.trim();
+  const enabled = el('pm_enabled').checked;
+  const editId = el('pm_edit_id').value;
+
+  if (!id || !base_url) {
+    toast('ID and Base URL are required', 'error');
+    return;
+  }
+
+  try {
+    if (editId) {
+      // Update existing
+      const resp = await fetch(BASE + '/providers/' + encodeURIComponent(editId), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name || id, base_url: base_url, api_key: api_key, enabled: enabled })
+      });
+      if (!resp.ok) { const d = await resp.json(); throw new Error(d.detail || 'update failed'); }
+    } else {
+      const resp = await fetch(BASE + '/providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: id, name: name || id, base_url: base_url, api_key: api_key, enabled: enabled })
+      });
+      if (!resp.ok) { const d = await resp.json(); throw new Error(d.detail || 'create failed'); }
+    }
+    closeProviderModal();
+    await loadProviders();
+    // Re-populate enrichment settings
+    loadEnrichSettings();
+    toast('Provider saved', 'success');
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+function editProvider(id) {
+  const p = _providersList.find(function(p) { return p.id === id; });
+  if (!p) return;
+  el('providerModalTitle').textContent = 'Edit Provider';
+  el('pm_id').value = p.id;
+  el('pm_id').disabled = true;
+  el('pm_name').value = p.name || '';
+  el('pm_base_url').value = p.base_url || '';
+  el('pm_api_key').value = p.api_key || '';
+  el('pm_enabled').checked = p.enabled !== false;
+  el('pm_edit_id').value = p.id;
+  el('providerModal').style.display = 'flex';
+}
+
+async function deleteProvider(id) {
+  if (!confirm('Delete provider "' + id + '"?')) return;
+  try {
+    const resp = await fetch(BASE + '/providers/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!resp.ok) { const d = await resp.json(); throw new Error(d.detail || 'delete failed'); }
+    await loadProviders();
+    loadEnrichSettings();
+    toast('Provider deleted', 'warning');
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  }
 }
 
 // ============================================
