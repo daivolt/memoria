@@ -174,6 +174,11 @@ async def _post_chat(
 
 
 def _extract_content(data: dict) -> str:
+    output = data.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if item.get("type") == "message":
+                return item.get("content") or ""
     choice = data.get("choices", [{}])[0]
     msg = choice.get("message", {})
     content = msg.get("content", "") or ""
@@ -270,22 +275,36 @@ async def _enrich_internal(
             }
         )
     messages.append({"role": "user", "content": prompt})
-    payload = {
-        "model": LLM_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": ENRICH_TEMPERATURE,
-    }
+    if "/api/v1/chat" in LLM_URL:
+        payload = {
+            "model": LLM_MODEL,
+            "input": prompt,
+            "max_output_tokens": max_tokens,
+            "temperature": ENRICH_TEMPERATURE,
+        }
+    else:
+        payload = {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": ENRICH_TEMPERATURE,
+        }
     own_session = session is None
     if own_session:
         session = aiohttp.ClientSession()
     t0 = time.time()
     try:
         data = await _post_chat(session, payload)
-        usage = data.get("usage", {}) or {}
-        pt = usage.get("prompt_tokens", 0) or 0
-        ct = usage.get("completion_tokens", 0) or 0
-        tt = usage.get("total_tokens", 0) or 0
+        stats = data.get("stats") if "/api/v1/chat" in LLM_URL else None
+        if stats:
+            pt = stats.get("input_tokens", 0) or 0
+            ct = stats.get("total_output_tokens", 0) or 0
+            tt = pt + ct
+        else:
+            usage = data.get("usage", {}) or {}
+            pt = usage.get("prompt_tokens", 0) or 0
+            ct = usage.get("completion_tokens", 0) or 0
+            tt = usage.get("total_tokens", 0) or 0
         _token_counters["prompt_tokens"] += pt
         _token_counters["completion_tokens"] += ct
         _token_counters["total_tokens"] += tt
