@@ -45,7 +45,7 @@ ENRICH_TEMPERATURE = float(os.environ.get("MEMORIA_ENRICH_TEMPERATURE", "0.0"))
 ENRICH_MAX_RETRIES = 3
 ENRICH_CONCURRENCY = int(os.environ.get("MEMORIA_ENRICH_CONCURRENCY", "4"))
 STALE_PROCESSING_SEC = int(os.environ.get("MEMORIA_ENRICH_STALE_SEC", "600"))
-IDLE_TIMEOUT_MINUTES = int(os.environ.get("MEMORIA_ENRICH_IDLE_MIN", "0"))
+IDLE_TIMEOUT_MINUTES = int(os.environ.get("MEMORIA_ENRICH_IDLE_MIN", "5"))
 
 # Sentinel for records that can't be enriched (prevents infinite re-enqueue)
 _NOKW_SENTINEL = "__NOKW__"
