@@ -44,6 +44,19 @@ STALE_PROCESSING_SEC = int(os.environ.get("MEMORIA_ENRICH_STALE_SEC", "600"))
 # Sentinel for records that can't be enriched (prevents infinite re-enqueue)
 _NOKW_SENTINEL = "__NOKW__"
 
+# In-memory token counters (reset on restart)
+_token_counters: dict[str, int] = {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "calls": 0,
+}
+
+
+def token_stats() -> dict:
+    return dict(_token_counters)
+
+
 # ── Prompt Templates ─────────────────────────────────────────
 
 CORPUS_PROMPT = """Generate search keywords NOT in this text. Synonyms, abbreviations, alternate names. 3-5 phrases. Output only JSON:
@@ -194,6 +207,11 @@ async def _enrich_internal(
         session = aiohttp.ClientSession()
     try:
         data = await _post_chat(session, payload)
+        usage = data.get("usage", {}) or {}
+        _token_counters["prompt_tokens"] += usage.get("prompt_tokens", 0) or 0
+        _token_counters["completion_tokens"] += usage.get("completion_tokens", 0) or 0
+        _token_counters["total_tokens"] += usage.get("total_tokens", 0) or 0
+        _token_counters["calls"] += 1
         raw = _extract_content(data)
         keywords = _parse_keywords(raw)
         if not keywords:

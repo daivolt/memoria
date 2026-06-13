@@ -3666,11 +3666,12 @@ async def update_config(updates: ConfigUpdate):
 
 @app.get("/enrichment/stats")
 async def enrichment_stats():
-    """Get enrichment queue status."""
+    """Get enrichment queue status + token consumption."""
     if not _pool:
         return {"ok": False, "error": "no database connection"}
     try:
         stats = await enrichment.queue_stats(_pool)
+        stats["tokens"] = enrichment.token_stats()
         return {"ok": True, "stats": stats}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -6502,10 +6503,11 @@ function switchChatRoom(room) {
 
 async function updateChatPanels(room) {
   try {
-    const [actRes, monRes, cortexRes] = await Promise.all([
+    const [actRes, monRes, cortexRes, enrichRes] = await Promise.all([
       api('/activity?room=' + encodeURIComponent(room) + '&limit=10'),
       api('/monitor'),
       api('/cortex/status').catch(() => ({ cortex: {} })),
+      api('/enrichment/stats').catch(() => ({ ok: false })),
     ]);
     const cortex = cortexRes.cortex || {};
     // Signals panel
@@ -6528,6 +6530,22 @@ async function updateChatPanels(room) {
             '</span>'
           ).join('')
         : '<span style="color:rgba(148,163,184,0.4)">No activity</span>';
+    }
+    // Token usage line in signals panel
+    const tok = (enrichRes.ok && enrichRes.stats && enrichRes.stats.tokens) ? enrichRes.stats.tokens : null;
+    const sigEl2 = document.getElementById('chatSignals');
+    if (sigEl2 && tok) {
+      const cost = (tok.total_tokens * 0.14 / 1000000).toFixed(3);
+      const tokLine = sigEl2.querySelector('.token-line');
+      if (tokLine) {
+        tokLine.textContent = '🔥 ' + fmtTokens(tok.total_tokens || 0) + ' tok | $' + cost;
+      } else {
+        const div = document.createElement('span');
+        div.className = 'token-line';
+        div.style.cssText = 'display:block;margin-top:4px;font-size:10px;color:var(--warning)';
+        div.textContent = '🔥 ' + fmtTokens(tok.total_tokens || 0) + ' tok | $' + cost;
+        sigEl2.appendChild(div);
+      }
     }
     // Monitor panel
     const ags = monRes.agents || [];
@@ -6821,14 +6839,23 @@ function toggleApiKeyVisibility() {
   inp.type = inp.type === 'password' ? 'text' : 'password';
 }
 
+function fmtTokens(n) {
+  return n >= 1000000 ? (n / 1000000).toFixed(1) + 'M'
+    : n >= 1000 ? (n / 1000).toFixed(1) + 'K'
+    : n;
+}
+
 async function loadEnrichStats() {
   try {
     const data = await api('/enrichment/stats');
     if (data.ok) {
       const s = data.stats;
+      const t = s.tokens || {};
+      const cost = ((t.total_tokens || 0) * 0.14 / 1000000).toFixed(3);
       el('enrichStatus').innerHTML =
         'Queue: <b>' + s.pending + '</b> pending, <b>' + s.done + '</b> done, <b>' + s.error + '</b> errors | ' +
-        'Last enriched: <b>' + (s.last_enriched ? ago(s.last_enriched) + ' ago' : 'never') + '</b>';
+        'Last enriched: <b>' + (s.last_enriched ? ago(s.last_enriched) + ' ago' : 'never') + '</b> | ' +
+        '🔥 <b>' + fmtTokens(t.total_tokens || 0) + '</b> tokens in <b>' + (t.calls || 0) + '</b> calls (<b>$' + cost + '</b>)';
     }
   } catch(e) {
     el('enrichStatus').textContent = 'Stats unavailable';
