@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from typing import Any
 
 import aiohttp
@@ -84,6 +85,43 @@ def idle_status() -> dict:
         "timeout_min": IDLE_TIMEOUT_MINUTES,
         "last_activity": _last_activity_time,
     }
+
+
+# Pipeline log — ring buffer of recent enrichment operations
+_pipeline_log: deque = deque(maxlen=500)
+
+
+def _log_pipeline(
+    surface: str = "?",
+    record_id: str = "?",
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    keywords: int = 0,
+    status: str = "ok",
+    error: str = "",
+    duration_ms: int = 0,
+    queue_id: int = 0,
+):
+    _pipeline_log.append(
+        {
+            "ts": time.time(),
+            "surface": surface,
+            "record_id": record_id,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "keywords": keywords,
+            "status": status,
+            "error": error,
+            "duration_ms": duration_ms,
+            "queue_id": queue_id,
+        }
+    )
+
+
+def pipeline_log(limit: int = 50) -> list[dict]:
+    return list(_pipeline_log)[-limit:]
 
 
 # ── Prompt Templates ─────────────────────────────────────────
@@ -209,6 +247,7 @@ async def _enrich_internal(
     max_keywords: int,
     session: aiohttp.ClientSession = None,
     is_paper: bool = False,
+    pipeline_ctx: dict | None = None,
 ) -> list[str]:
     if not ENRICH_ENABLED:
         return []
@@ -234,19 +273,39 @@ async def _enrich_internal(
     own_session = session is None
     if own_session:
         session = aiohttp.ClientSession()
+    t0 = time.time()
     try:
         data = await _post_chat(session, payload)
         usage = data.get("usage", {}) or {}
-        _token_counters["prompt_tokens"] += usage.get("prompt_tokens", 0) or 0
-        _token_counters["completion_tokens"] += usage.get("completion_tokens", 0) or 0
-        _token_counters["total_tokens"] += usage.get("total_tokens", 0) or 0
+        pt = usage.get("prompt_tokens", 0) or 0
+        ct = usage.get("completion_tokens", 0) or 0
+        tt = usage.get("total_tokens", 0) or 0
+        _token_counters["prompt_tokens"] += pt
+        _token_counters["completion_tokens"] += ct
+        _token_counters["total_tokens"] += tt
         _token_counters["calls"] += 1
         raw = _extract_content(data)
         keywords = _parse_keywords(raw)
         if not keywords:
             keywords = _extract_keywords_from_reasoning(data)
+        nkw = len(keywords[:max_keywords])
+        _log_pipeline(
+            **(pipeline_ctx or {}),
+            prompt_tokens=pt,
+            completion_tokens=ct,
+            total_tokens=tt,
+            keywords=nkw,
+            status="ok",
+            duration_ms=int((time.time() - t0) * 1000),
+        )
         return keywords[:max_keywords]
     except Exception as e:
+        _log_pipeline(
+            **(pipeline_ctx or {}),
+            status="error",
+            error=str(e)[:200],
+            duration_ms=int((time.time() - t0) * 1000),
+        )
         logger.warning("enrich_internal failed: %s", e)
         return []
     finally:
@@ -258,15 +317,21 @@ async def enrich_text(
     text: str,
     session: aiohttp.ClientSession = None,
     is_paper: bool = False,
+    pipeline_ctx: dict | None = None,
 ) -> list[str]:
-    return await _enrich_internal(text, CORPUS_PROMPT, 5, session, is_paper=is_paper)
+    return await _enrich_internal(
+        text, CORPUS_PROMPT, 5, session, is_paper=is_paper, pipeline_ctx=pipeline_ctx
+    )
 
 
 async def expand_query(
     query: str,
     session: aiohttp.ClientSession = None,
+    pipeline_ctx: dict | None = None,
 ) -> list[str]:
-    return await _enrich_internal(query, QUERY_PROMPT, 10, session)
+    return await _enrich_internal(
+        query, QUERY_PROMPT, 10, session, pipeline_ctx=pipeline_ctx
+    )
 
 
 # ── DF (Document Frequency) Filter ───────────────────────────
@@ -421,8 +486,9 @@ async def _process_one(
     text: str,
 ) -> bool:
     try:
+        ctx = {"surface": surface, "record_id": record_id, "queue_id": queue_id}
         is_paper = surface == "papers"
-        keywords = await enrich_text(text, session, is_paper=is_paper)
+        keywords = await enrich_text(text, session, is_paper=is_paper, pipeline_ctx=ctx)
         if not keywords:
             await _mark_queue_error(pool, queue_id, "no_keywords_generated")
             await _mark_unenrichable(pool, surface, record_id)

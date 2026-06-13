@@ -3692,6 +3692,11 @@ async def enrichment_stats():
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/enrichment/pipeline-log")
+async def enrichment_pipeline_log(limit: int = 50):
+    return {"ok": True, "entries": enrichment.pipeline_log(limit=limit)}
+
+
 @app.post("/enrichment/reindex")
 async def trigger_reindex():
     """Re-enqueue all records for enrichment (use after model/prompt changes)."""
@@ -5368,6 +5373,12 @@ body {
           <button class="btn btn-warning btn-sm" onclick="consolidateChat()">🔄 Consolidate</button>
         </div>
       </div>
+      <div class="card mt-4">
+        <div class="card-title">📋 Pipeline Log <span class="text-sm text-muted" id="pipelineLogCount"></span></div>
+        <div style="max-height:300px;overflow-y:auto;font-family:var(--mono);font-size:10px;line-height:1.6" id="pipelineLogEntries">
+          <span style="color:var(--text-muted)">Loading...</span>
+        </div>
+      </div>
     </div>
     <!-- Tab 8: Brain Network -->
       <div class="tab-content" id="tab8">
@@ -6837,6 +6848,7 @@ async function loadSettings() {
     renderConfig();
     loadEnrichSettings();
     loadEnrichStats();
+    loadPipelineLog();
     setConn(true);
   } catch(e) {
     setConn(false);
@@ -6946,6 +6958,36 @@ async function loadEnrichStats() {
     }
   } catch(e) {
     el('enrichStatus').textContent = 'Stats unavailable';
+  }
+}
+
+async function loadPipelineLog() {
+  try {
+    const data = await api('/enrichment/pipeline-log?limit=50');
+    if (!data.ok) return;
+    const entries = data.entries || [];
+    el('pipelineLogCount').textContent = '(' + entries.length + ')';
+    el('pipelineLogEntries').innerHTML = entries.length
+      ? entries.slice().reverse().slice(0, 30).map(function(e) {
+          const t = ago(e.ts);
+          const s = e.surface === '?' ? '' : esc(e.surface.slice(0, 8));
+          const rid = e.record_id === '?' ? '' : esc(e.record_id.slice(0, 12));
+          const kw = e.status === 'ok' ? ' kw=' + e.keywords : '';
+          const tok = e.status === 'ok' ? ' tok=' + e.total_tokens : '';
+          const ms = e.duration_ms ? ' ' + e.duration_ms + 'ms' : '';
+          const err = e.error ? ' ⚠' + esc(e.error.slice(0, 40)) : '';
+          const col = e.status === 'ok' ? 'var(--text-muted)' : 'var(--danger)';
+          return '<div style="color:' + col + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
+            '<span style="color:var(--text-muted)">' + t + '</span> ' +
+            (s ? '<span style="color:var(--accent)">' + s + '</span>/' : '') +
+            (rid ? '<span>' + rid + '</span>' : '') +
+            '<span style="color:var(--warning)">' + kw + tok + '</span>' +
+            ms + err +
+            '</div>';
+        }).join('')
+      : '<span style="color:var(--text-muted)">No enrichment calls yet</span>';
+  } catch(e) {
+    // silent
   }
 }
 
@@ -7485,7 +7527,7 @@ setInterval(() => {
   else if (state.tab === 4) loadRecall();
   else if (state.tab === 5) { loadChat(); loadRateLimit(); }
   else if (state.tab === 6) loadSafety();
-  else if (state.tab === 7) { loadSettings(); }
+  else if (state.tab === 7) { loadEnrichStats(); loadPipelineLog(); }
   else if (state.tab === 8) { loadBrainDelayed(); }
 }, 3000);
 
