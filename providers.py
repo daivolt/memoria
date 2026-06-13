@@ -89,6 +89,7 @@ def _default_data() -> dict:
             "provider_id": "deepseek",
             "model": "deepseek-v4-flash",
         },
+        "llm_locked": True,
     }
 
 
@@ -182,8 +183,19 @@ def _ensure_chat_url(url: str) -> str:
     return url + "/v1/chat/completions"
 
 
+def get_llm_locked() -> bool:
+    return load_data().get("llm_locked", True)
+
+
+def set_llm_locked(locked: bool):
+    data = load_data()
+    data["llm_locked"] = locked
+    save_data(data)
+    sync_enrichment()
+
+
 def sync_enrichment():
-    """Sync enrichment.LLM_URL, LLM_MODEL, LLM_API_KEY from providers.json current."""
+    """Sync enrichment.LLM_URL, LLM_MODEL, LLM_API_KEY, LLM_LOCKED from providers.json."""
     import enrichment
 
     data = load_data()
@@ -191,6 +203,7 @@ def sync_enrichment():
     cur = data.get("current", {})
     pid = cur.get("provider_id", "")
     model = cur.get("model", "")
+    enrichment.LLM_LOCKED = data.get("llm_locked", True)
     if pid and pid in all_providers:
         prov = all_providers[pid]
         enrichment.LLM_URL = _ensure_chat_url(prov["base_url"])

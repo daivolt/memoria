@@ -25,6 +25,7 @@ import aiohttp
 
 logger = logging.getLogger("enrichment")
 
+LLM_LOCKED = os.environ.get("MEMORIA_LLM_LOCKED", "true").lower() == "true"
 LLM_URL = os.environ.get(
     "MEMORIA_LLM_URL", "http://localhost:11434/v1/chat/completions"
 )
@@ -253,6 +254,8 @@ async def _enrich_internal(
     pipeline_ctx: dict | None = None,
 ) -> list[str]:
     if not ENRICH_ENABLED:
+        return []
+    if LLM_LOCKED:
         return []
     if not text or not text.strip():
         return []

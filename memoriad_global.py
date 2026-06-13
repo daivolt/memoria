@@ -3787,6 +3787,67 @@ async def set_current_provider(body: ProviderCurrent):
     return {"ok": True}
 
 
+class ProviderTest(BaseModel):
+    base_url: str
+    api_key: str = ""
+    model: str = "test"
+
+
+@app.post("/providers/test")
+async def test_provider(body: ProviderTest):
+    url = body.base_url.rstrip("/")
+    if "/chat/completions" not in url:
+        if "/v1/" in url or url.endswith("/v1"):
+            url += "/chat/completions"
+        else:
+            url += "/v1/chat/completions"
+    req_body = json.dumps(
+        {
+            "model": body.model,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 5,
+            "stream": False,
+        }
+    ).encode()
+    req = urllib.request.Request(url, data=req_body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if body.api_key:
+        req.add_header("Authorization", f"Bearer {body.api_key}")
+    t0 = time.time()
+    try:
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(
+            None, lambda: urllib.request.urlopen(req, timeout=15)
+        )
+        data = json.loads(resp.read())
+        latency = int((time.time() - t0) * 1000)
+        ok = bool(data.get("choices"))
+        return {"ok": ok, "success": ok, "latency_ms": latency, "model": body.model}
+    except Exception as e:
+        latency = int((time.time() - t0) * 1000)
+        return {
+            "ok": False,
+            "success": False,
+            "error": str(e)[:200],
+            "latency_ms": latency,
+        }
+
+
+class LLMLockBody(BaseModel):
+    locked: bool
+
+
+@app.get("/llm-lock")
+async def get_llm_lock():
+    return {"locked": providers.get_llm_locked()}
+
+
+@app.post("/llm-lock")
+async def set_llm_lock(body: LLMLockBody):
+    providers.set_llm_locked(body.locked)
+    return {"ok": True, "locked": body.locked}
+
+
 @app.post("/providers/seed")
 async def seed_providers():
     """Re-seed providers from loadbalancer.env, preserving API keys for existing entries."""
@@ -5487,6 +5548,12 @@ body {
       </div>
       <div class="card mt-4">
         <div class="card-title">🔑 Providers</div>
+        <div class="flex gap-2 mt-2" style="align-items:center;padding:8px 10px;border-radius:6px;background:var(--bg-alt, rgba(255,255,255,0.03))">
+          <span id="llmLockIcon" style="font-size:18px">🔒</span>
+          <span id="llmLockLabel" style="flex:1;font-weight:600;font-size:13px;color:var(--danger)">LOCKED</span>
+          <span id="llmLockSpinner" style="display:none;font-size:12px">⏳</span>
+          <button class="btn btn-sm" id="llmLockBtn" onclick="toggleLLMLock()" style="min-width:80px">Unlock</button>
+        </div>
         <div id="providerList" class="mt-2" style="font-size:12px"></div>
         <div class="flex gap-2 mt-2">
           <button class="btn btn-accent btn-sm" onclick="showAddProvider()">+ Add</button>
@@ -5523,6 +5590,7 @@ body {
         </div>
         <div class="flex gap-2 mt-3" style="justify-content:flex-end">
           <button class="btn btn-sm" onclick="closeProviderModal()">Cancel</button>
+          <button class="btn btn-sm" id="providerModalTestBtn" onclick="testProvider()">Test</button>
           <button class="btn btn-accent btn-sm" id="providerModalSaveBtn" onclick="saveProvider()">Save</button>
         </div>
         <input type="hidden" id="pm_edit_id" value="">
@@ -7007,6 +7075,7 @@ async function loadSettings() {
   try {
     state.config = await api('/config');
     await loadProviders();
+    await loadLLMLock();
     renderConfig();
     loadEnrichSettings();
     loadEnrichStats();
@@ -7257,6 +7326,43 @@ async function consolidateChat() {
 // ============================================
 // PROVIDER MANAGEMENT
 // ============================================
+async function loadLLMLock() {
+  try {
+    const data = await api('/llm-lock');
+    const locked = data.locked !== false;
+    el('llmLockIcon').textContent = locked ? '🔒' : '🔓';
+    el('llmLockLabel').textContent = locked ? 'LOCKED' : 'UNLOCKED';
+    el('llmLockLabel').style.color = locked ? 'var(--danger)' : 'var(--success, #4caf50)';
+    el('llmLockBtn').textContent = locked ? 'Unlock' : 'Lock';
+    el('llmLockBtn').className = locked ? 'btn btn-sm btn-warning' : 'btn btn-sm btn-accent';
+  } catch(e) {
+    el('llmLockLabel').textContent = '?';
+  }
+}
+
+async function toggleLLMLock() {
+  const btn = el('llmLockBtn');
+  const spinner = el('llmLockSpinner');
+  btn.disabled = true;
+  spinner.style.display = 'inline';
+  try {
+    const current = el('llmLockLabel').textContent === 'LOCKED';
+    const resp = await fetch(BASE + '/llm-lock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ locked: !current })
+    });
+    if (!resp.ok) throw new Error('toggle failed');
+    await loadLLMLock();
+    toast(current ? 'LLM unlocked' : 'LLM locked', current ? 'success' : 'warning');
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    spinner.style.display = 'none';
+  }
+}
+
 function renderProviderList() {
   const container = el('providerList');
   if (!_providersList.length) {
@@ -7361,6 +7467,34 @@ async function deleteProvider(id) {
     toast('Provider deleted', 'warning');
   } catch(e) {
     toast('Failed: ' + e.message, 'error');
+  }
+}
+
+async function testProvider() {
+  const base_url = el('pm_base_url').value.trim();
+  const api_key = el('pm_api_key').value.trim();
+  if (!base_url) { toast('Enter a Base URL first', 'error'); return; }
+  const btn = el('providerModalTestBtn');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  try {
+    const resp = await fetch(BASE + '/providers/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base_url: base_url, api_key: api_key, model: 'test' })
+    });
+    const data = await resp.json();
+    if (data.success) {
+      toast('Connected! ' + data.latency_ms + 'ms', 'success');
+    } else {
+      toast('Failed: ' + (data.error || 'unknown error'), 'error');
+    }
+  } catch(e) {
+    toast('Test failed: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
   }
 }
 
