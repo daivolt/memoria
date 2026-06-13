@@ -7409,8 +7409,8 @@ function renderProviderList() {
           (p.api_key ? '✓ key' : 'no key') +
         '</td>' +
         '<td style="padding:4px 6px;white-space:nowrap">' +
-          '<button class="btn btn-xs" onclick="editProvider(\'' + esc(p.id) + '\')" title="Edit">✎</button> ' +
-          '<button class="btn btn-xs btn-warning" onclick="deleteProvider(\'' + esc(p.id) + '\')" title="Delete">✕</button>' +
+          '<button class="btn btn-xs" onclick="editProvider(' + "'" + esc(p.id) + "'" + ')" title="Edit">✎</button> ' +
+          '<button class="btn btn-xs btn-warning" onclick="deleteProvider(' + "'" + esc(p.id) + "'" + ')" title="Delete">✕</button>' +
         '</td></tr>';
     }).join('') +
     '</table>';
@@ -7553,7 +7553,7 @@ async function loadRoutes() {
             '<input type="text" id="route_input_' + esc(name) + '" value="' + esc(r) + '" style="width:180px;font-size:11px;font-family:var(--mono);padding:2px 4px" placeholder="provider/model or qa-auto">' +
           '</td>' +
           '<td style="padding:4px 6px">' +
-            '<button class="btn btn-xs" onclick="saveRoute(\'' + esc(name) + '\')">💾</button>' +
+            '<button class="btn btn-xs" onclick="saveRoute(' + "'" + esc(name) + "'" + ')">💾</button>' +
           '</td></tr>';
       }).join('') +
       '</table>' +
