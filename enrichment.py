@@ -40,6 +40,7 @@ ENRICH_TEMPERATURE = float(os.environ.get("MEMORIA_ENRICH_TEMPERATURE", "0.0"))
 ENRICH_MAX_RETRIES = 3
 ENRICH_CONCURRENCY = int(os.environ.get("MEMORIA_ENRICH_CONCURRENCY", "4"))
 STALE_PROCESSING_SEC = int(os.environ.get("MEMORIA_ENRICH_STALE_SEC", "600"))
+IDLE_TIMEOUT_MINUTES = int(os.environ.get("MEMORIA_ENRICH_IDLE_MIN", "0"))
 
 # Sentinel for records that can't be enriched (prevents infinite re-enqueue)
 _NOKW_SENTINEL = "__NOKW__"
@@ -55,6 +56,34 @@ _token_counters: dict[str, int] = {
 
 def token_stats() -> dict:
     return dict(_token_counters)
+
+
+# In-memory idle tracking
+_last_activity_time: float = time.time()
+
+
+def record_activity():
+    global _last_activity_time
+    _last_activity_time = time.time()
+
+
+def idle_status() -> dict:
+    if IDLE_TIMEOUT_MINUTES <= 0:
+        return {
+            "idle": False,
+            "remaining_sec": -1,
+            "timeout_min": 0,
+            "last_activity": _last_activity_time,
+        }
+    elapsed = time.time() - _last_activity_time
+    timeout_sec = IDLE_TIMEOUT_MINUTES * 60
+    remaining = max(0, timeout_sec - elapsed)
+    return {
+        "idle": elapsed >= timeout_sec,
+        "remaining_sec": remaining,
+        "timeout_min": IDLE_TIMEOUT_MINUTES,
+        "last_activity": _last_activity_time,
+    }
 
 
 # ── Prompt Templates ─────────────────────────────────────────

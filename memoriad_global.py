@@ -28,6 +28,7 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
     Response,
@@ -3601,8 +3602,17 @@ async def get_config():
         "enrich_weight": enrichment.EXPANSION_WEIGHT,
         "enrich_df_ratio": enrichment.MAX_DF_RATIO,
         "enrich_temperature": enrichment.ENRICH_TEMPERATURE,
+        "enrich_idle_min": enrichment.IDLE_TIMEOUT_MINUTES,
         "papers_dir": str(PAPERS_DIR),
     }
+
+
+# Middleware: record activity on every request (resets idle timer)
+@app.middleware("http")
+async def record_activity_middleware(request: Request, call_next):
+    enrichment.record_activity()
+    response = await call_next(request)
+    return response
 
 
 class ConfigUpdate(BaseModel):
@@ -3623,6 +3633,7 @@ class ConfigUpdate(BaseModel):
     enrich_weight: Optional[float] = None
     enrich_df_ratio: Optional[float] = None
     enrich_temperature: Optional[float] = None
+    enrich_idle_min: Optional[int] = None
 
 
 @app.patch("/config")
@@ -3660,6 +3671,8 @@ async def update_config(updates: ConfigUpdate):
         enrichment.MAX_DF_RATIO = data["enrich_df_ratio"]
     if "enrich_temperature" in data:
         enrichment.ENRICH_TEMPERATURE = data["enrich_temperature"]
+    if "enrich_idle_min" in data:
+        enrichment.IDLE_TIMEOUT_MINUTES = data["enrich_idle_min"]
 
     return {"ok": True, "updated": list(data.keys())}
 
@@ -3672,6 +3685,8 @@ async def enrichment_stats():
     try:
         stats = await enrichment.queue_stats(_pool)
         stats["tokens"] = enrichment.token_stats()
+        stats["idle"] = enrichment.idle_status()
+        stats["enabled"] = enrichment.ENRICH_ENABLED
         return {"ok": True, "stats": stats}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -5052,6 +5067,27 @@ body {
   0%, 100% { opacity: 0.4; transform: scale(0.8); }
   50% { opacity: 1; transform: scale(1.2); }
 }
+
+/* LLM toggle in topbar */
+.topbar-divider { width:1px; height:18px; background:var(--border); margin:0 8px; display:inline-block; vertical-align:middle; }
+.enrich-toggle { cursor:pointer; display:inline-flex; align-items:center; gap:5px; font-size:12px; padding:2px 8px; border-radius:4px; transition:background .2s; vertical-align:middle; }
+.enrich-toggle:hover { background:var(--bg-elevated); }
+.enrich-toggle .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+.enrich-toggle .dot.on { background:var(--success); box-shadow:0 0 6px rgba(74,222,128,.5); }
+.enrich-toggle .dot.off { background:var(--text-muted); }
+.enrich-toggle .dot.idle { background:var(--warning); animation:pulse-dot 1.5s ease-in-out infinite; }
+.idle-countdown { font-size:10px; color:var(--text-muted); margin-left:2px; }
+
+/* Sidebar bottom: LLM toggle */
+.sidebar-spacer { flex:1; }
+.sidebar-llm-toggle { display:flex; align-items:center; gap:6px; padding:8px 16px; cursor:pointer; font-size:12px; color:var(--text-muted); border-top:1px solid var(--border); transition:background .2s,color .2s; }
+.sidebar-llm-toggle:hover { background:var(--bg-elevated); color:var(--text-primary); }
+.sidebar-llm-toggle .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+.sidebar-llm-toggle .dot.on { background:var(--success); box-shadow:0 0 6px rgba(74,222,128,.5); }
+.sidebar-llm-toggle .dot.off { background:var(--text-muted); }
+.sidebar-llm-toggle .dot.idle { background:var(--warning); animation:pulse-dot 1.5s ease-in-out infinite; }
+.sidebar-llm-toggle .idle-countdown { margin-left:auto; font-size:10px; color:var(--text-muted); }
+#enrichLabel { white-space:nowrap; }
 </style>
 <script src="/static/d3.v7.min.js"></script>
 </head>
@@ -5096,6 +5132,12 @@ body {
     <div class="nav-item" data-tab="6" onclick="switchTab(6)"><span class="icon">🛡</span> Safety</div>
     <div class="nav-item" data-tab="7" onclick="switchTab(7)"><span class="icon">⚙</span> Settings</div>
     <div class="nav-item" data-tab="8" onclick="switchTab(8)"><span class="icon">🧠</span> Brain</div>
+    <div class="sidebar-spacer"></div>
+    <div class="sidebar-llm-toggle" id="enrichToggle" onclick="toggleEnrich()" title="Toggle LLM enrichment">
+      <span class="dot" id="enrichDot"></span>
+      <span id="enrichLabel">LLM Enrichment</span>
+      <span class="idle-countdown" id="idleCountdown"></span>
+    </div>
   </div>
 
   <!-- Main Content -->
@@ -5306,6 +5348,10 @@ body {
           <div class="setting-row" style="flex:1;min-width:100px">
             <span class="label">Temperature</span>
             <input type="number" id="cfg_enrich_temperature" value="0.4" data-key="enrich_temperature" step="0.1" min="0.0" max="1.0" style="width:80px">
+          </div>
+          <div class="setting-row" style="flex:0 0 auto">
+            <span class="label">Idle Timeout (min)</span>
+            <input type="number" id="cfg_enrich_idle_min" value="0" min="0" style="width:60px" title="Auto-disconnect after N min idle. 0 = never.">
           </div>
         </div>
         <div style="margin-top:12px;font-size:12px;color:var(--text-muted)" id="enrichStatus">
@@ -6806,6 +6852,7 @@ function loadEnrichSettings() {
   el('cfg_enrich_weight').value = cfg.enrich_weight ?? 0.5;
   el('cfg_enrich_df_ratio').value = cfg.enrich_df_ratio ?? 0.1;
   el('cfg_enrich_temperature').value = cfg.enrich_temperature ?? 0.4;
+  el('cfg_enrich_idle_min').value = cfg.enrich_idle_min ?? 0;
   const apiKey = cfg.enrich_llm_api_key || '';
   el('cfg_enrich_llm_api_key').value = apiKey;
   // Detect provider from URL
@@ -6839,6 +6886,29 @@ function toggleApiKeyVisibility() {
   inp.type = inp.type === 'password' ? 'text' : 'password';
 }
 
+async function toggleEnrich() {
+  const on = el('enrichToggle').dataset.enabled !== '1';
+  const resp = await fetch(BASE + '/config', {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enrich_enabled: on}),
+  });
+  if (resp.ok) {
+    el('cfg_enrich_enabled').checked = on;
+    updateEnrichToggle(on);
+    toast('LLM ' + (on ? 'connected' : 'disconnected'), on ? 'success' : 'warning');
+  }
+}
+
+function updateEnrichToggle(on) {
+  const tog = el('enrichToggle');
+  if (!tog) return;
+  tog.dataset.enabled = on ? '1' : '0';
+  const dot = el('enrichDot');
+  dot.className = 'dot ' + (on ? 'on' : 'off');
+  el('enrichLabel').textContent = on ? 'LLM Connected' : 'LLM Disconnected';
+}
+
 function fmtTokens(n) {
   return n >= 1000000 ? (n / 1000000).toFixed(1) + 'M'
     : n >= 1000 ? (n / 1000).toFixed(1) + 'K'
@@ -6856,6 +6926,23 @@ async function loadEnrichStats() {
         'Queue: <b>' + s.pending + '</b> pending, <b>' + s.done + '</b> done, <b>' + s.error + '</b> errors | ' +
         'Last enriched: <b>' + (s.last_enriched ? ago(s.last_enriched) + ' ago' : 'never') + '</b> | ' +
         '🔥 <b>' + fmtTokens(t.total_tokens || 0) + '</b> tokens in <b>' + (t.calls || 0) + '</b> calls (<b>$' + cost + '</b>)';
+      // Sync sidebar toggle
+      const idle = s.idle || {};
+      const on = data.ok && s && s.enabled !== false;
+      updateEnrichToggle(on);
+      const cd = el('idleCountdown');
+      if (cd && idle.timeout_min > 0) {
+        if (idle.idle) {
+          cd.textContent = 'auto ✕';
+          cd.style.color = 'var(--danger)';
+        } else {
+          const sec = Math.ceil(idle.remaining_sec);
+          cd.textContent = Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0');
+          cd.style.color = '';
+        }
+      } else if (cd) {
+        cd.textContent = '';
+      }
     }
   } catch(e) {
     el('enrichStatus').textContent = 'Stats unavailable';
@@ -6900,6 +6987,8 @@ async function saveConfig() {
   if (!isNaN(df)) updates['enrich_df_ratio'] = df;
   const temp = parseFloat(el('cfg_enrich_temperature').value);
   if (!isNaN(temp)) updates['enrich_temperature'] = temp;
+  const idle = parseInt(el('cfg_enrich_idle_min').value);
+  if (!isNaN(idle)) updates['enrich_idle_min'] = idle;
   const llm_url = el('cfg_enrich_llm_url').value.trim();
   if (llm_url) updates['enrich_llm_url'] = llm_url;
   const llm_model = el('cfg_enrich_llm_model').value.trim();
@@ -7377,6 +7466,11 @@ function filterBrainTasksByAgent(name) {
 // INIT
 // ============================================
 initTabFromHash();
+updateEnrichToggle(false); // default off, loadEnrichStats will sync
+
+// Poll enrich stats every 5s for sidebar toggle + idle countdown
+setInterval(loadEnrichStats, 5000);
+loadEnrichStats();
 
 window.addEventListener('hashchange', function() {
   const m = location.hash.match(/tab=(\\d)/);
