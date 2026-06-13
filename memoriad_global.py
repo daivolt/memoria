@@ -3660,7 +3660,10 @@ async def update_config(updates: ConfigUpdate):
         ENRICH_ENABLED = data["enrich_enabled"]
         enrichment.ENRICH_ENABLED = data["enrich_enabled"]
     if "enrich_llm_url" in data:
-        enrichment.LLM_URL = data["enrich_llm_url"]
+        url = data["enrich_llm_url"]
+        if url and "/chat/completions" not in url and "/v1/" not in url:
+            url = url.rstrip("/") + "/v1/chat/completions"
+        enrichment.LLM_URL = url
     if "enrich_llm_model" in data:
         enrichment.LLM_MODEL = data["enrich_llm_model"]
     if "enrich_llm_api_key" in data:
