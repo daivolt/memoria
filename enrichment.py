@@ -10,7 +10,7 @@ Two surfaces:
   QUERY-SIDE (recall-time): LLM expands user query → DF filter validates terms
     against the corpus → weighted retrieval.
 
-LLM backend: Ollama Cloud via local proxy (deepseek-v4-flash:cloud).
+LLM backend: DeepSeek API (deepseek-v4-flash).
 """
 
 import asyncio

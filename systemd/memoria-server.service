@@ -16,8 +16,11 @@ Environment=CHITCHAT_URL=http://localhost:19999
 Environment=MEMORIA_PORT=19998
 Environment=MEMORIA_HOST=0.0.0.0
 Environment=OPENCODE_DB=/home/daivolt/.local/share/opencode/opencode.db
-Environment=LLM_URL=http://localhost:11434/v1/chat/completions
-Environment=LLM_MODEL=deepseek-v4-flash:cloud
+# Environment=LLM_URL=http://localhost:11434/v1/chat/completions     # Ollama (local)
+# Environment=LLM_MODEL=deepseek-v4-flash:cloud                     # Ollama Cloud model
+Environment=MEMORIA_LLM_URL=https://api.deepseek.com/chat/completions
+Environment=MEMORIA_LLM_MODEL=deepseek-v4-flash
+Environment=MEMORIA_LLM_API_KEY=sk-419e7a5db4e3479db962615fa1c1a103
 Environment=PGHOST=localhost
 Environment=PGUSER=postgres
 Environment=PGDATABASE=memoria
