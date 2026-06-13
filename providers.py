@@ -13,6 +13,7 @@ _PROVIDER_NAMES = {
     "SILICONFLOW": "SiliconFlow",
     "GROQ": "Groq",
     "OLLAMA": "Ollama (Local)",
+    "LMSTUDIO": "LM Studio",
     "OPENAI": "OpenAI",
 }
 
