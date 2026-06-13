@@ -3,11 +3,12 @@
 ## Deploy
 
 ```bash
-./deploy.sh          # ci_check → restart → verify
-./deploy.sh --force  # skip ci_check, just restart
+./deploy.sh  # ci_check → restart → verify
 ```
 
-Full service restart: stops chitchat-server, memoria-server, and all agents, then starts in order. CI check gates the deploy.
+**NEVER use `--force`**. It skips ci_check and can leave services in a broken state. If deploy fails, fix the issue first, then deploy cleanly.
+
+Full service restart: stops chitchat-server, memoria-server, and all agents, then starts in order. CI check gates the deploy. If ci_check hangs because services are down, start services manually first, then run deploy.sh.
 
 ## CI
 
