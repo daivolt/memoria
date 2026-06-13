@@ -250,13 +250,6 @@ async def _append_session(rec: dict):
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
-    # Enrichment hook
-    if _pool and ENRICH_ENABLED:
-        text = f"{rec.get('title', '')} {rec.get('task', '')} {rec.get('summary', '')}"
-        try:
-            await enrichment.enqueue_enrichment(_pool, "sessions", rec["id"], text)
-        except Exception:
-            pass
 
 
 def _glob_wd(project: str) -> Path:
@@ -412,14 +405,6 @@ async def _store_message(msg: dict, room: str):
     path = room_dir / "inbox.jsonl"
     with open(path, "a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    # Enrichment hook
-    if _pool and ENRICH_ENABLED:
-        try:
-            await enrichment.enqueue_enrichment(
-                _pool, "chitchat", msg.get("ts", ""), msg.get("text", "")
-            )
-        except Exception:
-            pass
 
 
 async def poll_chitchat():
@@ -1306,10 +1291,6 @@ async def _papers_watcher_loop():
                     pid_row = await conn.fetchrow(
                         "SELECT id FROM papers WHERE filename = $1", fname
                     )
-                    if pid_row:
-                        await enrichment.enqueue_enrichment(
-                            _pool, "papers", str(pid_row["id"]), text
-                        )
                 print(f"[papers] indexed {fname} ({len(text)} chars)", flush=True)
         except Exception as e:
             print(f"[papers] watcher error: {e}", flush=True)
@@ -1859,14 +1840,6 @@ async def _add_fact_to_topic(topic: str, text: str):
         await pg.add_topic_fact(topic, text)
     except Exception:
         pass
-    # Enrichment hook
-    if _pool and ENRICH_ENABLED:
-        try:
-            await enrichment.enqueue_enrichment(
-                _pool, "topics", topic, f"{topic} {text}"
-            )
-        except Exception:
-            pass
     topics_dir = WORKDIR / "topics"
     topics_dir.mkdir(parents=True, exist_ok=True)
     tpath = topics_dir / f"{topic}.md"
