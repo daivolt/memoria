@@ -109,6 +109,7 @@ FEDERATION_AUTO_SYNC = os.environ.get("FEDERATION_AUTO_SYNC", "true").lower() ==
 
 # ── SIRA-style enrichment ─────────────────────────────────────
 
+CONFIG_PATH = Path.home() / ".config/memoria/config.json"
 ENRICH_ENABLED = os.environ.get("MEMORIA_ENRICH_ENABLED", "true").lower() == "true"
 ENRICH_POLL_INTERVAL = int(os.environ.get("MEMORIA_ENRICH_POLL_INTERVAL", "5"))
 PAPERS_WATCH_INTERVAL = int(os.environ.get("MEMORIA_PAPERS_WATCH_INTERVAL", "60"))
@@ -862,6 +863,7 @@ async def _deep_consolidate():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_config()
     _init_index()
     federation._init_federation(WORKDIR)
     providers.sync_enrichment()
@@ -3611,6 +3613,59 @@ class ConfigUpdate(BaseModel):
     enrich_idle_min: Optional[int] = None
 
 
+def _load_config():
+    if not CONFIG_PATH.exists():
+        return
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+    except Exception as exc:
+        print(f"[config] failed to load {CONFIG_PATH}: {exc}", flush=True)
+        return
+    field_map = {
+        "memory_limit": "MEMORY_LIMIT",
+        "poll_interval": "POLL_INTERVAL",
+        "agent_stale_sec": "AGENT_STALE_SEC",
+        "chitchat_poll_interval": "CHITCHAT_POLL_INTERVAL",
+        "chitchat_consolidate_threshold": "CHITCHAT_CONSOLIDATE_THRESHOLD",
+        "chitchat_max_messages": "CHITCHAT_MAX_MESSAGES",
+        "sleep_cycle_hours": "SLEEP_CYCLE_HOURS",
+        "session_max_records": "SESSION_MAX_RECORDS",
+        "auto_accept_threshold": "AUTO_ACCEPT_THRESHOLD",
+        "chitchat_url": "CHITCHAT_URL",
+    }
+    for field, var_name in field_map.items():
+        if field in data:
+            globals()[var_name] = data[field]
+    if "enrich_enabled" in data:
+        global ENRICH_ENABLED
+        ENRICH_ENABLED = data["enrich_enabled"]
+        enrichment.ENRICH_ENABLED = data["enrich_enabled"]
+    if "enrich_llm_url" in data:
+        enrichment.LLM_URL = data["enrich_llm_url"]
+    if "enrich_llm_model" in data:
+        enrichment.LLM_MODEL = data["enrich_llm_model"]
+    if "enrich_llm_api_key" in data:
+        enrichment.LLM_API_KEY = data["enrich_llm_api_key"]
+    if "enrich_weight" in data:
+        enrichment.EXPANSION_WEIGHT = data["enrich_weight"]
+    if "enrich_df_ratio" in data:
+        enrichment.MAX_DF_RATIO = data["enrich_df_ratio"]
+    if "enrich_temperature" in data:
+        enrichment.ENRICH_TEMPERATURE = data["enrich_temperature"]
+    if "enrich_idle_min" in data:
+        enrichment.IDLE_TIMEOUT_MINUTES = data["enrich_idle_min"]
+
+
+def _save_config(data: dict):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as exc:
+        print(f"[config] failed to save {CONFIG_PATH}: {exc}", flush=True)
+
+
 @app.patch("/config")
 async def update_config(updates: ConfigUpdate):
     data = updates.model_dump(exclude_none=True)
@@ -3656,6 +3711,7 @@ async def update_config(updates: ConfigUpdate):
     if "enrich_idle_min" in data:
         enrichment.IDLE_TIMEOUT_MINUTES = data["enrich_idle_min"]
 
+    _save_config(data)
     return {"ok": True, "updated": list(data.keys())}
 
 
@@ -7242,7 +7298,6 @@ function renderConfig() {
     ['sleep_cycle_hours', 'Sleep Cycle (h)', 'number'],
     ['session_max_records', 'Max Records', 'number'],
     ['auto_accept_threshold', 'Auto Accept', 'number'],
-    ['port', 'Port', 'number'],
   ];
   container.innerHTML = fields.map(([key, label, type]) =>
     '<div class="setting-row">' +
@@ -7256,8 +7311,9 @@ async function saveConfig() {
   const updates = {};
   document.querySelectorAll('#configGrid input[data-key]').forEach(inp => {
     const key = inp.dataset.key;
-    const val = inp.value;
-    if (val !== '' && !isNaN(val)) updates[key] = parseFloat(val);
+    const val = inp.value.trim();
+    if (val === '') return;
+    if (!isNaN(val)) updates[key] = parseFloat(val);
     else updates[key] = val;
   });
   // Enrichment fields
@@ -7277,11 +7333,15 @@ async function saveConfig() {
   const apiKey = el('cfg_enrich_llm_api_key').value.trim();
   if (apiKey) updates['enrich_llm_api_key'] = apiKey;
   try {
-    await fetch(BASE + '/config', {
+    const resp = await fetch(BASE + '/config', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updates)
     });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(err.detail || resp.statusText);
+    }
     // Sync current provider selection
     const pid = el('cfg_provider').value;
     if (pid && pid !== 'custom') {
