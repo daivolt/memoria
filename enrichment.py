@@ -29,9 +29,6 @@ LLM_LOCKED = os.environ.get("MEMORIA_LLM_LOCKED", "true").lower() == "true"
 LLM_URL = os.environ.get(
     "MEMORIA_LLM_URL", "http://localhost:11434/v1/chat/completions"
 )
-# Auto-append /v1/chat/completions if URL looks like a base (no chat path)
-if LLM_URL and "/chat/completions" not in LLM_URL and "/v1/" not in LLM_URL:
-    LLM_URL = LLM_URL.rstrip("/") + "/v1/chat/completions"
 LLM_MODEL = os.environ.get("MEMORIA_LLM_MODEL", "deepseek-v4-flash:cloud")
 LLM_API_KEY = os.environ.get("MEMORIA_LLM_API_KEY", "")
 ENRICH_ENABLED = os.environ.get("MEMORIA_ENRICH_ENABLED", "true").lower() == "true"

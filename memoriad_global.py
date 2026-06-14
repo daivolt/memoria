@@ -3642,17 +3642,7 @@ def _load_config():
         ENRICH_ENABLED = data["enrich_enabled"]
         enrichment.ENRICH_ENABLED = data["enrich_enabled"]
     if "enrich_llm_url" in data:
-        url = data["enrich_llm_url"].replace(
-            "/chat/chat/completions", "/chat/completions"
-        )
-        if url and "/chat/completions" not in url:
-            url = url.rstrip("/")
-            if url.endswith("/chat"):
-                url += "/completions"
-            elif "/v1/" in url or url.endswith("/v1"):
-                url += "/chat/completions"
-            else:
-                url += "/v1/chat/completions"
+        url = data["enrich_llm_url"]
         enrichment.LLM_URL = url
         data["enrich_llm_url"] = url
     if "enrich_llm_model" in data:
@@ -3702,17 +3692,7 @@ async def update_config(updates: ConfigUpdate):
         ENRICH_ENABLED = data["enrich_enabled"]
         enrichment.ENRICH_ENABLED = data["enrich_enabled"]
     if "enrich_llm_url" in data:
-        url = data["enrich_llm_url"].replace(
-            "/chat/chat/completions", "/chat/completions"
-        )
-        if url and "/chat/completions" not in url:
-            url = url.rstrip("/")
-            if url.endswith("/chat"):
-                url += "/completions"
-            elif "/v1/" in url or url.endswith("/v1"):
-                url += "/chat/completions"
-            else:
-                url += "/v1/chat/completions"
+        url = data["enrich_llm_url"]
         enrichment.LLM_URL = url
         data["enrich_llm_url"] = url
     if "enrich_llm_model" in data:
@@ -3820,14 +3800,7 @@ async def set_current_provider(body: ProviderCurrent):
     model = cur.get("model", "")
     if pid and pid in all_providers:
         prov = all_providers[pid]
-        url = prov["base_url"]
-        if url and "/chat/completions" not in url:
-            url = url.rstrip("/")
-            if "/v1/" in url or url.endswith("/v1"):
-                url += "/chat/completions"
-            else:
-                url += "/v1/chat/completions"
-        enrichment.LLM_URL = url
+        enrichment.LLM_URL = prov["base_url"]
         enrichment.LLM_MODEL = model
         enrichment.LLM_API_KEY = prov.get("api_key", "")
     return {"ok": True}
@@ -3842,11 +3815,6 @@ class ProviderTest(BaseModel):
 @app.post("/providers/test")
 async def test_provider(body: ProviderTest):
     url = body.base_url.rstrip("/")
-    if "/chat/completions" not in url:
-        if "/v1/" in url or url.endswith("/v1"):
-            url += "/chat/completions"
-        else:
-            url += "/v1/chat/completions"
     req_body = json.dumps(
         {
             "model": body.model,
@@ -5651,7 +5619,7 @@ body {
           </div>
           <div class="setting-row">
             <span class="label">Base URL</span>
-            <input type="text" id="pm_base_url" style="flex:1;font-size:12px" placeholder="https://api.example.com/v1">
+            <input type="text" id="pm_base_url" style="flex:1;font-size:12px" placeholder="https://api.example.com/v1/chat/completions">
           </div>
           <div class="setting-row">
             <span class="label">API Key</span>
@@ -7189,18 +7157,7 @@ function loadEnrichSettings() {
 function applyProviderFields(providerId, model) {
   const p = _providersList.find(function(p) { return p.id === providerId; });
   if (!p) return;
-  let base = p.base_url.replace(/\/+$/, '');
-  let url;
-  if (base.includes('/chat/completions')) {
-    url = base;
-  } else if (base.endsWith('/chat')) {
-    url = base + '/completions';
-  } else if (base.includes('/v1/') || base.endsWith('/v1')) {
-    url = base + '/chat/completions';
-  } else {
-    url = base + '/v1/chat/completions';
-  }
-  el('cfg_enrich_llm_url').value = url;
+  el('cfg_enrich_llm_url').value = p.base_url;
   el('cfg_enrich_llm_api_key').value = p.api_key || '';
   if (model) el('cfg_enrich_llm_model').value = model;
 }

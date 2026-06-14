@@ -180,17 +180,6 @@ def delete_provider(provider_id: str) -> bool:
     return False
 
 
-def _ensure_chat_url(url: str) -> str:
-    if not url or "/chat/completions" in url:
-        return url
-    url = url.rstrip("/")
-    if url.endswith("/chat"):
-        return url + "/completions"
-    if "/v1/" in url or url.endswith("/v1"):
-        return url + "/chat/completions"
-    return url + "/v1/chat/completions"
-
-
 def get_llm_locked() -> bool:
     return load_data().get("llm_locked", True)
 
@@ -234,15 +223,9 @@ def _resolve_route_str(
         pid, model = route_str.split("/", 1)
         prov = all_providers.get(pid)
         if prov:
-            return _ensure_chat_url(prov["base_url"]), model, prov.get("api_key", "")
+            return prov["base_url"], model, prov.get("api_key", "")
         return "", model, ""
-    url = lb_url.rstrip("/")
-    if "/chat/completions" not in url:
-        if "/v1/" in url or url.endswith("/v1"):
-            url += "/chat/completions"
-        else:
-            url += "/v1/chat/completions"
-    return url, route_str, ""
+    return lb_url.rstrip("/"), route_str, ""
 
 
 def resolve_route(name: str) -> tuple[str, str, str]:
@@ -258,7 +241,7 @@ def resolve_route(name: str) -> tuple[str, str, str]:
     model = cur.get("model", "")
     if pid and pid in all_providers:
         prov = all_providers[pid]
-        return _ensure_chat_url(prov["base_url"]), model, prov.get("api_key", "")
+        return prov["base_url"], model, prov.get("api_key", "")
     return "", "", ""
 
 
@@ -283,6 +266,6 @@ def sync_enrichment():
         model = cur.get("model", "")
         if pid and pid in all_providers:
             prov = all_providers[pid]
-            enrichment.LLM_URL = _ensure_chat_url(prov["base_url"])
+            enrichment.LLM_URL = prov["base_url"]
             enrichment.LLM_MODEL = model
             enrichment.LLM_API_KEY = prov.get("api_key", "")
