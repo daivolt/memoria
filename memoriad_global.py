@@ -3642,7 +3642,14 @@ def _load_config():
         ENRICH_ENABLED = data["enrich_enabled"]
         enrichment.ENRICH_ENABLED = data["enrich_enabled"]
     if "enrich_llm_url" in data:
-        enrichment.LLM_URL = data["enrich_llm_url"]
+        url = data["enrich_llm_url"]
+        if url and "/chat/completions" not in url:
+            url = url.rstrip("/")
+            if "/v1/" in url or url.endswith("/v1"):
+                url += "/chat/completions"
+            else:
+                url += "/v1/chat/completions"
+        enrichment.LLM_URL = url
     if "enrich_llm_model" in data:
         enrichment.LLM_MODEL = data["enrich_llm_model"]
     if "enrich_llm_api_key" in data:
@@ -3698,6 +3705,7 @@ async def update_config(updates: ConfigUpdate):
             else:
                 url += "/v1/chat/completions"
         enrichment.LLM_URL = url
+        data["enrich_llm_url"] = url
     if "enrich_llm_model" in data:
         enrichment.LLM_MODEL = data["enrich_llm_model"]
     if "enrich_llm_api_key" in data:
