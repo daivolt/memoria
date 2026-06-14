@@ -863,10 +863,10 @@ async def _deep_consolidate():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _load_config()
     _init_index()
     federation._init_federation(WORKDIR)
     providers.sync_enrichment()
+    _load_config()  # manual config overrides provider defaults
     global \
         _pool, \
         _poll_task, \
@@ -7147,27 +7147,26 @@ async function loadSettings() {
 
 function loadEnrichSettings() {
   const cfg = state.config || {};
-  el('cfg_enrich_llm_url').value = cfg.enrich_llm_url || 'http://localhost:11434/v1/chat/completions';
-  el('cfg_enrich_llm_model').value = cfg.enrich_llm_model || 'deepseek-v4-flash:cloud';
-  el('cfg_enrich_enabled').checked = cfg.enrich_enabled !== false;
-  el('cfg_enrich_weight').value = cfg.enrich_weight ?? 0.5;
-  el('cfg_enrich_df_ratio').value = cfg.enrich_df_ratio ?? 0.1;
-  el('cfg_enrich_temperature').value = cfg.enrich_temperature ?? 0.4;
-  el('cfg_enrich_idle_min').value = cfg.enrich_idle_min ?? 0;
-  const apiKey = cfg.enrich_llm_api_key || '';
-  el('cfg_enrich_llm_api_key').value = apiKey;
-  // Populate provider dropdown from loaded providers
+  // Populate provider dropdown first (sets fields from provider defaults)
   const sel = el('cfg_provider');
   sel.innerHTML = _providersList
     .filter(function(p) { return p.enabled !== false; })
     .map(function(p) { return '<option value="' + esc(p.id) + '">' + esc(p.name || p.id) + '</option>'; })
     .join('');
   sel.innerHTML += '<option value="custom">Custom</option>';
-  // Select current provider if known
   if (_currentProvider.provider_id && sel.querySelector('option[value="' + _currentProvider.provider_id + '"]')) {
     sel.value = _currentProvider.provider_id;
     applyProviderFields(_currentProvider.provider_id, _currentProvider.model);
   }
+  // Apply saved config on top — manual wins over provider defaults
+  if (cfg.enrich_llm_url) el('cfg_enrich_llm_url').value = cfg.enrich_llm_url.replace(/\/+$/, '');
+  if (cfg.enrich_llm_model) el('cfg_enrich_llm_model').value = cfg.enrich_llm_model;
+  if (cfg.enrich_llm_api_key) el('cfg_enrich_llm_api_key').value = cfg.enrich_llm_api_key;
+  el('cfg_enrich_enabled').checked = cfg.enrich_enabled !== false;
+  el('cfg_enrich_weight').value = cfg.enrich_weight ?? 0.5;
+  el('cfg_enrich_df_ratio').value = cfg.enrich_df_ratio ?? 0.1;
+  el('cfg_enrich_temperature').value = cfg.enrich_temperature ?? 0.4;
+  el('cfg_enrich_idle_min').value = cfg.enrich_idle_min ?? 0;
 }
 
 function applyProviderFields(providerId, model) {
