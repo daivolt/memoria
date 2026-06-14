@@ -3645,7 +3645,9 @@ def _load_config():
         url = data["enrich_llm_url"]
         if url and "/chat/completions" not in url:
             url = url.rstrip("/")
-            if "/v1/" in url or url.endswith("/v1"):
+            if url.endswith("/chat"):
+                url += "/completions"
+            elif "/v1/" in url or url.endswith("/v1"):
                 url += "/chat/completions"
             else:
                 url += "/v1/chat/completions"
@@ -3700,7 +3702,9 @@ async def update_config(updates: ConfigUpdate):
         url = data["enrich_llm_url"]
         if url and "/chat/completions" not in url:
             url = url.rstrip("/")
-            if "/v1/" in url or url.endswith("/v1"):
+            if url.endswith("/chat"):
+                url += "/completions"
+            elif "/v1/" in url or url.endswith("/v1"):
                 url += "/chat/completions"
             else:
                 url += "/v1/chat/completions"
@@ -7180,10 +7184,17 @@ function loadEnrichSettings() {
 function applyProviderFields(providerId, model) {
   const p = _providersList.find(function(p) { return p.id === providerId; });
   if (!p) return;
-  const base = p.base_url.replace(/\/+$/, '');
-  const url = base.includes('/v1/') || base.endsWith('/v1')
-    ? base + '/chat/completions'
-    : base + '/v1/chat/completions';
+  let base = p.base_url.replace(/\/+$/, '');
+  let url;
+  if (base.includes('/chat/completions')) {
+    url = base;
+  } else if (base.endsWith('/chat')) {
+    url = base + '/completions';
+  } else if (base.includes('/v1/') || base.endsWith('/v1')) {
+    url = base + '/chat/completions';
+  } else {
+    url = base + '/v1/chat/completions';
+  }
   el('cfg_enrich_llm_url').value = url;
   el('cfg_enrich_llm_api_key').value = p.api_key || '';
   if (model) el('cfg_enrich_llm_model').value = model;

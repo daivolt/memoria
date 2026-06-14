@@ -181,9 +181,11 @@ def delete_provider(provider_id: str) -> bool:
 
 
 def _ensure_chat_url(url: str) -> str:
-    if not url or "/chat/completions" in url or url.rstrip("/").endswith("/chat"):
+    if not url or "/chat/completions" in url:
         return url
     url = url.rstrip("/")
+    if url.endswith("/chat"):
+        return url + "/completions"
     if "/v1/" in url or url.endswith("/v1"):
         return url + "/chat/completions"
     return url + "/v1/chat/completions"
