@@ -1,11 +1,15 @@
 import json
 import os
 import re
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "memoria"
 PROVIDERS_FILE = CONFIG_DIR / "providers.json"
 LOADBALANCER_ENV = Path.home() / "conf" / "env" / "loadbalancer.env"
+_lmstudio_loaded_model_cache = None
+_lmstudio_loaded_model_ts = 0
 
 _PROVIDER_NAMES = {
     "DEEPSEEK": "DeepSeek",
@@ -15,6 +19,7 @@ _PROVIDER_NAMES = {
     "OLLAMA": "Ollama (Local)",
     "LMSTUDIO": "LM Studio",
     "OPENAI": "OpenAI",
+    "OPENCODE-ZEN": "OpenCode Zen",
 }
 
 
@@ -134,6 +139,42 @@ def set_current(provider_id: str, model: str):
     save_data(data)
 
 
+def get_lmstudio_loaded_model() -> str | None:
+    """Query LM Studio for the currently loaded model key.
+    Returns the model key if a model is loaded, None otherwise.
+    This is the ONLY safe way to get the model name for LM Studio requests.
+    Results are cached for 60 seconds to avoid hammering LM Studio.
+    """
+    global _lmstudio_loaded_model_cache, _lmstudio_loaded_model_ts
+    now = __import__("time").time()
+    if _lmstudio_loaded_model_ts and now - _lmstudio_loaded_model_ts < 60:
+        return _lmstudio_loaded_model_cache
+    try:
+        data = load_data()
+        prov = next(
+            (p for p in data.get("providers", []) if p["id"] == "lmstudio"), None
+        )
+        if not prov:
+            return None
+        base = prov["base_url"].rstrip("/")
+        if base.endswith("/api/v1/chat"):
+            base = base.replace("/api/v1/chat", "")
+        url = base + "/api/v1/models"
+        resp = urllib.request.urlopen(url, timeout=5)
+        models = json.loads(resp.read()).get("models", [])
+        for m in models:
+            if m.get("loaded_instances"):
+                result = m.get("key", m.get("id"))
+                _lmstudio_loaded_model_cache = result
+                _lmstudio_loaded_model_ts = now
+                return result
+        _lmstudio_loaded_model_cache = None
+        _lmstudio_loaded_model_ts = now
+        return None
+    except Exception:
+        return _lmstudio_loaded_model_cache
+
+
 def add_provider(provider: dict) -> dict:
     data = load_data()
     providers = data["providers"]
@@ -188,7 +229,6 @@ def set_llm_locked(locked: bool):
     data = load_data()
     data["llm_locked"] = locked
     save_data(data)
-    sync_enrichment()
 
 
 def get_loadbalancer_url() -> str:
@@ -235,18 +275,42 @@ def resolve_route(name: str) -> tuple[str, str, str]:
     routes = data.get("routes", {})
     route_str = routes.get(name) or routes.get("default")
     if route_str:
-        return _resolve_route_str(route_str, all_providers, lb_url)
+        url, model, key = _resolve_route_str(route_str, all_providers, lb_url)
+        if model and "/api/v1/chat" in url:
+            loaded = get_lmstudio_loaded_model()
+            if loaded and loaded != model:
+                model = loaded
+        return url, model, key
     cur = data.get("current", {})
     pid = cur.get("provider_id", "")
     model = cur.get("model", "")
     if pid and pid in all_providers:
         prov = all_providers[pid]
-        return prov["base_url"], model, prov.get("api_key", "")
+        url = prov["base_url"]
+        if "/api/v1/chat" in url:
+            loaded = get_lmstudio_loaded_model()
+            if loaded and loaded != model:
+                model = loaded
+        return url, model, prov.get("api_key", "")
     return "", "", ""
 
 
+def get_model_config(model_key: str) -> dict:
+    data = load_data()
+    configs = data.get("lmstudio_model_configs", {})
+    return configs.get(model_key, {})
+
+
+def set_model_config(model_key: str, config: dict):
+    data = load_data()
+    if "lmstudio_model_configs" not in data:
+        data["lmstudio_model_configs"] = {}
+    data["lmstudio_model_configs"][model_key] = config
+    save_data(data)
+
+
 def sync_enrichment():
-    """Sync enrichment.LLM_URL, LLM_MODEL, LLM_API_KEY, LLM_LOCKED from providers.json."""
+    """Sync enrichment.LLM_URL, LLM_MODEL, LLM_API_KEY from providers.json."""
     import enrichment
 
     data = load_data()
@@ -254,7 +318,6 @@ def sync_enrichment():
     lb_url = data.get("loadbalancer_url", "http://100.121.245.69:8000/v1")
     routes = data.get("routes", {})
     route_str = routes.get("enrichment") or routes.get("default")
-    enrichment.LLM_LOCKED = data.get("llm_locked", True)
     if route_str:
         url, model, key = _resolve_route_str(route_str, all_providers, lb_url)
         enrichment.LLM_URL = url

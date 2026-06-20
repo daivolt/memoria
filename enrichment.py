@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import time
+import urllib.request
+import urllib.error
 from collections import deque
 from typing import Any
 
@@ -25,7 +27,6 @@ import aiohttp
 
 logger = logging.getLogger("enrichment")
 
-LLM_LOCKED = os.environ.get("MEMORIA_LLM_LOCKED", "true").lower() == "true"
 LLM_URL = os.environ.get(
     "MEMORIA_LLM_URL", "http://localhost:11434/v1/chat/completions"
 )
@@ -46,6 +47,80 @@ IDLE_TIMEOUT_MINUTES = int(os.environ.get("MEMORIA_ENRICH_IDLE_MIN", "5"))
 
 # Sentinel for records that can't be enriched (prevents infinite re-enqueue)
 _NOKW_SENTINEL = "__NOKW__"
+
+
+def _is_global_locked() -> bool:
+    """Check if the global LLM lock is enabled (reads providers.json directly)."""
+    try:
+        import providers
+
+        return providers.get_llm_locked()
+    except Exception:
+        return True
+
+
+_lmstudio_cache = {"model": None, "ts": 0.0}
+_LMSTUDIO_CACHE_TTL = 60
+
+
+class _TokenBucket:
+    __slots__ = ("rate", "burst", "tokens", "last")
+
+    def __init__(self, rate: float, burst: int):
+        self.rate = rate
+        self.burst = burst
+        self.tokens = float(burst)
+        self.last = time.time()
+
+    def consume(self) -> bool:
+        now = time.time()
+        self.tokens = min(self.burst, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+
+
+_ZEN_RATE_LIMIT = 4 / 60.0
+_ZEN_BURST = 2
+_zen_rate_bucket = _TokenBucket(_ZEN_RATE_LIMIT, _ZEN_BURST)
+_ZEN_BACKOFF_UNTIL = 0.0
+
+
+def _get_lmstudio_loaded_model() -> str | None:
+    """Query LM Studio for the currently loaded model. Returns model key or None.
+    Cached for 60 seconds to avoid hammering LM Studio."""
+    now = time.time()
+    if _lmstudio_cache["ts"] and now - _lmstudio_cache["ts"] < _LMSTUDIO_CACHE_TTL:
+        return _lmstudio_cache["model"]
+    try:
+        import providers
+
+        data = providers.load_data()
+        prov = next(
+            (p for p in data.get("providers", []) if p["id"] == "lmstudio"), None
+        )
+        if not prov:
+            return None
+        base = prov["base_url"].rstrip("/")
+        if base.endswith("/api/v1/chat"):
+            base = base.replace("/api/v1/chat", "")
+        url = base + "/api/v1/models"
+        resp = urllib.request.urlopen(url, timeout=5)
+        models = json.loads(resp.read()).get("models", [])
+        for m in models:
+            if m.get("loaded_instances"):
+                result = m.get("key", m.get("id"))
+                _lmstudio_cache["model"] = result
+                _lmstudio_cache["ts"] = now
+                return result
+        _lmstudio_cache["model"] = None
+        _lmstudio_cache["ts"] = now
+    except Exception:
+        pass
+    return _lmstudio_cache["model"]
+
 
 # In-memory token counters (reset on restart)
 _token_counters: dict[str, int] = {
@@ -145,6 +220,14 @@ Query: {query}
 async def _post_chat(
     session: aiohttp.ClientSession, payload: dict, retries: int = ENRICH_MAX_RETRIES
 ) -> dict[str, Any]:
+    global _ZEN_BACKOFF_UNTIL, _zen_rate_bucket
+    is_zen = "opencode.ai/zen" in LLM_URL or "zen-proxy" in LLM_URL
+    if is_zen:
+        now = time.time()
+        if now < _ZEN_BACKOFF_UNTIL:
+            raise RuntimeError(f"zen backoff {_ZEN_BACKOFF_UNTIL - now:.0f}s remaining")
+        if not _zen_rate_bucket.consume():
+            raise RuntimeError("zen rate limited, skipping")
     headers = {}
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
@@ -158,6 +241,10 @@ async def _post_chat(
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
+                if resp.status == 429 and is_zen:
+                    _zen_rate_bucket.rate = max(_zen_rate_bucket.rate / 2, 0.01)
+                    _ZEN_BACKOFF_UNTIL = time.time() + 60
+                    raise RuntimeError("zen 429 rate limit, halving rate")
                 text = await resp.text()
                 if attempt < retries - 1:
                     await asyncio.sleep(2**attempt)
@@ -168,6 +255,44 @@ async def _post_chat(
                 await asyncio.sleep(2**attempt)
                 continue
             raise RuntimeError(f"LLM connection failed: {e}") from e
+
+
+async def _fallback_lmstudio_enrich(
+    prompt: str, messages: list, max_tokens: int, session: aiohttp.ClientSession
+) -> dict | None:
+    try:
+        import providers as _prov
+
+        data = _prov.load_data()
+        provs = {p["id"]: p for p in data.get("providers", [])}
+        lmstudio = provs.get("lmstudio")
+        if not lmstudio:
+            return None
+        url = lmstudio["base_url"].rstrip("/")
+        if not url.endswith("/api/v1/chat"):
+            url = url.replace("/v1/chat/completions", "") + "/api/v1/chat"
+        model = _get_lmstudio_loaded_model()
+        if not model:
+            return None
+        logger.info("enrichment falling back to lmstudio model %s", model)
+        payload = {
+            "model": model,
+            "input": prompt,
+            "max_output_tokens": max_tokens,
+            "temperature": ENRICH_TEMPERATURE,
+        }
+        async with session.post(
+            url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            logger.warning("lmstudio fallback HTTP %s", resp.status)
+            return None
+    except Exception as e:
+        logger.warning("lmstudio fallback failed: %s", e)
+        return None
 
 
 def _extract_content(data: dict) -> str:
@@ -257,7 +382,7 @@ async def _enrich_internal(
 ) -> list[str]:
     if not ENRICH_ENABLED:
         return []
-    if LLM_LOCKED:
+    if _is_global_locked():
         return []
     if not text or not text.strip():
         return []
@@ -272,16 +397,20 @@ async def _enrich_internal(
             }
         )
     messages.append({"role": "user", "content": prompt})
+    model = LLM_MODEL
     if "/api/v1/chat" in LLM_URL:
+        loaded = _get_lmstudio_loaded_model()
+        if loaded:
+            model = loaded
         payload = {
-            "model": LLM_MODEL,
+            "model": model,
             "input": prompt,
             "max_output_tokens": max_tokens,
             "temperature": ENRICH_TEMPERATURE,
         }
     else:
         payload = {
-            "model": LLM_MODEL,
+            "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": ENRICH_TEMPERATURE,
@@ -291,7 +420,19 @@ async def _enrich_internal(
         session = aiohttp.ClientSession()
     t0 = time.time()
     try:
-        data = await _post_chat(session, payload)
+        try:
+            data = await _post_chat(session, payload)
+        except RuntimeError as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                fallback = await _fallback_lmstudio_enrich(
+                    prompt, messages, max_tokens, session
+                )
+                if fallback is not None:
+                    data = fallback
+                else:
+                    raise
+            else:
+                raise
         stats = data.get("stats") if "/api/v1/chat" in LLM_URL else None
         if stats:
             pt = stats.get("input_tokens", 0) or 0

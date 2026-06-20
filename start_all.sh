@@ -29,16 +29,20 @@ for i in $(seq 1 10); do
   sleep 2
 done
 
+# Start warden session manager (gNotes depends on it)
+echo "→ xvfb + warden-session-manager"
+systemctl --user start xvfb warden-session-manager 2>/dev/null || echo "  (warden not installed, skipping)"
+
 # Start all agents
-echo "→ agents (worker, orchestrator, researcher, builder, pilosopher)"
-systemctl --user start memoria-worker orchestrator researcher builder pilosopher
+echo "→ agents (worker, orchestrator, researcher, builder, pilosopher, gnotes)"
+systemctl --user start memoria-worker orchestrator researcher builder pilosopher gnotes
 
 sleep 2
 
 # Verify
 echo ""
 echo "== Status =="
-systemctl --user list-units --type=service 2>/dev/null | grep -E "memoria|chitchat|pilosopher|orchestrator|researcher|builder" | grep loaded
+systemctl --user list-units --type=service 2>/dev/null | grep -E "memoria|chitchat|pilosopher|orchestrator|researcher|builder|gnotes" | grep loaded
 echo ""
 echo "== Memoria health =="
 curl -s http://localhost:19998/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'  version={d.get(\"memoria_version\")} rooms={d.get(\"chitchat_rooms\")}')"

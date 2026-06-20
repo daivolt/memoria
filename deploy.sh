@@ -35,7 +35,7 @@ find "$MEMORIA_DIR" /home/daivolt/conf/chitchat -name "*.pyc" -delete 2>/dev/nul
 
 # ── Stop all services ───────────────────────────────────────
 
-for s in mini sage builder researcher orchestrator memoria-worker pilosopher memoria-server chitchat-server; do
+for s in mini sage builder researcher orchestrator memoria-worker pilosopher gnotes warden-session-manager xvfb memoria-server chitchat-server; do
   systemctl --user stop "$s" 2>/dev/null || true
 done
 sleep 2
@@ -58,7 +58,10 @@ for i in $(seq 1 10); do
   sleep 2
 done
 
-for s in mini memoria-worker orchestrator researcher builder pilosopher sage; do
+systemctl --user start xvfb 2>/dev/null || true
+systemctl --user start warden-session-manager 2>/dev/null || true
+
+for s in mini memoria-worker orchestrator researcher builder pilosopher sage gnotes; do
   systemctl --user start "$s" 2>/dev/null >/dev/null || ERR="${ERR}  $s failed to start\n"
 done
 

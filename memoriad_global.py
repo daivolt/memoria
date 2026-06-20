@@ -86,6 +86,9 @@ CHITCHAT_LOGS_ROOM = os.environ.get("CHITCHAT_LOGS_ROOM", "logs")
 CHITCHAT_POLL_INTERVAL = 3
 CHITCHAT_CONSOLIDATE_THRESHOLD = 20
 CHITCHAT_DIR = WORKDIR / "chitchat"
+NOTEBOOKS_DIR = WORKDIR / "notebooks"
+NOTEBOOKS_CONFIG = NOTEBOOKS_DIR / "config.json"
+GNOTES_URL = os.environ.get("GNOTES_URL", "http://localhost:3101")
 CHITCHAT_MAX_MESSAGES = 10000  # per-room slot limit (hippocampal capacity)
 CHITCHAT_ROOMS = [
     r.strip() for r in os.environ.get("CHITCHAT_ROOMS", "general,logs").split(",")
@@ -131,6 +134,10 @@ _enrich_worker_task: asyncio.Task | None = None
 _papers_watcher_task: asyncio.Task | None = None
 _stale_task_reaper_task: asyncio.Task | None = None
 _task_healer_task: asyncio.Task | None = None
+_last_hip_proposal: dict[str, float] = {}
+_last_deep_proposal: dict[str, float] = {}
+_HIP_PROPOSAL_COOLDOWN = 3600
+_DEEP_PROPOSAL_COOLDOWN = 3600
 
 # ── Shared modules for session extraction ────────────────────
 
@@ -263,8 +270,26 @@ def _memory_path(project: str) -> Path:
     return _glob_wd(project) / "MEMORY.md"
 
 
+def _pinned_path(project: str) -> Path:
+    return _glob_wd(project) / "PINNED.md"
+
+
+def _verify_path(project: str) -> Path:
+    return _glob_wd(project) / "VERIFY.json"
+
+
 def _parse_memory(project: str) -> list[str]:
     p = _memory_path(project)
+    if not p.exists():
+        return []
+    raw = p.read_text().strip()
+    if not raw:
+        return []
+    return [e.strip() for e in raw.split("§") if e.strip()]
+
+
+def _parse_pinned(project: str) -> list[str]:
+    p = _pinned_path(project)
     if not p.exists():
         return []
     raw = p.read_text().strip()
@@ -287,6 +312,49 @@ def _write_memory(project: str, entries: list[str]):
         raise
 
 
+def _write_pinned(project: str, entries: list[str]):
+    p = _pinned_path(project)
+    d = p.parent
+    if not d.exists():
+        d.mkdir(parents=True, exist_ok=True)
+    content = "\n§\n".join(entries)
+    fd, tmp = tempfile.mkstemp(dir=str(d))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content + "\n")
+        os.replace(tmp, p)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def _load_verify_history(project: str) -> list[dict]:
+    p = _verify_path(project)
+    if not p.exists():
+        return []
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return []
+
+
+def _save_verify_history(project: str, history: list[dict]):
+    p = _verify_path(project)
+    d = p.parent
+    if not d.exists():
+        d.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(d))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(history, f, indent=2)
+        os.replace(tmp, p)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
 # ── Background poll ───────────────────────────────────────────
 
 
@@ -300,6 +368,40 @@ _chitchat_consolidated_through: dict[
     str, float
 ] = {}  # newest ingested_at processed per room
 _recent_chat_texts: dict[str, deque[str]] = {}  # per-room sliding window for dedup
+
+
+def _save_chitchat_cursors():
+    path = WORKDIR / "chitchat_cursors.json"
+    path.write_text(json.dumps(_chitchat_cursors))
+
+
+def _load_chitchat_cursors() -> dict:
+    path = WORKDIR / "chitchat_cursors.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_consolidated_through():
+    path = WORKDIR / "chitchat_consolidated_through.json"
+    path.write_text(json.dumps(_chitchat_consolidated_through))
+
+
+def _load_consolidated_through() -> dict:
+    path = WORKDIR / "chitchat_consolidated_through.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+_chitchat_cursors = _load_chitchat_cursors()
+_chitchat_consolidated_through = _load_consolidated_through()
 
 
 async def poll_sessions():
@@ -414,6 +516,7 @@ async def poll_chitchat():
     rooms = _chitchat_rooms()
     if not rooms:
         return
+    total_new = 0
     for r in rooms:
         name = r["name"]
         history = _chitchat_history(name)
@@ -429,6 +532,9 @@ async def poll_chitchat():
             _chitchat_cursors[name] = ts
             new_count += 1
         _chitchat_unconsolidated += new_count
+        total_new += new_count
+    if total_new:
+        _save_chitchat_cursors()
 
 
 async def _load_existing_topic_names() -> list[str]:
@@ -528,6 +634,31 @@ def _prune_chitchat():
             pass
 
 
+def _clear_consolidated_inboxes():
+    if not CHITCHAT_DIR.exists():
+        return
+    for room_dir in sorted(CHITCHAT_DIR.iterdir()):
+        if not room_dir.is_dir():
+            continue
+        path = room_dir / "inbox.jsonl"
+        if not path.exists():
+            continue
+        room_name = room_dir.name
+        cutoff = _chitchat_consolidated_through.get(room_name, 0)
+        if cutoff <= 0:
+            continue
+        lines = path.read_text().strip().splitlines()
+        kept = []
+        for line in lines:
+            try:
+                msg = json.loads(line)
+                if msg.get("ingested_at", 0) > cutoff:
+                    kept.append(line)
+            except json.JSONDecodeError:
+                continue
+        path.write_text("\n".join(kept) + "\n" if kept else "")
+
+
 async def _consolidate_chitchat():
     global _chitchat_unconsolidated, _chitchat_consolidated_through
     if _chitchat_unconsolidated < CHITCHAT_CONSOLIDATE_THRESHOLD:
@@ -543,13 +674,17 @@ async def _consolidate_chitchat():
         path = room_dir / "inbox.jsonl"
         if not path.exists():
             continue
+        room_name = room_dir.name
+        cutoff = _chitchat_consolidated_through.get(room_name, 0)
         lines = path.read_text().strip().splitlines()
         for line in lines:
             try:
                 msg = json.loads(line)
-                all_messages.append(msg)
                 ingested = msg.get("ingested_at", 0)
-                room = msg.get("room", room_dir.name)
+                if ingested <= cutoff:
+                    continue
+                all_messages.append(msg)
+                room = msg.get("room", room_name)
                 if ingested > max_ingested_per_room.get(room, 0):
                     max_ingested_per_room[room] = ingested
             except json.JSONDecodeError:
@@ -671,6 +806,8 @@ async def _consolidate_chitchat():
             _chitchat_consolidated_through[room] = ingested
 
     _prune_chitchat()
+    _clear_consolidated_inboxes()
+    _save_consolidated_through()
     _chitchat_unconsolidated = 0
 
 
@@ -712,10 +849,18 @@ async def _deep_consolidate():
     """
     _prune_sessions()
 
-    # 1. Force chitchat consolidation
-    global _chitchat_unconsolidated
+    # 1. Force chitchat consolidation (reset watermark so it re-analyzes all messages)
+    global _chitchat_unconsolidated, _chitchat_consolidated_through
+    saved_watermark = dict(_chitchat_consolidated_through)
+    _chitchat_consolidated_through = {}
     _chitchat_unconsolidated = CHITCHAT_CONSOLIDATE_THRESHOLD
     await _consolidate_chitchat()
+    for k, v in saved_watermark.items():
+        if (
+            k not in _chitchat_consolidated_through
+            or _chitchat_consolidated_through[k] < v
+        ):
+            _chitchat_consolidated_through[k] = v
 
     # 2. Consolidate hippocampal episodes: cluster by similarity
     try:
@@ -761,41 +906,62 @@ async def _deep_consolidate():
                     top_kw = [w for w, c in kw.most_common(3)]
                     if top_kw:
                         existing = await _load_existing_topic_names()
-                        if not _find_matching_topic(top_kw, existing):
-                            avg_reward = sum(
-                                e.get("reward", 0) for e in high_val
-                            ) / len(high_val)
-                            sample_titles = list(
-                                {
-                                    e.get("task_title", "")
-                                    for e in high_val
-                                    if e.get("task_title")
-                                }
-                            )[:8]
-                            prop_text = (
-                                f"[hippocampal consolidation] Cluster '{ttype}': "
-                                f"{len(high_val)} high-reward episodes (avg reward: {avg_reward:.2f}), "
-                                f"keywords: {', '.join(top_kw)}"
-                            )
-                            prop_path = WORKDIR / "proposals.jsonl"
-                            record = {
-                                "id": f"hip_consolidate_{int(time.time())}",
-                                "text": prop_text,
-                                "topic": top_kw[0][:50],
-                                "proposed_at": time.time(),
-                                "source": "hippocampal_consolidation",
-                                "context": {
-                                    "cluster_type": ttype,
-                                    "episode_count": len(high_val),
-                                    "total_episodes": len(cluster),
-                                    "avg_reward": round(avg_reward, 3),
-                                    "keywords": top_kw,
-                                    "sample_titles": sample_titles,
-                                    "project": project,
-                                },
+                        if _find_matching_topic(top_kw, existing):
+                            continue
+                        prop_key = f"hip:{project}:{ttype}:{':'.join(sorted(top_kw))}"
+                        now_ts = time.time()
+                        if (
+                            prop_key in _last_hip_proposal
+                            and now_ts - _last_hip_proposal[prop_key]
+                            < _HIP_PROPOSAL_COOLDOWN
+                        ):
+                            continue
+                        avg_reward = sum(e.get("reward", 0) for e in high_val) / len(
+                            high_val
+                        )
+                        existing_props = _load_proposals()
+                        prop_text = (
+                            f"[hippocampal consolidation] Cluster '{ttype}': "
+                            f"{len(high_val)} high-reward episodes (avg reward: {avg_reward:.2f}), "
+                            f"keywords: {', '.join(top_kw)}"
+                        )
+                        dup = any(
+                            p.get("source") == "hippocampal_consolidation"
+                            and p.get("topic", "")[:50] == top_kw[0][:50]
+                            and p.get("context", {}).get("cluster_type") == ttype
+                            for p in existing_props
+                        )
+                        if dup:
+                            continue
+                        avg_reward = sum(e.get("reward", 0) for e in high_val) / len(
+                            high_val
+                        )
+                        sample_titles = list(
+                            {
+                                e.get("task_title", "")
+                                for e in high_val
+                                if e.get("task_title")
                             }
-                            with open(prop_path, "a") as f:
-                                f.write(json.dumps(record) + "\n")
+                        )[:8]
+                        record = {
+                            "id": f"hip_consolidate_{int(time.time())}",
+                            "text": prop_text,
+                            "topic": top_kw[0][:50],
+                            "proposed_at": time.time(),
+                            "source": "hippocampal_consolidation",
+                            "context": {
+                                "cluster_type": ttype,
+                                "episode_count": len(high_val),
+                                "total_episodes": len(cluster),
+                                "avg_reward": round(avg_reward, 3),
+                                "keywords": top_kw,
+                                "sample_titles": sample_titles,
+                                "project": project,
+                            },
+                        }
+                        with open(str(WORKDIR / "proposals.jsonl"), "a") as f:
+                            f.write(json.dumps(record) + "\n")
+                        _last_hip_proposal[prop_key] = now_ts
     except Exception:
         pass
 
@@ -819,43 +985,64 @@ async def _deep_consolidate():
         if top:
             existing = await _load_existing_topic_names()
             if not _find_matching_topic(top, existing):
-                recent_sessions = []
-                for line in lines[-5:]:
-                    try:
-                        s = json.loads(line)
-                        recent_sessions.append(
-                            {
-                                "title": s.get("title", ""),
-                                "task": (s.get("task") or "")[:200],
-                                "id": s.get("id", ""),
-                            }
+                deep_key = f"deep:{':'.join(sorted(top))}"
+                now_ts = time.time()
+                if (
+                    deep_key in _last_deep_proposal
+                    and now_ts - _last_deep_proposal[deep_key] < _DEEP_PROPOSAL_COOLDOWN
+                ):
+                    pass
+                else:
+                    existing_props = _load_proposals()
+                    dup = any(
+                        p.get("source") == "deep_consolidation"
+                        and p.get("topic", "")[:50] == top[0][:50]
+                        for p in existing_props
+                    )
+                    if dup:
+                        pass
+                    else:
+                        recent_sessions = []
+                        for line in lines[-5:]:
+                            try:
+                                s = json.loads(line)
+                                recent_sessions.append(
+                                    {
+                                        "title": s.get("title", ""),
+                                        "task": (s.get("task") or "")[:200],
+                                        "id": s.get("id", ""),
+                                    }
+                                )
+                            except json.JSONDecodeError:
+                                continue
+                        prop_text = (
+                            f"[deep consolidation] Recent session keywords: {', '.join(top)}\n"
+                            f"Sessions analyzed: {len(recent_sessions)}\n"
+                            f"Titles: "
+                            + "; ".join(
+                                s["title"][:60] for s in recent_sessions if s["title"]
+                            )
                         )
-                    except json.JSONDecodeError:
-                        continue
-                prop_text = (
-                    f"[deep consolidation] Recent session keywords: {', '.join(top)}\n"
-                    f"Sessions analyzed: {len(recent_sessions)}\n"
-                    f"Titles: "
-                    + "; ".join(s["title"][:60] for s in recent_sessions if s["title"])
-                )
-                prop_path = WORKDIR / "proposals.jsonl"
-                record = {
-                    "id": f"deep_consolidate_{int(time.time())}",
-                    "text": prop_text,
-                    "topic": top[0][:50],
-                    "proposed_at": time.time(),
-                    "source": "deep_consolidation",
-                    "context": {
-                        "keywords": top,
-                        "keyword_counts": {
-                            w: c for w, c in session_keywords.most_common(5) if c >= 2
-                        },
-                        "session_count": len(recent_sessions),
-                        "sessions": recent_sessions,
-                    },
-                }
-                with open(prop_path, "a") as f:
-                    f.write(json.dumps(record) + "\n")
+                        record = {
+                            "id": f"deep_consolidate_{int(time.time())}",
+                            "text": prop_text,
+                            "topic": top[0][:50],
+                            "proposed_at": time.time(),
+                            "source": "deep_consolidation",
+                            "context": {
+                                "keywords": top,
+                                "keyword_counts": {
+                                    w: c
+                                    for w, c in session_keywords.most_common(5)
+                                    if c >= 2
+                                },
+                                "session_count": len(recent_sessions),
+                                "sessions": recent_sessions,
+                            },
+                        }
+                        with open(str(WORKDIR / "proposals.jsonl"), "a") as f:
+                            f.write(json.dumps(record) + "\n")
+                        _last_deep_proposal[deep_key] = now_ts
 
 
 # ── FastAPI app ──────────────────────────────────────────────
@@ -970,6 +1157,7 @@ async def _awake_replay_loop():
 
     await asyncio.sleep(5)
     while True:
+        idle_boost = 0.0
         try:
             projects = set(t.get("project", "unknown") for t in _list_tasks(None, None))
             now = time.time()
@@ -1231,7 +1419,7 @@ async def _enrich_worker_loop():
     await asyncio.sleep(10)
     while True:
         try:
-            if _pool:
+            if _pool and not providers.get_llm_locked():
                 await enrichment.recover_stale(_pool)
                 count = await enrichment.process_queue(_pool)
                 if count:
@@ -1409,7 +1597,7 @@ async def recall(
     results = []
 
     expansion_terms: list[str] = []
-    if enrich and ENRICH_ENABLED and _pool:
+    if enrich and ENRICH_ENABLED and _pool and not providers.get_llm_locked():
         try:
             expansion_terms = await enrichment.expand_query(q)
             if expansion_terms:
@@ -1537,7 +1725,7 @@ async def unified_context(body: ContextRequest):
         raise HTTPException(400, "query is required")
 
     expansion_terms: list[str] = []
-    if ENRICH_ENABLED and _pool:
+    if ENRICH_ENABLED and _pool and not providers.get_llm_locked():
         try:
             expansion_terms = await enrichment.expand_query(body.query)
             if expansion_terms:
@@ -1735,7 +1923,7 @@ async def list_topics(detail: bool = False):
 async def topics_search(q: str = Query(...), limit: int = 3):
     try:
         expansion_terms: list[str] = []
-        if ENRICH_ENABLED and _pool:
+        if ENRICH_ENABLED and _pool and not providers.get_llm_locked():
             try:
                 expansion_terms = await enrichment.expand_query(q)
                 if expansion_terms:
@@ -2252,6 +2440,86 @@ async def replace_memory(project: str, body: ReplaceMemory):
     return {"ok": True, "entries": len(entries)}
 
 
+# ── Pinned context injection ────────────────────────────────
+
+
+class AddPinned(BaseModel):
+    text: str
+
+
+@app.get("/pinned/{project}")
+async def get_pinned(project: str):
+    entries = _parse_pinned(project)
+    return {"project": project, "entries": entries, "count": len(entries)}
+
+
+@app.post("/pinned/{project}")
+async def add_pinned(project: str, body: AddPinned):
+    entries = _parse_pinned(project)
+    entries.append(body.text)
+    _write_pinned(project, entries)
+    return {"ok": True, "entries": len(entries), "text": body.text}
+
+
+@app.delete("/pinned/{project}/{idx}")
+async def delete_pinned(project: str, idx: int):
+    entries = _parse_pinned(project)
+    if idx < 0 or idx >= len(entries):
+        raise HTTPException(404, f"index {idx} out of range (0-{len(entries) - 1})")
+    removed = entries.pop(idx)
+    _write_pinned(project, entries)
+    return {"ok": True, "removed": removed, "entries": len(entries)}
+
+
+@app.get("/ctx/{project}")
+async def get_injection_context(project: str):
+    entries = _parse_pinned(project)
+    marker = uuid.uuid4().hex[:8]
+    if not entries:
+        return {"markdown": "", "entries": 0, "marker": marker}
+    lines = [f"<!-- MEMORIA_CTX: {marker} -->"]
+    lines.append("## Pinned Context")
+    lines.append("")
+    for e in entries:
+        lines.append(f"- {e}")
+    lines.append("")
+    lines.append(
+        "IMPORTANT: This context is auto-injected by memoria. "
+        "Preserve the MEMORIA_CTX marker during summarization."
+    )
+    markdown = "\n".join(lines)
+    return {"markdown": markdown, "entries": len(entries), "marker": marker}
+
+
+# ── Compaction verification ─────────────────────────────────
+
+
+class VerifyResult(BaseModel):
+    marker: str
+    survived: bool
+    note: str = ""
+
+
+@app.get("/verify/{project}")
+async def get_verify(project: str):
+    history = _load_verify_history(project)
+    return {"project": project, "history": history, "count": len(history)}
+
+
+@app.post("/verify/{project}")
+async def add_verify(project: str, body: VerifyResult):
+    history = _load_verify_history(project)
+    entry = {
+        "marker": body.marker,
+        "survived": body.survived,
+        "note": body.note,
+        "timestamp": time.time(),
+    }
+    history.append(entry)
+    _save_verify_history(project, history)
+    return {"ok": True, "entry": entry}
+
+
 # ── Compression ─────────────────────────────────────────────
 
 
@@ -2297,6 +2565,36 @@ def _delete_agent(agent_id: str):
     p = _agent_path(agent_id)
     if p.exists():
         p.unlink()
+
+
+def _agent_route_key(agent: dict) -> str:
+    return agent.get("chitchat_name") or f"agent_{agent['id'][:8]}"
+
+
+def _sync_agent_route(agent: dict):
+    route_key = _agent_route_key(agent)
+    provider_id = agent.get("provider_id", "")
+    model = agent.get("model", "")
+    if model:
+        route = f"{provider_id}/{model}" if provider_id else model
+        providers.set_route(route_key, route)
+    else:
+        data = providers.load_data()
+        routes = data.get("routes", {})
+        if route_key in routes:
+            del routes[route_key]
+            data["routes"] = routes
+            providers.save_data(data)
+
+
+def _remove_agent_route(agent: dict):
+    route_key = _agent_route_key(agent)
+    data = providers.load_data()
+    routes = data.get("routes", {})
+    if route_key in routes:
+        del routes[route_key]
+        data["routes"] = routes
+        providers.save_data(data)
 
 
 def _list_agents(project: str | None = None) -> list[dict]:
@@ -2388,12 +2686,46 @@ class RegisterAgent(BaseModel):
     files: list[str] = []
     chitchat_name: str = ""
     capabilities: list[str] = ["general"]
+    instructions: str = ""
+    default_folder: str = ""
+    provider_id: str = ""
+    model: str = ""
 
 
 class AgentHeartbeat(BaseModel):
     status: str = "active"
     activity: str = ""
     commit_log: list[str] = []
+    instructions: str = ""
+    default_folder: str = ""
+    provider_id: str = ""
+    model: str = ""
+
+
+class AgentConfig(BaseModel):
+    instructions: str | None = None
+    default_folder: str | None = None
+    task: str | None = None
+    capabilities: list[str] | None = None
+    provider_id: str | None = None
+    model: str | None = None
+
+
+class CreateAgentBody(BaseModel):
+    project: str
+    task: str = ""
+    instructions: str = ""
+    default_folder: str = ""
+    capabilities: list[str] = ["general"]
+    chitchat_name: str = ""
+    auto_start: bool = False
+    service_name: str = ""
+    provider_id: str = ""
+    model: str = ""
+
+
+class ServiceAction(BaseModel):
+    pass
 
 
 @app.post("/agents")
@@ -2413,8 +2745,13 @@ async def register_agent(body: RegisterAgent):
         "chitchat_name": body.chitchat_name,
         "conflicts_warned": conflicts,
         "capabilities": body.capabilities,
+        "instructions": body.instructions[:2000],
+        "default_folder": body.default_folder,
+        "provider_id": body.provider_id,
+        "model": body.model,
     }
     _save_agent(agent)
+    _sync_agent_route(agent)
     if body.chitchat_name:
         _ensure_chitchat_room(body.chitchat_name)
     _notify_chitchat_logs(
@@ -2464,17 +2801,35 @@ async def heartbeat(agent_id: str, body: AgentHeartbeat):
         a["activity"] = body.activity
     if body.commit_log:
         a["commit_log"].extend(body.commit_log)
+    if body.instructions:
+        a["instructions"] = body.instructions[:2000]
+    if body.default_folder:
+        a["default_folder"] = body.default_folder
+    if body.provider_id:
+        a["provider_id"] = body.provider_id
+    if body.model:
+        a["model"] = body.model
     _save_agent(a)
+    if body.provider_id or body.model:
+        _sync_agent_route(a)
     return {"ok": True}
 
 
 @app.delete("/agents/{agent_id}")
-async def deregister_agent(agent_id: str):
+async def deregister_agent(agent_id: str, kill: bool = False):
     a = _load_agent(agent_id)
     if a is None:
         raise HTTPException(404, "agent not found")
     project = a.get("project", "unknown")
+    if kill:
+        pid = a.get("pid", 0)
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
     _delete_agent(agent_id)
+    _remove_agent_route(a)
     _notify_chitchat_logs(
         f"agent {agent_id[:12]} finished: {a.get('task', '?')[:200]}"
         + f" — {len(a.get('commit_log', []))} commits"
@@ -2494,6 +2849,244 @@ async def deregister_agent(agent_id: str):
         },
     )
     return {"ok": True, "commits": len(a.get("commit_log", []))}
+
+
+@app.post("/agents/create")
+async def create_agent(body: CreateAgentBody):
+    agent_id = f"agent_{uuid.uuid4().hex[:12]}"
+    conflicts = _check_file_conflicts(body.project, [])
+    agent = {
+        "id": agent_id,
+        "project": body.project,
+        "task": body.task[:500],
+        "files": [],
+        "pid": 0,
+        "started_at": time.time(),
+        "last_heartbeat": time.time(),
+        "status": "stopped",
+        "commit_log": [],
+        "chitchat_name": body.chitchat_name,
+        "conflicts_warned": conflicts,
+        "capabilities": body.capabilities,
+        "instructions": body.instructions[:2000],
+        "default_folder": body.default_folder,
+        "provider_id": body.provider_id,
+        "model": body.model,
+    }
+    _save_agent(agent)
+    _sync_agent_route(agent)
+    service_started = False
+    if body.auto_start and body.service_name:
+        svc = SERVICE_AGENTS.get(body.service_name, "")
+        if svc:
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", "start", svc],
+                    capture_output=True,
+                    timeout=10,
+                )
+                service_started = True
+                agent["status"] = "active"
+                agent["service_name"] = body.service_name
+                _save_agent(agent)
+            except Exception:
+                pass
+    _notify_chitchat_logs(
+        f"agent {agent_id[:12]} created on project '{body.project}': {body.task[:200]}"
+    )
+    await _events.broadcast(
+        "agent_registered",
+        {"agent_id": agent_id, "project": body.project, "task": body.task[:100]},
+    )
+    return {"ok": True, "agent_id": agent_id, "service_started": service_started}
+
+
+@app.patch("/agents/{agent_id}/config")
+async def update_agent_config(agent_id: str, body: AgentConfig):
+    a = _load_agent(agent_id)
+    if a is None:
+        raise HTTPException(404, "agent not found")
+    if body.instructions is not None:
+        a["instructions"] = body.instructions[:2000]
+    if body.default_folder is not None:
+        a["default_folder"] = body.default_folder
+    if body.task is not None:
+        a["task"] = body.task[:500]
+    if body.capabilities is not None:
+        a["capabilities"] = body.capabilities
+    if body.provider_id is not None:
+        a["provider_id"] = body.provider_id
+    if body.model is not None:
+        a["model"] = body.model
+    _save_agent(a)
+    _sync_agent_route(a)
+    return {"ok": True}
+
+
+@app.post("/agents/{agent_id}/pause")
+async def pause_agent(agent_id: str):
+    a = _load_agent(agent_id)
+    if a is None:
+        raise HTTPException(404, "agent not found")
+    pid = a.get("pid", 0)
+    if not pid:
+        raise HTTPException(400, "agent has no PID")
+    try:
+        os.kill(pid, signal.SIGSTOP)
+    except OSError as e:
+        raise HTTPException(400, f"failed to send SIGSTOP: {e}")
+    a["status"] = "paused"
+    _save_agent(a)
+    _notify_chitchat_logs(f"agent {agent_id[:12]} paused")
+    return {"ok": True}
+
+
+@app.post("/agents/{agent_id}/resume")
+async def resume_agent(agent_id: str):
+    a = _load_agent(agent_id)
+    if a is None:
+        raise HTTPException(404, "agent not found")
+    pid = a.get("pid", 0)
+    if not pid:
+        raise HTTPException(400, "agent has no PID")
+    try:
+        os.kill(pid, signal.SIGCONT)
+    except OSError as e:
+        raise HTTPException(400, f"failed to send SIGCONT: {e}")
+    a["status"] = "active"
+    _save_agent(a)
+    _notify_chitchat_logs(f"agent {agent_id[:12]} resumed")
+    return {"ok": True}
+
+
+def _get_service_status(service_name: str) -> dict:
+    svc = SERVICE_AGENTS.get(service_name, "")
+    if not svc:
+        return {
+            "name": service_name,
+            "status": "unknown",
+            "pid": 0,
+            "cpu": 0,
+            "mem": 0,
+            "rss_mb": 0,
+        }
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                svc,
+                "-p",
+                "ActiveState,SubState,MainPID",
+                "--value",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        parts = result.stdout.strip().split("\n")
+        active = parts[0] if len(parts) > 0 else "unknown"
+        sub = parts[1] if len(parts) > 1 else ""
+        pid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        cpu = mem = rss_kb = 0
+        if pid:
+            ps_out = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "%cpu=,%mem=,rss=", "--no-headers"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            if ps_out:
+                p = ps_out.split()
+                cpu = float(p[0]) if len(p) > 0 else 0
+                mem = float(p[1]) if len(p) > 1 else 0
+                rss_kb = int(p[2]) if len(p) > 2 else 0
+        return {
+            "name": service_name,
+            "service": svc,
+            "status": active,
+            "sub_status": sub,
+            "pid": pid,
+            "cpu": cpu,
+            "mem": mem,
+            "rss_mb": round(rss_kb / 1024, 1),
+        }
+    except Exception:
+        return {
+            "name": service_name,
+            "status": "unknown",
+            "pid": 0,
+            "cpu": 0,
+            "mem": 0,
+            "rss_mb": 0,
+        }
+
+
+@app.get("/services")
+async def list_services():
+    services = [_get_service_status(name) for name in SERVICE_AGENTS]
+    return {"services": services, "count": len(services)}
+
+
+@app.post("/services/{service_name}/start")
+async def start_service(service_name: str):
+    svc = SERVICE_AGENTS.get(service_name, "")
+    if not svc:
+        raise HTTPException(404, f"unknown service: {service_name}")
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "start", svc],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            raise HTTPException(500, f"systemctl start failed: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "systemctl start timed out")
+    _notify_chitchat_logs(f"service {service_name} started")
+    return {"ok": True, "service": service_name, "action": "start"}
+
+
+@app.post("/services/{service_name}/stop")
+async def stop_service(service_name: str):
+    svc = SERVICE_AGENTS.get(service_name, "")
+    if not svc:
+        raise HTTPException(404, f"unknown service: {service_name}")
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "stop", svc],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            raise HTTPException(500, f"systemctl stop failed: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "systemctl stop timed out")
+    _notify_chitchat_logs(f"service {service_name} stopped")
+    return {"ok": True, "service": service_name, "action": "stop"}
+
+
+@app.post("/services/{service_name}/restart")
+async def restart_service(service_name: str):
+    svc = SERVICE_AGENTS.get(service_name, "")
+    if not svc:
+        raise HTTPException(404, f"unknown service: {service_name}")
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", svc],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            raise HTTPException(500, f"systemctl restart failed: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "systemctl restart timed out")
+    _notify_chitchat_logs(f"service {service_name} restarted")
+    return {"ok": True, "service": service_name, "action": "restart"}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3661,9 +4254,16 @@ def _load_config():
 
 def _save_config(data: dict):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    if CONFIG_PATH.exists():
+        try:
+            existing = json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            pass
+    existing.update(data)
     try:
         with open(CONFIG_PATH, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(existing, f, indent=2)
     except Exception as exc:
         print(f"[config] failed to save {CONFIG_PATH}: {exc}", flush=True)
 
@@ -3709,6 +4309,8 @@ async def update_config(updates: ConfigUpdate):
         enrichment.IDLE_TIMEOUT_MINUTES = data["enrich_idle_min"]
 
     _save_config(data)
+    if any(k.startswith("enrich_") for k in data):
+        providers.sync_enrichment()
     return {"ok": True, "updated": list(data.keys())}
 
 
@@ -3773,6 +4375,22 @@ async def create_provider(body: ProviderEntry):
         raise HTTPException(409, str(e))
 
 
+@app.patch("/providers/current")
+async def set_current_provider(body: ProviderCurrent):
+    providers.set_current(body.provider_id, body.model)
+    data = providers.load_data()
+    all_providers = {p["id"]: p for p in data.get("providers", [])}
+    cur = data.get("current", {})
+    pid = cur.get("provider_id", "")
+    model = cur.get("model", "")
+    if pid and pid in all_providers:
+        prov = all_providers[pid]
+        enrichment.LLM_URL = prov["base_url"]
+        enrichment.LLM_MODEL = model
+        enrichment.LLM_API_KEY = prov.get("api_key", "")
+    return {"ok": True}
+
+
 @app.patch("/providers/{provider_id}")
 async def update_provider(provider_id: str, body: ProviderUpdate):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
@@ -3787,23 +4405,6 @@ async def delete_provider(provider_id: str):
     if providers.delete_provider(provider_id):
         return {"ok": True}
     raise HTTPException(404, "provider not found")
-
-
-@app.patch("/providers/current")
-async def set_current_provider(body: ProviderCurrent):
-    providers.set_current(body.provider_id, body.model)
-    # Sync enrichment module with new provider
-    data = providers.load_data()
-    all_providers = {p["id"]: p for p in data.get("providers", [])}
-    cur = data.get("current", {})
-    pid = cur.get("provider_id", "")
-    model = cur.get("model", "")
-    if pid and pid in all_providers:
-        prov = all_providers[pid]
-        enrichment.LLM_URL = prov["base_url"]
-        enrichment.LLM_MODEL = model
-        enrichment.LLM_API_KEY = prov.get("api_key", "")
-    return {"ok": True}
 
 
 class ProviderTest(BaseModel):
@@ -3847,6 +4448,199 @@ async def test_provider(body: ProviderTest):
         }
 
 
+class LMStudioModelAction(BaseModel):
+    model_key: str
+
+
+class LMStudioLoadConfig(BaseModel):
+    model_key: str
+    context_length: Optional[int] = None
+    gpu: Optional[bool] = None
+    flash_attention: Optional[bool] = None
+    eval_batch_size: Optional[int] = None
+    offload_kv_cache_to_gpu: Optional[bool] = None
+    num_experts: Optional[int] = None
+    seed: Optional[int] = None
+    keep_model_in_memory: Optional[bool] = None
+
+
+@app.get("/lmstudio/models")
+async def lmstudio_list_models():
+    cur = providers.get_current()
+    pid = cur.get("provider_id", "")
+    if pid != "lmstudio":
+        return {"ok": False, "error": "Current provider is not LM Studio"}
+    prov = next((p for p in providers.get_providers() if p["id"] == "lmstudio"), None)
+    if not prov:
+        return {"ok": False, "error": "LM Studio provider not found"}
+    try:
+        base = prov["base_url"].rstrip("/")
+        if base.endswith("/api/v1/chat"):
+            base = base.replace("/api/v1/chat", "")
+        elif base.endswith("/v1/chat/completions"):
+            base = base.replace("/v1/chat/completions", "")
+        models_url = base + "/api/v1/models"
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(
+            None, lambda: urllib.request.urlopen(models_url, timeout=10)
+        )
+        raw = json.loads(resp.read())
+        models = []
+        for m in raw.get("models", []):
+            inst = m.get("loaded_instances") or []
+            models.append(
+                {
+                    "id": m.get("key", m.get("id", "")),
+                    "display_name": m.get("display_name", ""),
+                    "publisher": m.get("publisher", ""),
+                    "architecture": m.get("architecture", ""),
+                    "params_string": m.get("params_string", ""),
+                    "quantization": (m.get("quantization") or {}).get("name", ""),
+                    "bits_per_weight": (m.get("quantization") or {}).get(
+                        "bits_per_weight"
+                    ),
+                    "size_bytes": m.get("size_bytes", 0),
+                    "max_context_length": m.get("max_context_length", 0),
+                    "format": m.get("format", ""),
+                    "type": m.get("type", ""),
+                    "loaded": len(inst) > 0,
+                    "loaded_instances": [
+                        {
+                            "id": i.get("id", ""),
+                            "context_length": i.get("config", {}).get(
+                                "context_length", 0
+                            ),
+                        }
+                        for i in inst
+                    ],
+                    "capabilities": m.get("capabilities", {}),
+                }
+            )
+        saved_configs = providers.load_data().get("lmstudio_model_configs", {})
+        return {"ok": True, "models": models, "saved_configs": saved_configs}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+
+@app.post("/lmstudio/load")
+async def lmstudio_load_model(body: LMStudioLoadConfig):
+    """MANUAL ONLY — load a model in LM Studio. Only callable from the Settings dashboard.
+    Agents and automated processes must NEVER call this endpoint."""
+    cur = providers.get_current()
+    pid = cur.get("provider_id", "")
+    if pid != "lmstudio":
+        return {"ok": False, "error": "Current provider is not LM Studio"}
+    config_parts = []
+    if body.context_length is not None:
+        config_parts.append(f"context_length={body.context_length}")
+    if body.gpu is not None:
+        if body.gpu:
+            config_parts.append(
+                "gpu=GpuSplitConfig(strategy='max', disabled_gpus=[], priority=0, custom_ratio=1.0)"
+            )
+        else:
+            config_parts.append("gpu=False")
+    if body.flash_attention is not None:
+        config_parts.append(f"flash_attention={body.flash_attention}")
+    if body.eval_batch_size is not None:
+        config_parts.append(f"eval_batch_size={body.eval_batch_size}")
+    if body.offload_kv_cache_to_gpu is not None:
+        config_parts.append(f"offload_kv_cache_to_gpu={body.offload_kv_cache_to_gpu}")
+    if body.num_experts is not None:
+        config_parts.append(f"num_experts={body.num_experts}")
+    if body.seed is not None:
+        config_parts.append(f"seed={body.seed}")
+    if body.keep_model_in_memory is not None:
+        config_parts.append(f"keep_model_in_memory={body.keep_model_in_memory}")
+    config_arg = ""
+    if config_parts:
+        config_arg = ", config=LlmLoadModelConfig(" + ", ".join(config_parts) + ")"
+    cmd = (
+        "import lmstudio as lms; "
+        "from lmstudio._sdk_models import LlmLoadModelConfig, GpuSplitConfig; "
+        f"client=lms.Client(api_host='100.117.7.2:12345'); "
+        f"model=client.llm.load_new_instance('{body.model_key}'{config_arg}); "
+        "print(model.identifier)"
+    )
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                ["python3", "-c", cmd],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            ),
+        )
+        if result.returncode != 0:
+            return {"ok": False, "error": result.stderr[:500]}
+        identifier = (
+            result.stdout.strip().split("\n")[-1]
+            if result.stdout.strip()
+            else body.model_key
+        )
+        providers.set_current("lmstudio", body.model_key)
+        providers.sync_enrichment()
+        saved = {
+            k: v
+            for k, v in body.model_dump().items()
+            if k != "model_key" and v is not None
+        }
+        if saved:
+            providers.set_model_config(body.model_key, saved)
+        return {"ok": True, "identifier": identifier}
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "Load timed out (model may still be loading)"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+
+@app.post("/lmstudio/unload")
+async def lmstudio_unload_model(body: LMStudioModelAction):
+    """MANUAL ONLY — unload a model from LM Studio. Only callable from the Settings dashboard.
+    Agents and automated processes must NEVER call this endpoint."""
+    cur = providers.get_current()
+    pid = cur.get("provider_id", "")
+    if pid != "lmstudio":
+        return {"ok": False, "error": "Current provider is not LM Studio"}
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                [
+                    "python3",
+                    "-c",
+                    f"import lmstudio as lms; "
+                    f"client=lms.Client(api_host='100.117.7.2:12345'); "
+                    f"models=client.llm.list_loaded(); "
+                    f"[m.unload() for m in models if m.identifier=='{body.model_key}']",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            ),
+        )
+        if result.returncode != 0:
+            return {"ok": False, "error": result.stderr[:300]}
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+
+@app.get("/lmstudio/model-config/{model_key}")
+async def lmstudio_get_model_config(model_key: str):
+    cfg = providers.get_model_config(model_key)
+    return {"ok": True, "model_key": model_key, "config": cfg}
+
+
+@app.post("/lmstudio/model-config/{model_key}")
+async def lmstudio_set_model_config(model_key: str, config: dict):
+    providers.set_model_config(model_key, config)
+    return {"ok": True, "model_key": model_key, "config": config}
+
+
 class LLMLockBody(BaseModel):
     locked: bool
 
@@ -3885,6 +4679,74 @@ async def set_named_route(name: str, body: RouteBody):
     return {"ok": True, "name": name, "route": body.route}
 
 
+@app.delete("/routes/{name}")
+async def delete_named_route(name: str):
+    data = providers.load_data()
+    routes = data.get("routes", {})
+    if name in routes:
+        del routes[name]
+        data["routes"] = routes
+        providers.save_data(data)
+        return {"ok": True, "deleted": name}
+    raise HTTPException(404, "route not found")
+
+
+ZEN_FREE_MODELS = [
+    {"id": "big-pickle", "free": True, "description": "General purpose"},
+    {"id": "deepseek-v4-flash-free", "free": True, "description": "Fast, large output"},
+    {"id": "mimo-v2.5-free", "free": True, "description": "Multimodal, creative"},
+    {"id": "qwen3.6-plus-free", "free": True, "description": "Balanced reasoning"},
+    {"id": "minimax-m3-free", "free": True, "description": "Efficient inference"},
+    {
+        "id": "nemotron-3-ultra-free",
+        "free": True,
+        "description": "1M context, verification",
+    },
+    {"id": "north-mini-code-free", "free": True, "description": "Coding-optimized"},
+]
+
+
+@app.get("/zen/models")
+async def zen_list_models():
+    prov = next(
+        (p for p in providers.get_providers() if p["id"] == "opencode-zen"), None
+    )
+    if not prov:
+        return {"ok": False, "error": "OpenCode Zen provider not configured"}
+    base = prov["base_url"].rstrip("/")
+    url = base + "/models"
+    try:
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(
+            None, lambda: urllib.request.urlopen(url, timeout=10)
+        )
+        raw = json.loads(resp.read())
+        remote_models = []
+        for m in raw.get("data", []):
+            model_id = m.get("id", "")
+            is_free = any(fm["id"] == model_id for fm in ZEN_FREE_MODELS)
+            free_info = next(
+                (fm for fm in ZEN_FREE_MODELS if fm["id"] == model_id), None
+            )
+            remote_models.append(
+                {
+                    "id": model_id,
+                    "free": is_free,
+                    "description": free_info["description"] if free_info else "",
+                    "owned_by": m.get("owned_by", ""),
+                    "object": m.get("object", ""),
+                }
+            )
+        remote_ids = {m["id"] for m in remote_models}
+        for fm in ZEN_FREE_MODELS:
+            if fm["id"] not in remote_ids:
+                remote_models.append(fm | {"owned_by": "", "object": ""})
+        return {"ok": True, "models": remote_models}
+    except Exception as e:
+        all_models = [fm | {"owned_by": "", "object": ""} for fm in ZEN_FREE_MODELS]
+        return {"ok": True, "models": all_models, "error": str(e)[:200]}
+
+
 @app.post("/providers/seed")
 async def seed_providers():
     """Re-seed providers from loadbalancer.env, preserving API keys for existing entries."""
@@ -3899,6 +4761,102 @@ async def seed_providers():
     data["providers"] = fresh
     providers.save_data(data)
     return {"ok": True, "providers": fresh}
+
+
+# ── Notebooks endpoints ──────────────────────────────────────────
+
+
+def _load_notebooks_config():
+    if NOTEBOOKS_CONFIG.exists():
+        try:
+            return json.loads(NOTEBOOKS_CONFIG.read_text())
+        except Exception:
+            pass
+    return {"notebooks": [], "default_notebook_id": None}
+
+
+def _save_notebooks_config(config):
+    NOTEBOOKS_DIR.mkdir(parents=True, exist_ok=True)
+    NOTEBOOKS_CONFIG.write_text(json.dumps(config, indent=2))
+
+
+@app.get("/notebooks/config")
+async def get_notebooks_config():
+    return _load_notebooks_config()
+
+
+@app.put("/notebooks/config")
+async def put_notebooks_config(body: dict):
+    _save_notebooks_config(body)
+    return {"ok": True}
+
+
+@app.post("/notebooks")
+async def add_notebook(body: dict):
+    config = _load_notebooks_config()
+    nb = {
+        "id": body.get("id", ""),
+        "name": body.get("name", ""),
+        "emoji": body.get("emoji", ""),
+        "enabled": body.get("enabled", True),
+        "room_mapping": body.get("room_mapping", {}),
+        "default_for_unmapped": body.get("default_for_unmapped", False),
+        "topics": body.get("topics", []),
+        "chat_style": body.get("chat_style", "DEFAULT"),
+        "chat_length": body.get("chat_length", "DEFAULT"),
+    }
+    if not nb["id"]:
+        raise HTTPException(400, "notebook id is required")
+    for existing in config.get("notebooks", []):
+        if existing["id"] == nb["id"]:
+            raise HTTPException(409, f"notebook {nb['id']} already exists")
+    config.setdefault("notebooks", []).append(nb)
+    if body.get("default_for_unmapped") or not config.get("default_notebook_id"):
+        config["default_notebook_id"] = nb["id"]
+    _save_notebooks_config(config)
+    return {"ok": True, "notebook": nb}
+
+
+@app.patch("/notebooks/{notebook_id}")
+async def patch_notebook(notebook_id: str, body: dict):
+    config = _load_notebooks_config()
+    for nb in config.get("notebooks", []):
+        if nb["id"] == notebook_id:
+            for k, v in body.items():
+                if k != "id":
+                    nb[k] = v
+            if body.get("default_for_unmapped"):
+                config["default_notebook_id"] = notebook_id
+            _save_notebooks_config(config)
+            return {"ok": True, "notebook": nb}
+    raise HTTPException(404, f"notebook {notebook_id} not found")
+
+
+@app.delete("/notebooks/{notebook_id}")
+async def delete_notebook(notebook_id: str):
+    config = _load_notebooks_config()
+    before = len(config.get("notebooks", []))
+    config["notebooks"] = [
+        nb for nb in config.get("notebooks", []) if nb["id"] != notebook_id
+    ]
+    if len(config["notebooks"]) == before:
+        raise HTTPException(404, f"notebook {notebook_id} not found")
+    if config.get("default_notebook_id") == notebook_id:
+        config["default_notebook_id"] = (
+            config["notebooks"][0]["id"] if config["notebooks"] else None
+        )
+    _save_notebooks_config(config)
+    return {"ok": True}
+
+
+@app.get("/notebooks/live")
+async def get_live_notebooks():
+    try:
+        req = urllib.request.Request(f"{GNOTES_URL}/live-notebooks")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        raise HTTPException(502, f"gNotes not available: {e}")
 
 
 @app.post("/enrichment/reindex")
@@ -4055,6 +5013,7 @@ SERVICE_AGENTS = {
     "worker": "memoria-worker.service",
     "sage": "sage.service",
     "pilosopher": "pilosopher.service",
+    "gnotes": "gnotes.service",
 }
 
 
@@ -4842,7 +5801,7 @@ body {
 .context-menu { background:var(--bg-elevated); border:1px solid var(--border); border-radius:8px; padding:4px 0; box-shadow:0 4px 12px rgba(0,0,0,.3); min-width:120px; }
 .context-item { padding:6px 16px; cursor:pointer; font-size:13px; color:var(--text-primary); }
 .context-item:hover { background:var(--bg-hover); }
-.context-item.danger { color:var(--danger); }
+.context-item.danger { color:var(--error); }
 .chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .chat-messages {
   flex: 1;
@@ -4866,6 +5825,7 @@ body {
 .msg .from.agent-os { color: var(--error); }
 .msg .from.mini, .msg .from.mini-participant { color: var(--accent-secondary); }
 .msg .from.notebookLM { color: var(--warning); }
+.msg .from.gNotes { color: var(--success); }
 .msg .ts { font-size: 10px; color: var(--text-muted); float: right; margin-left: 8px; }
 .msg.system { background: var(--bg-elevated); border-left: 3px solid var(--text-muted); }
 .msg.system .from { color: var(--text-muted); }
@@ -5050,6 +6010,87 @@ body {
 }
 .filter-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 .filter-btn.active { background: var(--accent-glow); color: var(--accent); border-color: var(--accent); }
+
+/* Agent sub-tabs */
+.agent-sub-tabs { display: flex; gap: 4px; margin-bottom: 16px; }
+.agent-sub-tab {
+  padding: 6px 16px;
+  border-radius: var(--radius-xs);
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.12s;
+  font-family: var(--font);
+}
+.agent-sub-tab:hover { background: var(--bg-hover); color: var(--text-primary); }
+.agent-sub-tab.active { background: var(--accent-glow); color: var(--accent); border-color: var(--accent); }
+
+/* Agent action buttons */
+.agent-actions { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 8px; }
+.agent-actions .btn { font-size: 11px; padding: 3px 8px; }
+
+/* Agent config preview */
+.agent-config-preview { font-size: 11px; color: var(--text-muted); margin-top: 6px; }
+.agent-config-preview .config-row { display: flex; gap: 6px; margin-bottom: 2px; }
+.agent-config-preview .config-label { font-weight: 600; color: var(--text-muted); min-width: 80px; }
+.agent-config-preview .config-val { color: var(--text-secondary); word-break: break-word; }
+.agent-config-preview .instructions-preview {
+  font-family: var(--mono);
+  font-size: 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 6px;
+  margin-top: 4px;
+  max-height: 48px;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-secondary);
+}
+
+/* Agent create/edit modal form */
+.agent-form { display: flex; flex-direction: column; gap: 12px; }
+.agent-form .form-group { display: flex; flex-direction: column; gap: 4px; }
+.agent-form label { font-size: 12px; font-weight: 600; color: var(--text-secondary); }
+.agent-form input, .agent-form textarea, .agent-form select {
+  padding: 8px 10px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 13px;
+  transition: border-color 0.12s;
+}
+.agent-form input:focus, .agent-form textarea:focus, .agent-form select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.agent-form textarea { min-height: 100px; resize: vertical; font-family: var(--mono); font-size: 12px; }
+.agent-form .form-row { display: flex; gap: 12px; }
+.agent-form .form-row > .form-group { flex: 1; }
+.agent-form .form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
+.agent-form .checkbox-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+.agent-form .checkbox-row input { width: 14px; height: 14px; accent-color: var(--accent); }
+
+/* Service card status badges */
+.svc-status { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; }
+.svc-status .svc-dot { width: 8px; height: 8px; border-radius: 50%; }
+.svc-status.active .svc-dot { background: var(--success); }
+.svc-status.active { color: var(--success); }
+.svc-status.inactive .svc-dot { background: var(--text-muted); }
+.svc-status.inactive { color: var(--text-muted); }
+.svc-status.failed .svc-dot { background: var(--error); }
+.svc-status.failed { color: var(--error); }
+.svc-status.unknown .svc-dot { background: var(--warning); }
+.svc-status.unknown { color: var(--warning); }
+
+.svc-stats { display: flex; gap: 12px; font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.svc-stats span { display: flex; align-items: center; gap: 3px; }
 
 .auto-approve-toggle { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; padding: 0 8px; font-size: 12px; color: var(--text-muted); user-select: none; }
 .auto-approve-toggle input { width: 14px; height: 14px; cursor: pointer; accent-color: var(--accent); }
@@ -5250,7 +6291,7 @@ body {
 .sidepane-task.pending { border-left-color:var(--warning); }
 .sidepane-task.running { border-left-color:var(--accent); }
 .sidepane-task.completed { border-left-color:var(--success); opacity:.7; }
-.sidepane-task.failed { border-left-color:var(--danger); }
+.sidepane-task.failed { border-left-color:var(--error); }
 .sidepane-task .title { font-weight:600; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .sidepane-task .meta { font-size:10px; color:var(--text-muted); margin-top:2px; }
 .msg .body a { color: var(--accent); text-decoration: underline; }
@@ -5295,6 +6336,7 @@ body {
 .sidebar-llm-toggle .dot.on { background:var(--success); box-shadow:0 0 6px rgba(74,222,128,.5); }
 .sidebar-llm-toggle .dot.off { background:var(--text-muted); }
 .sidebar-llm-toggle .dot.idle { background:var(--warning); animation:pulse-dot 1.5s ease-in-out infinite; }
+.sidebar-llm-toggle .dot.locked { background:var(--error); box-shadow:0 0 6px rgba(239,68,68,.5); }
 .sidebar-llm-toggle .idle-countdown { margin-left:auto; font-size:10px; color:var(--text-muted); }
 #enrichLabel { white-space:nowrap; }
 </style>
@@ -5341,10 +6383,15 @@ body {
     <div class="nav-item" data-tab="6" onclick="switchTab(6)"><span class="icon">🛡</span> Safety</div>
     <div class="nav-item" data-tab="7" onclick="switchTab(7)"><span class="icon">⚙</span> Settings</div>
     <div class="nav-item" data-tab="8" onclick="switchTab(8)"><span class="icon">🧠</span> Brain</div>
+    <div class="nav-item" data-tab="9" onclick="switchTab(9)"><span class="icon">📓</span> Notebooks</div>
     <div class="sidebar-spacer"></div>
-    <div class="sidebar-llm-toggle" id="enrichToggle" onclick="toggleEnrich()" title="Toggle LLM enrichment">
-      <span class="dot" id="enrichDot"></span>
-      <span id="enrichLabel">LLM Enrichment</span>
+    <div class="sidebar-llm-toggle" id="lockToggle" onclick="toggleGlobalLock()" title="Global LLM Lock — blocks all token usage when locked">
+      <span class="dot" id="lockDot"></span>
+      <span id="lockLabel">LLM Locked</span>
+    </div>
+    <div class="sidebar-llm-toggle" id="systemToggle" onclick="toggleSystem()" title="Toggle enrichment pipeline — system-level token usage">
+      <span class="dot" id="systemDot"></span>
+      <span id="systemLabel">System On</span>
       <span class="idle-countdown" id="idleCountdown"></span>
     </div>
   </div>
@@ -5365,15 +6412,26 @@ body {
       <div class="tab-header">
         <div class="tab-title">Agents</div>
         <div class="tab-actions">
-          <div class="filter-group" id="agentFilters">
-            <button class="filter-btn active" data-filter="all" onclick="setAgentFilter('all')">All</button>
-            <button class="filter-btn" data-filter="active" onclick="setAgentFilter('active')">Active</button>
-            <button class="filter-btn" data-filter="idle" onclick="setAgentFilter('idle')">Idle</button>
-            <button class="filter-btn" data-filter="error" onclick="setAgentFilter('error')">Error</button>
-          </div>
+          <button class="btn btn-accent btn-sm" onclick="openCreateAgentModal()">+ New Agent</button>
         </div>
       </div>
-      <div class="item-list" id="agentList"></div>
+      <div class="agent-sub-tabs">
+        <button class="agent-sub-tab active" data-view="registered" onclick="switchAgentView('registered')">Registered</button>
+        <button class="agent-sub-tab" data-view="services" onclick="switchAgentView('services')">Services</button>
+      </div>
+      <div id="agentRegisteredView">
+        <div class="filter-group" id="agentFilters" style="margin-bottom:12px">
+          <button class="filter-btn active" data-filter="all" onclick="setAgentFilter('all')">All</button>
+          <button class="filter-btn" data-filter="active" onclick="setAgentFilter('active')">Active</button>
+          <button class="filter-btn" data-filter="idle" onclick="setAgentFilter('idle')">Idle</button>
+          <button class="filter-btn" data-filter="paused" onclick="setAgentFilter('paused')">Paused</button>
+          <button class="filter-btn" data-filter="error" onclick="setAgentFilter('error')">Error</button>
+        </div>
+        <div class="item-list" id="agentList"></div>
+      </div>
+      <div id="agentServicesView" style="display:none">
+        <div class="item-list" id="serviceList"></div>
+      </div>
     </div>
 
     <!-- Tab 2: Tasks -->
@@ -5530,7 +6588,14 @@ body {
           </div>
           <div class="setting-row" style="flex:1;min-width:180px">
             <span class="label">LLM Model</span>
-            <input type="text" id="cfg_enrich_llm_model" value="" data-key="enrich_llm_model" style="width:100%;font-size:12px">
+            <div style="display:flex;gap:4px;align-items:center;flex:1">
+              <select id="cfg_enrich_llm_model" data-key="enrich_llm_model" style="flex:1;font-size:12px;padding:2px 4px;display:none"></select>
+              <input type="text" id="cfg_enrich_llm_model_text" value="" data-key="enrich_llm_model" style="flex:1;font-size:12px">
+              <button class="btn btn-xs" id="btnFetchModels" onclick="fetchLMStudioModels()" title="Fetch available models from LM Studio" style="display:none">📡 Fetch</button>
+              <button class="btn btn-xs btn-accent" id="btnLoadModel" onclick="loadLMStudioModel()" title="Load model in LM Studio" style="display:none">⬇ Load</button>
+              <button class="btn btn-xs" id="btnSaveModelConfig" onclick="saveLMStudioModelConfig()" title="Save load config for this model" style="display:none">💾 Config</button>
+              <button class="btn btn-xs" id="btnUnloadModel" onclick="unloadLMStudioModel()" title="Unload model from LM Studio" style="display:none">⬆ Unload</button>
+            </div>
           </div>
         </div>
         <div class="flex gap-2 mt-2" style="flex-wrap:wrap">
@@ -5541,6 +6606,9 @@ body {
               <button class="btn btn-xs" onclick="toggleApiKeyVisibility()" title="Show/Hide">👁</button>
             </div>
           </div>
+        </div>
+        <div id="lmstudio_model_details" style="display:none;width:100%;margin-top:4px;padding:8px 12px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius-xs);font-size:11px;line-height:1.6;color:var(--text-muted)">
+        </div>
         <div class="flex gap-2 mt-2" style="flex-wrap:wrap">
           <div class="setting-row" style="flex:0 0 auto">
             <span class="label">Enabled</span>
@@ -5585,12 +6653,6 @@ body {
       </div>
       <div class="card mt-4">
         <div class="card-title">🔑 Providers</div>
-        <div class="flex gap-2 mt-2" style="align-items:center;padding:8px 10px;border-radius:6px;background:var(--bg-alt, rgba(255,255,255,0.03))">
-          <span id="llmLockIcon" style="font-size:18px">🔒</span>
-          <span id="llmLockLabel" style="flex:1;font-weight:600;font-size:13px;color:var(--danger)">LOCKED</span>
-          <span id="llmLockSpinner" style="display:none;font-size:12px">⏳</span>
-          <button class="btn btn-sm" id="llmLockBtn" onclick="toggleLLMLock()" style="min-width:80px">Unlock</button>
-        </div>
         <div id="providerList" class="mt-2" style="font-size:12px"></div>
         <div class="flex gap-2 mt-2">
           <button class="btn btn-accent btn-sm" onclick="showAddProvider()">+ Add</button>
@@ -5599,8 +6661,119 @@ body {
       </div>
       <div class="card mt-4">
         <div class="card-title">🛣️ Routes</div>
-        <div class="text-sm text-muted mb-2" style="margin-bottom:6px">Per-agent LLM assignment. Format: <code>provider/model</code> for direct, <code>qa-auto</code>/<code>qa-best</code>/<code>qa-fast</code> for loadbalancer.</div>
+        <div class="text-sm text-muted mb-2" style="margin-bottom:6px">Per-agent LLM assignment. Format: <code>provider/model</code> for direct, <code>qa-auto</code>/<code>qa-best</code>/<code>qa-fast</code> for loadbalancer. Routes override the current provider/model selection.</div>
         <div id="routesList" style="font-size:11px"></div>
+        <div class="flex gap-2 mt-2">
+          <button class="btn btn-accent btn-sm" onclick="showAddRoute()">+ Add Route</button>
+          <button class="btn btn-sm" onclick="syncAllRoutesToCurrent()">🔄 Sync All to Current</button>
+        </div>
+      </div>
+    </div>
+    <!-- Create Agent Modal -->
+    <div class="modal-overlay" id="createAgentModal" style="display:none" onclick="if(event.target===this)closeCreateAgentModal()">
+      <div class="modal" style="max-width:560px">
+        <button class="modal-close" onclick="closeCreateAgentModal()">×</button>
+        <h2>Create Agent</h2>
+        <div class="agent-form">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Project *</label>
+              <input type="text" id="caProject" placeholder="memoria" value="memoria">
+            </div>
+            <div class="form-group">
+              <label>Capabilities</label>
+              <input type="text" id="caCapabilities" placeholder="general, coding, research" value="general">
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Task</label>
+            <input type="text" id="caTask" placeholder="What this agent does...">
+          </div>
+          <div class="form-group">
+            <label>Instructions (system prompt)</label>
+            <textarea id="caInstructions" placeholder="You are a..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Default Folder</label>
+            <input type="text" id="caDefaultFolder" placeholder="/mnt/external-drive/code/{room}">
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Provider</label>
+              <select id="caProvider"><option value="">-- none --</option></select>
+            </div>
+            <div class="form-group">
+              <label>Model</label>
+              <input type="text" id="caModel" placeholder="deepseek-v4-flash">
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Chitchat Name</label>
+            <input type="text" id="caChitchatName" placeholder="worker">
+          </div>
+          <div class="checkbox-row">
+            <input type="checkbox" id="caAutoStart">
+            <label for="caAutoStart" style="margin:0;font-weight:normal;cursor:pointer">Auto-start as systemd service</label>
+          </div>
+          <div class="form-group" id="caServiceGroup" style="display:none">
+            <label>Service Name</label>
+            <select id="caServiceName">
+              <option value="">-- select --</option>
+              <option value="orchestrator">orchestrator</option>
+              <option value="researcher">researcher</option>
+              <option value="builder">builder</option>
+              <option value="mini">mini</option>
+              <option value="worker">worker</option>
+              <option value="sage">sage</option>
+              <option value="pilosopher">pilosopher</option>
+              <option value="gnotes">gNotes</option>
+            </select>
+          </div>
+          <div class="form-actions">
+            <button class="btn" onclick="closeCreateAgentModal()">Cancel</button>
+            <button class="btn btn-accent" onclick="submitCreateAgent()">Create</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- Edit Agent Config Modal -->
+    <div class="modal-overlay" id="editAgentModal" style="display:none" onclick="if(event.target===this)closeEditAgentModal()">
+      <div class="modal" style="max-width:560px">
+        <button class="modal-close" onclick="closeEditAgentModal()">×</button>
+        <h2>Edit Agent</h2>
+        <div class="agent-form">
+          <input type="hidden" id="eaId">
+          <div class="form-group">
+            <label>Task</label>
+            <input type="text" id="eaTask" placeholder="What this agent does...">
+          </div>
+          <div class="form-group">
+            <label>Instructions (system prompt)</label>
+            <textarea id="eaInstructions" placeholder="You are a..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Default Folder</label>
+            <input type="text" id="eaDefaultFolder" placeholder="/mnt/external-drive/code/{room}">
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Provider</label>
+              <select id="eaProvider"><option value="">-- none --</option></select>
+            </div>
+            <div class="form-group">
+              <label>Model</label>
+              <input type="text" id="eaModel" placeholder="deepseek-v4-flash">
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Capabilities</label>
+            <input type="text" id="eaCapabilities" placeholder="general, coding, research">
+          </div>
+          <div class="form-actions">
+            <button class="btn" onclick="closeEditAgentModal()">Cancel</button>
+            <button class="btn btn-accent" onclick="submitEditAgent()">Save</button>
+          </div>
+        </div>
       </div>
     </div>
     <!-- Provider Editor Modal -->
@@ -5672,8 +6845,19 @@ body {
           <div id="brainTaskList" style="display:none;position:absolute;bottom:32px;left:8px;right:8px;max-height:200px;overflow-y:auto;background:rgba(10,10,16,0.95);border:1px solid rgba(108,92,231,0.2);border-radius:8px;padding:8px;gap:4px;flex-direction:column;"></div>
         </div>
       </div>
-  </div>
-</div>
+
+      <div class="tab-content" id="tab9">
+        <div class="tab-header">
+          <div class="tab-title">📓 Notebooks — NotebookLM Integration</div>
+          <div class="tab-actions">
+            <button class="btn btn-sm" onclick="syncLiveNotebooks()">🔄 Sync from NotebookLM</button>
+            <button class="btn btn-sm btn-accent" onclick="addNotebookModal()">+ Add Notebook</button>
+          </div>
+        </div>
+        <div id="notebooksList" style="padding:16px;"></div>
+            </div>
+          </div>
+        </div>
 
 <!-- Search Overlay -->
 <div class="search-overlay" id="searchOverlay"></div>
@@ -5738,7 +6922,7 @@ function switchTab(n) {
   document.querySelector('.nav-item[data-tab="' + n + '"]')?.classList.add('active');
   document.getElementById('sidebar').classList.remove('open');
   location.hash = 'tab=' + n;
-  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, loadRecall, loadChat, loadSafety, loadSettings, loadBrainDelayed];
+  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, loadRecall, loadChat, loadSafety, loadSettings, loadBrainDelayed, loadNotebooks];
   if (loaders[n]) loaders[n]();
 }
 
@@ -5746,7 +6930,7 @@ function initTabFromHash() {
   const m = location.hash.match(/tab=(\\d)/);
   if (m) {
     const n = parseInt(m[1]);
-    if (n >= 0 && n <= 8) { switchTab(n); return; }
+    if (n >= 0 && n <= 9) { switchTab(n); return; }
   }
   loadOverview();
 }
@@ -5820,15 +7004,20 @@ function restoreExpanded() {
 }
 
 // -- Fetch Wrapper --
-async function api(path) {
+async function api(path, method, body) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15000);
   try {
-    const r = await fetch(BASE + path, { signal: controller.signal });
+    const opts = { method: method || 'GET', signal: controller.signal };
+    if (body && method !== 'GET') {
+      opts.headers = { 'Content-Type': 'application/json' };
+      opts.body = JSON.stringify(body);
+    }
+    const r = await fetch(BASE + path, opts);
     clearTimeout(timer);
     if (!r.ok) {
-      const body = await r.text().catch(() => '');
-      throw new Error((r.status + ' ' + r.statusText + (body ? ': ' + body.slice(0, 120) : '')).trim());
+      const txt = await r.text().catch(() => '');
+      throw new Error((r.status + ' ' + r.statusText + (txt ? ': ' + txt.slice(0, 120) : '')).trim());
     }
     return r.json();
   } catch(e) {
@@ -5964,7 +7153,7 @@ async function loadOverview() {
       agentsEl.innerHTML = '<div class="empty-state">No agents running</div>';
     } else {
       agentsEl.innerHTML = agents.agents.map(a => '<div class="item-card">' +
-        '<div class="top">' + dot(a.status) + '<span class="id">' + esc(a.id).slice(0, 20) + '</span>' + tag(a.project, 'accent') + tag(a.status, a.status === 'active' ? 'success' : a.status === 'idle' ? 'warning' : 'error') + '</div>' +
+        '<div class="top">' + dot(a.status) + '<span class="id">' + esc(a.id).slice(0, 20) + '</span>' + tag(a.project, 'accent') + tag(a.status, a.status === 'active' ? 'success' : a.status === 'paused' ? 'warning' : a.status === 'idle' ? 'warning' : a.status === 'error' ? 'error' : 'default') + '</div>' +
         '<div class="meta"><span>&#128193; ' + (a.files || []).length + ' files</span><span>&#10084;&#65039; ' + ago(a.last_heartbeat) + '</span></div>' +
         '</div>').join('');
     }
@@ -6012,10 +7201,20 @@ async function loadOverview() {
   }
 }
 
-// ============================================
 // TAB 1: AGENTS
 // ============================================
 let agentsData = [];
+let servicesData = [];
+let agentView = 'registered';
+
+function switchAgentView(view) {
+  agentView = view;
+  document.querySelectorAll('.agent-sub-tab').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+  el('agentRegisteredView').style.display = view === 'registered' ? '' : 'none';
+  el('agentServicesView').style.display = view === 'services' ? '' : 'none';
+  if (view === 'registered') loadAgents();
+  else loadServices();
+}
 
 async function loadAgents() {
   try {
@@ -6028,10 +7227,71 @@ async function loadAgents() {
   }
 }
 
+async function loadServices() {
+  try {
+    servicesData = (await api('/services')).services || [];
+    renderServices();
+    setConn(true);
+  } catch(e) {
+    setConn(false);
+    el('serviceList').innerHTML = '<div class="empty-state error">Failed to load services: ' + esc(e.message) + '</div>';
+  }
+}
+
 function setAgentFilter(f) {
   state.agentFilter = f;
   document.querySelectorAll('#agentFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
   renderAgents();
+}
+
+function svcStatusLabel(s) {
+  const cls = s === 'active' ? 'active' : s === 'failed' ? 'failed' : s === 'inactive' ? 'inactive' : 'unknown';
+  return '<span class="svc-status ' + cls + '"><span class="svc-dot"></span>' + esc(s) + '</span>';
+}
+
+function renderServices() {
+  const container = el('serviceList');
+  if (!servicesData.length) {
+    container.innerHTML = '<div class="empty-state"><span class="icon">&#9881;</span>No services configured</div>';
+    return;
+  }
+  container.innerHTML = servicesData.map(s => {
+    const isUp = s.status === 'active';
+    return '<div class="item-card" onclick="toggleDetail(this)">' +
+      '<div class="top">' + svcStatusLabel(s.status) + '<span class="id">' + esc(s.name) + '</span>' +
+        (s.service ? tag(s.service, 'accent') : '') +
+        (s.pid ? '<span class="id">PID ' + s.pid + '</span>' : '') +
+      '</div>' +
+      '<div class="svc-stats">' +
+        '<span>&#9881; ' + esc(s.sub_status || '-') + '</span>' +
+        '<span>&#128187; ' + s.cpu.toFixed(1) + '% CPU</span>' +
+        '<span>&#128190; ' + s.mem.toFixed(1) + '% MEM</span>' +
+        '<span>&#128207; ' + s.rss_mb + ' MB</span>' +
+      '</div>' +
+      '<div class="agent-actions">' +
+        (isUp
+? '<button class="btn btn-error btn-sm" onclick="event.stopPropagation();serviceAction(' + "'" + esc(s.name) + "','" + 'stop' + "'" + ')">&#9724; Shutdown</button>' +
+'<button class="btn btn-warning btn-sm" onclick="event.stopPropagation();serviceAction(' + "'" + esc(s.name) + "','" + 'restart' + "'" + ')">&#8635; Restart</button>'
+: '<button class="btn btn-success btn-sm" onclick="event.stopPropagation();serviceAction(' + "'" + esc(s.name) + "','" + 'start' + "'" + ')">&#9654; Wake Up</button>') +
+      '</div>' +
+      '<div class="detail">' +
+        '<div><strong>Service:</strong> ' + esc(s.service || '-') + '</div>' +
+        '<div><strong>PID:</strong> ' + (s.pid || '-') + '</div>' +
+        '<div><strong>CPU:</strong> ' + s.cpu.toFixed(1) + '%</div>' +
+        '<div><strong>Memory:</strong> ' + s.mem.toFixed(1) + '% (' + s.rss_mb + ' MB)</div>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+async function serviceAction(name, action) {
+  try {
+    await api('/services/' + encodeURIComponent(name) + '/' + action, 'POST');
+    toast('Service ' + name + ' ' + action + 'ed', 'success');
+    loadServices();
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  }
 }
 
 function renderAgents() {
@@ -6041,28 +7301,185 @@ function renderAgents() {
     container.innerHTML = '<div class="empty-state"><span class="icon">&#9679;</span>No ' + (state.agentFilter === 'all' ? '' : state.agentFilter + ' ') + 'agents</div>';
     return;
   }
-  container.innerHTML = list.map(a => '<div class="item-card" onclick="toggleDetail(this)">' +
-    '<div class="top">' + dot(a.status) + '<span class="id">' + esc(a.id) + '</span>' + tag(a.project, 'accent') + tag(a.status, a.status === 'active' ? 'success' : a.status === 'idle' ? 'warning' : 'error') + '</div>' +
-    '<div class="title">' + esc(a.task || (a.chitchat_name || '')) +
-      (a.activity ? '<span class="activity-indicator"><span class="dot ' + esc(a.activity) + '"></span>' + esc(a.activity) + '</span>' : '') +
-    '</div>' +
-    '<div class="meta">' +
-      '<span>&#128193; ' + (a.files || []).length + ' files</span>' +
-      '<span>&#128190; ' + (a.commit_log || []).length + ' commits</span>' +
-      '<span>&#10084;&#65039; ' + ago(a.last_heartbeat) + '</span>' +
-      '<span>&#9654; ' + ago(a.started_at) + '</span>' +
-    '</div>' +
-    '<div class="detail">' +
-      '<div><strong>PID:</strong> ' + (a.pid || '-') + '</div>' +
-      '<div><strong>Chitchat:</strong> ' + esc(a.chitchat_name || '-') + '</div>' +
-      '<div><strong>Activity:</strong> ' + esc(a.activity || '-') + '</div>' +
-      '<div><strong>Started:</strong> ' + fmtTime(a.started_at) + '</div>' +
-      '<div><strong>Heartbeat:</strong> ' + fmtTime(a.last_heartbeat) + '</div>' +
-      (a.conflicts_warned && a.conflicts_warned.length ? '<div class="mt-2"><strong>&#9888; Conflicts:</strong> ' + esc(a.conflicts_warned.join('; ')) + '</div>' : '') +
-      (a.commit_log && a.commit_log.length ? '<div class="mt-2"><strong>Recent Commits:</strong></div><pre>' + esc(a.commit_log.slice(-5).join(String.fromCharCode(10))) + '</pre>' : '') +
-    '</div>' +
-    '</div>').join('');
+  container.innerHTML = list.map(a => {
+    const statusColor = a.status === 'active' ? 'success' : a.status === 'paused' ? 'warning' : a.status === 'idle' ? 'warning' : a.status === 'error' ? 'error' : 'default';
+    const canPause = a.status === 'active' && a.pid;
+    const canResume = a.status === 'paused' && a.pid;
+    const hasConfig = a.instructions || a.default_folder || a.model;
+    const hasLLM = a.provider_id || a.model;
+    return '<div class="item-card" onclick="toggleDetail(this)">' +
+      '<div class="top">' + dot(a.status) + '<span class="id">' + esc(a.id) + '</span>' + tag(a.project, 'accent') + tag(a.status, statusColor) +
+        (a.capabilities && a.capabilities.length ? a.capabilities.map(c => tag(c, 'default')).join('') : '') +
+        (hasLLM ? tag((a.provider_id || 'default') + '/' + (a.model || '?'), 'accent') : '') +
+      '</div>' +
+      '<div class="title">' + esc(a.task || (a.chitchat_name || '')) +
+        (a.activity ? '<span class="activity-indicator"><span class="dot ' + esc(a.activity) + '"></span>' + esc(a.activity) + '</span>' : '') +
+      '</div>' +
+      '<div class="meta">' +
+        '<span>&#128193; ' + (a.files || []).length + ' files</span>' +
+        '<span>&#128190; ' + (a.commit_log || []).length + ' commits</span>' +
+        '<span>&#10084;&#65039; ' + ago(a.last_heartbeat) + '</span>' +
+        '<span>&#9654; ' + ago(a.started_at) + '</span>' +
+        (a.pid ? '<span>PID ' + a.pid + '</span>' : '') +
+      '</div>' +
+      (hasConfig ? '<div class="agent-config-preview">' +
+        (a.default_folder ? '<div class="config-row"><span class="config-label">Folder:</span><span class="config-val">' + esc(a.default_folder) + '</span></div>' : '') +
+        (a.instructions ? '<div class="instructions-preview">' + esc(a.instructions.substring(0, 200)) + (a.instructions.length > 200 ? '...' : '') + '</div>' : '') +
+      '</div>' : '') +
+      '<div class="agent-actions">' +
+        (canPause ? '<button class="btn btn-warning btn-sm" onclick="event.stopPropagation();pauseAgent(' + "'" + a.id + "'" + ')">&#9208; Pause</button>' : '') +
+        (canResume ? '<button class="btn btn-success btn-sm" onclick="event.stopPropagation();resumeAgent(' + "'" + a.id + "'" + ')">&#9654; Resume</button>' : '') +
+        (a.status !== 'paused' && a.status !== 'stopped' && a.pid ? '<button class="btn btn-error btn-sm" onclick="event.stopPropagation();shutdownAgent(' + "'" + a.id + "'" + ')">&#9724; Shutdown</button>' : '') +
+        '<button class="btn btn-sm" onclick="event.stopPropagation();openEditAgentModal(' + "'" + a.id + "'" + ')">&#9998; Edit</button>' +
+        '<button class="btn btn-error btn-sm" onclick="event.stopPropagation();deleteAgent(' + "'" + a.id + "'" + ')">&#128465; Delete</button>' +
+      '</div>' +
+      '<div class="detail">' +
+        '<div><strong>PID:</strong> ' + (a.pid || '-') + '</div>' +
+        '<div><strong>Chitchat:</strong> ' + esc(a.chitchat_name || '-') + '</div>' +
+        '<div><strong>Activity:</strong> ' + esc(a.activity || '-') + '</div>' +
+        '<div><strong>Started:</strong> ' + fmtTime(a.started_at) + '</div>' +
+        '<div><strong>Heartbeat:</strong> ' + fmtTime(a.last_heartbeat) + '</div>' +
+        (a.instructions ? '<div class="mt-2"><strong>Instructions:</strong></div><pre>' + esc(a.instructions) + '</pre>' : '') +
+        (a.default_folder ? '<div><strong>Default Folder:</strong> ' + esc(a.default_folder) + '</div>' : '') +
+        (a.provider_id || a.model ? '<div><strong>LLM:</strong> ' + esc(a.provider_id || 'default') + ' / ' + esc(a.model || '(default)') + '</div>' : '') +
+        (a.conflicts_warned && a.conflicts_warned.length ? '<div class="mt-2"><strong>&#9888; Conflicts:</strong> ' + esc(a.conflicts_warned.join('; ')) + '</div>' : '') +
+        (a.commit_log && a.commit_log.length ? '<div class="mt-2"><strong>Recent Commits:</strong></div><pre>' + esc(a.commit_log.slice(-5).join(String.fromCharCode(10))) + '</pre>' : '') +
+      '</div>' +
+    '</div>';
+  }).join('');
 }
+
+async function pauseAgent(id) {
+  try {
+    await api('/agents/' + id + '/pause', 'POST');
+    toast('Agent paused', 'success');
+    loadAgents();
+  } catch(e) { toast('Pause failed: ' + e.message, 'error'); }
+}
+
+async function resumeAgent(id) {
+  try {
+    await api('/agents/' + id + '/resume', 'POST');
+    toast('Agent resumed', 'success');
+    loadAgents();
+  } catch(e) { toast('Resume failed: ' + e.message, 'error'); }
+}
+
+async function shutdownAgent(id) {
+  if (!confirm('Shutdown this agent?')) return;
+  try {
+    await api('/agents/' + id + '?kill=true', 'DELETE');
+    toast('Agent shut down', 'success');
+    loadAgents();
+  } catch(e) { toast('Shutdown failed: ' + e.message, 'error'); }
+}
+
+async function deleteAgent(id) {
+  if (!confirm('Permanently delete this agent?')) return;
+  try {
+    await api('/agents/' + id + '?kill=true', 'DELETE');
+    toast('Agent deleted', 'success');
+    loadAgents();
+  } catch(e) { toast('Delete failed: ' + e.message, 'error'); }
+}
+
+let _agentProvidersCache = [];
+
+async function loadProviderOptions() {
+  try {
+    const data = await api('/providers');
+    _agentProvidersCache = (data.providers || []).filter(p => p.enabled);
+  } catch(e) { _agentProvidersCache = []; }
+}
+
+function populateProviderSelect(selectId, selectedId) {
+  const sel = el(selectId);
+  sel.innerHTML = '<option value="">-- none --</option>' +
+    _agentProvidersCache.map(p =>
+      '<option value="' + esc(p.id) + '"' + (p.id === selectedId ? ' selected' : '') + '>' +
+      esc(p.name || p.id) + '</option>'
+    ).join('');
+}
+
+function openCreateAgentModal() {
+  el('caProject').value = 'memoria';
+  el('caTask').value = '';
+  el('caInstructions').value = '';
+  el('caDefaultFolder').value = '';
+  el('caChitchatName').value = '';
+  el('caCapabilities').value = 'general';
+  el('caAutoStart').checked = false;
+  el('caServiceGroup').style.display = 'none';
+  el('caServiceName').value = '';
+  el('caProvider').value = '';
+  el('caModel').value = '';
+  loadProviderOptions().then(() => populateProviderSelect('caProvider', ''));
+  el('createAgentModal').style.display = 'flex';
+}
+
+function closeCreateAgentModal() {
+  el('createAgentModal').style.display = 'none';
+}
+
+async function submitCreateAgent() {
+  const body = {
+    project: el('caProject').value.trim() || 'memoria',
+    task: el('caTask').value.trim(),
+    instructions: el('caInstructions').value.trim(),
+    default_folder: el('caDefaultFolder').value.trim(),
+    chitchat_name: el('caChitchatName').value.trim(),
+    capabilities: el('caCapabilities').value.split(',').map(s => s.trim()).filter(Boolean),
+    auto_start: el('caAutoStart').checked,
+    service_name: el('caServiceName').value,
+    provider_id: el('caProvider').value,
+    model: el('caModel').value.trim(),
+  };
+  try {
+    const data = await api('/agents/create', 'POST', body);
+    toast('Agent created: ' + (data.agent_id || '').slice(0, 12), 'success');
+    closeCreateAgentModal();
+    loadAgents();
+  } catch(e) { toast('Create failed: ' + e.message, 'error'); }
+}
+
+function openEditAgentModal(id) {
+  const a = agentsData.find(x => x.id === id);
+  if (!a) return;
+  el('eaId').value = a.id;
+  el('eaTask').value = a.task || '';
+  el('eaInstructions').value = a.instructions || '';
+  el('eaDefaultFolder').value = a.default_folder || '';
+  el('eaCapabilities').value = (a.capabilities || []).join(', ');
+  el('eaModel').value = a.model || '';
+  loadProviderOptions().then(() => populateProviderSelect('eaProvider', a.provider_id || ''));
+  el('editAgentModal').style.display = 'flex';
+}
+
+function closeEditAgentModal() {
+  el('editAgentModal').style.display = 'none';
+}
+
+async function submitEditAgent() {
+  const id = el('eaId').value;
+  const body = {
+    task: el('eaTask').value.trim(),
+    instructions: el('eaInstructions').value.trim(),
+    default_folder: el('eaDefaultFolder').value.trim(),
+    capabilities: el('eaCapabilities').value.split(',').map(s => s.trim()).filter(Boolean),
+    provider_id: el('eaProvider').value,
+    model: el('eaModel').value.trim(),
+  };
+  try {
+    await api('/agents/' + id + '/config', 'PATCH', body);
+    toast('Agent config saved', 'success');
+    closeEditAgentModal();
+    loadAgents();
+  } catch(e) { toast('Save failed: ' + e.message, 'error'); }
+}
+
+document.getElementById('caAutoStart').addEventListener('change', function() {
+  el('caServiceGroup').style.display = this.checked ? '' : 'none';
+});
 
 // ============================================
 // TAB 2: TASKS
@@ -6882,11 +8299,11 @@ async function updateChatPanels(room) {
 function renderMarkdown(text) {
   if (!text) return '';
   let s = esc(text);
-  s = s.replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
+  s = s.replace(/```([\\s\\S]*?)```/g, '<pre><code>$1</code></pre>');
   s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
-  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  s = s.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+  s = s.replace(/\\*([^*]+)\\*/g, '<em>$1</em>');
+  s = s.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank">$1</a>');
   s = s.replaceAll(String.fromCharCode(10), '<br>');
   return s;
 }
@@ -6903,7 +8320,7 @@ async function loadChatMessages() {
       const from = m.from || 'system';
       const isSys = m.type === 'system' || from === 'agent-os' || from === 'system';
       const cls = isSys ? ' system' : '';
-      const fromCls = from === 'agent-os' ? 'agent-os' : from === 'mini' || from === 'mini-participant' ? 'mini' : from === 'notebookLM' ? 'notebookLM' : '';
+      const fromCls = from === 'agent-os' ? 'agent-os' : from === 'mini' || from === 'mini-participant' ? 'mini' : from === 'notebookLM' ? 'notebookLM' : from === 'gNotes' ? 'gNotes' : '';
       const prefix = isSys ? '\u25c9' : from === 'user' || from === 'you' ? '\u25b6' : '\u25c8';
       return '<div class="msg' + cls + '">' +
         '<div class="from' + (fromCls ? ' ' + fromCls : '') + '">' + prefix + ' ' + esc(from) + ' <span class="ts">' + fmtTime(m.ts) + '</span></div>' +
@@ -7117,7 +8534,6 @@ async function loadSettings() {
   try {
     state.config = await api('/config');
     await loadProviders();
-    await loadLLMLock();
     await loadRoutes();
     renderConfig();
     loadEnrichSettings();
@@ -7132,7 +8548,6 @@ async function loadSettings() {
 
 function loadEnrichSettings() {
   const cfg = state.config || {};
-  // Populate provider dropdown first (sets fields from provider defaults)
   const sel = el('cfg_provider');
   sel.innerHTML = _providersList
     .filter(function(p) { return p.enabled !== false; })
@@ -7143,15 +8558,34 @@ function loadEnrichSettings() {
     sel.value = _currentProvider.provider_id;
     applyProviderFields(_currentProvider.provider_id, _currentProvider.model);
   }
-  // Apply saved config on top — manual wins over provider defaults
-  if (cfg.enrich_llm_url) el('cfg_enrich_llm_url').value = cfg.enrich_llm_url.replace(/\/+$/, '');
-  if (cfg.enrich_llm_model) el('cfg_enrich_llm_model').value = cfg.enrich_llm_model;
+  if (cfg.enrich_llm_url) el('cfg_enrich_llm_url').value = cfg.enrich_llm_url.replace(/\\/+$/, '');
+  if (cfg.enrich_llm_model) _setModelVal(cfg.enrich_llm_model);
   if (cfg.enrich_llm_api_key) el('cfg_enrich_llm_api_key').value = cfg.enrich_llm_api_key;
   el('cfg_enrich_enabled').checked = cfg.enrich_enabled !== false;
   el('cfg_enrich_weight').value = cfg.enrich_weight ?? 0.5;
   el('cfg_enrich_df_ratio').value = cfg.enrich_df_ratio ?? 0.1;
   el('cfg_enrich_temperature').value = cfg.enrich_temperature ?? 0.4;
   el('cfg_enrich_idle_min').value = cfg.enrich_idle_min ?? 0;
+  updateLMStudioButtons();
+}
+
+function _modelVal() {
+  const sel = el('cfg_enrich_llm_model');
+  const txt = el('cfg_enrich_llm_model_text');
+  return sel.style.display !== 'none' ? sel.value : txt.value;
+}
+
+function _setModelVal(v) {
+  const sel = el('cfg_enrich_llm_model');
+  const txt = el('cfg_enrich_llm_model_text');
+  if (sel.style.display !== 'none') {
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === v) { sel.selectedIndex = i; return; }
+    }
+    sel.value = v;
+  } else {
+    txt.value = v;
+  }
 }
 
 function applyProviderFields(providerId, model) {
@@ -7159,13 +8593,242 @@ function applyProviderFields(providerId, model) {
   if (!p) return;
   el('cfg_enrich_llm_url').value = p.base_url;
   el('cfg_enrich_llm_api_key').value = p.api_key || '';
-  if (model) el('cfg_enrich_llm_model').value = model;
+  if (model) _setModelVal(model);
 }
 
 function onProviderChange() {
   const pid = el('cfg_provider').value;
-  if (pid === 'custom') return;
-  applyProviderFields(pid, '');
+  if (pid === 'custom') {
+    updateLMStudioButtons();
+    return;
+  }
+  const currentModel = _modelVal();
+  applyProviderFields(pid, currentModel || _currentProvider.model);
+  updateLMStudioButtons();
+}
+
+function updateLMStudioButtons() {
+  const pid = el('cfg_provider').value;
+  const isLMStudio = pid === 'lmstudio';
+  const fetchBtn = el('btnFetchModels');
+  const loadBtn = el('btnLoadModel');
+  const unloadBtn = el('btnUnloadModel');
+  const saveCfgBtn = el('btnSaveModelConfig');
+  const sel = el('cfg_enrich_llm_model');
+  const txt = el('cfg_enrich_llm_model_text');
+  if (isLMStudio) {
+    sel.style.display = 'block';
+    txt.style.display = 'none';
+  } else {
+    sel.style.display = 'none';
+    txt.style.display = 'block';
+  }
+  if (fetchBtn) fetchBtn.style.display = isLMStudio ? 'inline-block' : 'none';
+  if (loadBtn) loadBtn.style.display = isLMStudio ? 'inline-block' : 'none';
+  if (unloadBtn) unloadBtn.style.display = isLMStudio ? 'inline-block' : 'none';
+  if (saveCfgBtn) saveCfgBtn.style.display = isLMStudio ? 'inline-block' : 'none';
+}
+
+let _lmModels = [];
+let _lmSavedConfigs = {};
+
+function _fmtSize(bytes) {
+  if (!bytes) return '';
+  if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + ' GB';
+  if (bytes >= 1048576) return (bytes / 1048576).toFixed(0) + ' MB';
+  return bytes + ' B';
+}
+
+function _fmtCtx(n) {
+  if (!n) return '';
+  if (n >= 1000000) return (n / 1000000).toFixed(0) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(0) + 'K';
+  return n + '';
+}
+
+function _showModelDetails(m) {
+  const panel = el('lmstudio_model_details');
+  if (!panel) return;
+  if (!m) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  let caps = [];
+  if (m.capabilities) {
+    if (m.capabilities.vision) caps.push('👁 vision');
+    if (m.capabilities.trained_for_tool_use) caps.push('🔧 tools');
+    if (m.capabilities.reasoning) caps.push('🧠 reasoning');
+  }
+  const sz = m.size_bytes ? _fmtSize(m.size_bytes) : '';
+  const ctx = m.max_context_length ? _fmtCtx(m.max_context_length) : '';
+  const state = m.loaded ? '<span style="color:var(--accent)">● loaded</span>' : '<span style="color:var(--text-muted)">○ not loaded</span>';
+  const inst = (m.loaded_instances && m.loaded_instances.length) ? ' (' + m.loaded_instances.length + ' instance' + (m.loaded_instances.length > 1 ? 's' : '') + ')' : '';
+  const savedCfg = (_lmSavedConfigs || {})[m.id] || {};
+  const ctxLen = savedCfg.context_length || m.max_context_length || 4096;
+  const gpuOff = savedCfg.gpu !== undefined ? savedCfg.gpu : true;
+  const flashAtt = savedCfg.flash_attention !== undefined ? savedCfg.flash_attention : true;
+  const offloadKv = savedCfg.offload_kv_cache_to_gpu !== undefined ? savedCfg.offload_kv_cache_to_gpu : true;
+  const evalBatch = savedCfg.eval_batch_size || 512;
+  const keepMem = savedCfg.keep_model_in_memory !== undefined ? savedCfg.keep_model_in_memory : false;
+  panel.innerHTML =
+    '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 16px;margin-bottom:8px">' +
+    '<div><strong>' + esc(m.display_name || m.id) + '</strong> ' + state + inst + '</div>' +
+    (sz ? '<div>📦 ' + sz + '</div>' : '') +
+    (m.params_string ? '<div>🔢 ' + esc(m.params_string) + '</div>' : '') +
+    (m.quantization ? '<div>🗜 ' + esc(m.quantization) + (m.bits_per_weight ? ' (' + m.bits_per_weight + 'bpw)' : '') + '</div>' : '') +
+    (ctx ? '<div>📏 ' + ctx + ' ctx</div>' : '') +
+    (m.architecture ? '<div>🏗 ' + esc(m.architecture) + '</div>' : '') +
+    (m.format ? '<div>📄 ' + esc(m.format) + '</div>' : '') +
+    (m.publisher ? '<div>👤 ' + esc(m.publisher) + '</div>' : '') +
+    (caps.length ? '<div>' + caps.join(' · ') + '</div>' : '') +
+    '</div>' +
+    '<div style="border-top:1px solid var(--border);padding-top:6px;margin-top:2px">' +
+    '<div style="font-weight:600;margin-bottom:4px">Load Configuration</div>' +
+    '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:4px 12px;align-items:center">' +
+    '<div><label style="font-size:11px">Context Length</label><input type="number" id="lm_cfg_ctx" value="' + ctxLen + '" style="width:100%;font-size:11px;padding:2px 4px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text-primary)"></div>' +
+    '<div><label style="font-size:11px">Eval Batch Size</label><input type="number" id="lm_cfg_batch" value="' + evalBatch + '" style="width:100%;font-size:11px;padding:2px 4px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text-primary)"></div>' +
+    '<div style="display:flex;gap:4px;align-items:center"><input type="checkbox" id="lm_cfg_gpu"' + (gpuOff ? ' checked' : '') + ' style="width:16px;height:16px"><label for="lm_cfg_gpu" style="font-size:11px">GPU Offload</label></div>' +
+    '<div style="display:flex;gap:4px;align-items:center"><input type="checkbox" id="lm_cfg_flash"' + (flashAtt ? ' checked' : '') + ' style="width:16px;height:16px"><label for="lm_cfg_flash" style="font-size:11px">Flash Attention</label></div>' +
+    '<div style="display:flex;gap:4px;align-items:center"><input type="checkbox" id="lm_cfg_kv"' + (offloadKv ? ' checked' : '') + ' style="width:16px;height:16px"><label for="lm_cfg_kv" style="font-size:11px">KV → GPU</label></div>' +
+    '<div style="display:flex;gap:4px;align-items:center"><input type="checkbox" id="lm_cfg_keep"' + (keepMem ? ' checked' : '') + ' style="width:16px;height:16px"><label for="lm_cfg_keep" style="font-size:11px">Keep in RAM</label></div>' +
+    '</div></div>';
+}
+
+async function fetchLMStudioModels() {
+  const btn = el('btnFetchModels');
+  if (btn) btn.disabled = true;
+  try {
+    const data = await api('/lmstudio/models');
+    if (!data.ok) { toast('Error: ' + (data.error || 'fetch failed'), 'error'); return; }
+    const sel = el('cfg_enrich_llm_model');
+    const curVal = sel.value;
+    sel.innerHTML = '<option value="">-- select model --</option>';
+    _lmModels = data.models || [];
+    _lmSavedConfigs = data.saved_configs || {};
+    _lmModels.sort(function(a, b) {
+      if (a.loaded && !b.loaded) return -1;
+      if (!a.loaded && b.loaded) return 1;
+      return (a.id || '').localeCompare(b.id || '');
+    });
+    const totalBytes = _lmModels.reduce(function(s, m) { return s + (m.size_bytes || 0); }, 0);
+    _lmModels.forEach(function(m) {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      const parts = [];
+      if (m.display_name) parts.push(m.display_name);
+      if (m.params_string) parts.push(m.params_string);
+      if (m.quantization) parts.push(m.quantization);
+      if (m.size_bytes) parts.push(_fmtSize(m.size_bytes));
+      const prefix = m.loaded ? '● ' : '○ ';
+      opt.textContent = prefix + (parts.length ? parts.join(' · ') : m.id);
+      sel.appendChild(opt);
+    });
+    if (curVal) {
+      for (let i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === curVal) { sel.selectedIndex = i; break; }
+      }
+    }
+    const loaded = _lmModels.filter(function(m) { return m.loaded; });
+    toast(_lmModels.length + ' models' + (loaded.length ? ' (' + loaded.length + ' loaded)' : '') + (totalBytes ? ' · ' + _fmtSize(totalBytes) + ' total' : ''), 'success');
+    sel.onchange = function() {
+      const m = _lmModels.find(function(m) { return m.id === sel.value; });
+      _showModelDetails(m || null);
+      const txt = el('cfg_enrich_llm_model_text');
+      if (txt) txt.value = sel.value;
+    };
+    const cur = _lmModels.find(function(m) { return m.id === curVal; });
+    _showModelDetails(cur || null);
+  } catch(e) {
+    toast('Fetch failed: ' + e.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function loadLMStudioModel() {
+  const modelKey = _modelVal();
+  if (!modelKey) { toast('Select a model first', 'error'); return; }
+  const btn = el('btnLoadModel');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Loading...'; }
+  const payload = {model_key: modelKey};
+  const ctx = el('lm_cfg_ctx');
+  const batch = el('lm_cfg_batch');
+  const gpu = el('lm_cfg_gpu');
+  const flash = el('lm_cfg_flash');
+  const kv = el('lm_cfg_kv');
+  const keep = el('lm_cfg_keep');
+  if (ctx && ctx.value) payload.context_length = parseInt(ctx.value);
+  if (batch && batch.value) payload.eval_batch_size = parseInt(batch.value);
+  if (gpu) payload.gpu = gpu.checked;
+  if (flash) payload.flash_attention = flash.checked;
+  if (kv) payload.offload_kv_cache_to_gpu = kv.checked;
+  if (keep) payload.keep_model_in_memory = keep.checked;
+  try {
+    const resp = await fetch(BASE + '/lmstudio/load', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    if (!data.ok) { toast('Load failed: ' + (data.error || 'unknown'), 'error'); return; }
+    toast('Model loaded: ' + (data.identifier || modelKey), 'success');
+    await loadProviders();
+    loadEnrichSettings();
+  } catch(e) {
+    toast('Load failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '⬇ Load'; }
+  }
+}
+
+async function unloadLMStudioModel() {
+  const modelKey = _modelVal();
+  if (!modelKey) { toast('Select a model first', 'error'); return; }
+  const btn = el('btnUnloadModel');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳...'; }
+  try {
+    const resp = await fetch(BASE + '/lmstudio/unload', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model_key: modelKey})
+    });
+    const data = await resp.json();
+    if (!data.ok) { toast('Unload failed: ' + (data.error || 'unknown'), 'error'); return; }
+    toast('Model unloaded: ' + modelKey, 'success');
+    await fetchLMStudioModels();
+  } catch(e) {
+    toast('Unload failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '⬆ Unload'; }
+  }
+}
+
+async function saveLMStudioModelConfig() {
+  const modelKey = _modelVal();
+  if (!modelKey) { toast('Select a model first', 'error'); return; }
+  const payload = {};
+  const ctx = el('lm_cfg_ctx');
+  const batch = el('lm_cfg_batch');
+  const gpu = el('lm_cfg_gpu');
+  const flash = el('lm_cfg_flash');
+  const kv = el('lm_cfg_kv');
+  const keep = el('lm_cfg_keep');
+  if (ctx && ctx.value) payload.context_length = parseInt(ctx.value);
+  if (batch && batch.value) payload.eval_batch_size = parseInt(batch.value);
+  if (gpu) payload.gpu = gpu.checked;
+  if (flash) payload.flash_attention = flash.checked;
+  if (kv) payload.offload_kv_cache_to_gpu = kv.checked;
+  if (keep) payload.keep_model_in_memory = keep.checked;
+  try {
+    const resp = await fetch(BASE + '/lmstudio/model-config/' + encodeURIComponent(modelKey), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    if (data.ok) { toast('Config saved for ' + modelKey, 'success'); }
+    else { toast('Save failed: ' + (data.error || 'unknown'), 'error'); }
+  } catch(e) {
+    toast('Save failed: ' + e.message, 'error');
+  }
 }
 
 function toggleApiKeyVisibility() {
@@ -7173,27 +8836,76 @@ function toggleApiKeyVisibility() {
   inp.type = inp.type === 'password' ? 'text' : 'password';
 }
 
-async function toggleEnrich() {
-  const on = el('enrichToggle').dataset.enabled !== '1';
-  const resp = await fetch(BASE + '/config', {
-    method: 'PATCH',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({enrich_enabled: on}),
-  });
-  if (resp.ok) {
-    el('cfg_enrich_enabled').checked = on;
-    updateEnrichToggle(on);
-    toast('LLM ' + (on ? 'connected' : 'disconnected'), on ? 'success' : 'warning');
+async function toggleGlobalLock() {
+  const tog = el('lockToggle');
+  if (!tog) return;
+  const current = tog.dataset.locked === '1';
+  const locked = !current;
+  try {
+    const resp = await fetch(BASE + '/llm-lock', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({locked: locked}),
+    });
+    if (!resp.ok) throw new Error('toggle failed');
+    updateLockToggle(locked);
+    toast(locked ? 'LLM locked — no token usage' : 'LLM unlocked', locked ? 'warning' : 'success');
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
   }
 }
 
-function updateEnrichToggle(on) {
-  const tog = el('enrichToggle');
+async function toggleSystem() {
+  const tog = el('systemToggle');
+  if (!tog) return;
+  const on = tog.dataset.enabled !== '1';
+  try {
+    const resp = await fetch(BASE + '/config', {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enrich_enabled: on}),
+    });
+    if (!resp.ok) throw new Error('toggle failed');
+    el('cfg_enrich_enabled').checked = on;
+    updateSystemToggle(on);
+    toast(on ? 'System On — enrichment active' : 'System Off — enrichment paused', on ? 'success' : 'warning');
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+function updateLockToggle(locked) {
+  const tog = el('lockToggle');
+  if (!tog) return;
+  tog.dataset.locked = locked ? '1' : '0';
+  const dot = el('lockDot');
+  dot.className = 'dot ' + (locked ? 'locked' : 'on');
+  el('lockLabel').textContent = locked ? 'LLM Locked' : 'LLM Unlocked';
+  el('lockLabel').style.color = locked ? 'var(--error)' : 'var(--success, #4caf50)';
+}
+
+function updateSystemToggle(on) {
+  const tog = el('systemToggle');
   if (!tog) return;
   tog.dataset.enabled = on ? '1' : '0';
-  const dot = el('enrichDot');
+  const dot = el('systemDot');
   dot.className = 'dot ' + (on ? 'on' : 'off');
-  el('enrichLabel').textContent = on ? 'LLM Connected' : 'LLM Disconnected';
+  el('systemLabel').textContent = on ? 'System On' : 'System Off';
+}
+
+async function loadLockState() {
+  try {
+    const [lockData, configData] = await Promise.all([api('/llm-lock'), api('/config')]);
+    updateLockToggle(lockData.locked !== false);
+    const enrichOn = configData.enrich_enabled !== false;
+    updateSystemToggle(enrichOn);
+    el('cfg_enrich_enabled').checked = enrichOn;
+  } catch(e) {
+    const lockTog = el('lockToggle');
+    if (lockTog) el('lockLabel').textContent = '?';
+    const sysTog = el('systemToggle');
+    if (sysTog) el('systemLabel').textContent = '?';
+  }
 }
 
 function fmtTokens(n) {
@@ -7216,12 +8928,12 @@ async function loadEnrichStats() {
       // Sync sidebar toggle
       const idle = s.idle || {};
       const on = data.ok && s && s.enabled !== false;
-      updateEnrichToggle(on);
+      updateSystemToggle(on);
       const cd = el('idleCountdown');
       if (cd && idle.timeout_min > 0) {
         if (idle.idle) {
           cd.textContent = 'auto ✕';
-          cd.style.color = 'var(--danger)';
+          cd.style.color = 'var(--error)';
         } else {
           const sec = Math.ceil(idle.remaining_sec);
           cd.textContent = Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0');
@@ -7251,7 +8963,7 @@ async function loadPipelineLog() {
           const tok = e.status === 'ok' ? ' tok=' + e.total_tokens : '';
           const ms = e.duration_ms ? ' ' + e.duration_ms + 'ms' : '';
           const err = e.error ? ' ⚠' + esc(e.error.slice(0, 40)) : '';
-          const col = e.status === 'ok' ? 'var(--text-muted)' : 'var(--danger)';
+          const col = e.status === 'ok' ? 'var(--text-muted)' : 'var(--error)';
           return '<div style="color:' + col + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
             '<span style="color:var(--text-muted)">' + t + '</span> ' +
             (s ? '<span style="color:var(--accent)">' + s + '</span>/' : '') +
@@ -7292,8 +9004,7 @@ async function saveConfig() {
   document.querySelectorAll('#configGrid input[data-key]').forEach(inp => {
     const key = inp.dataset.key;
     const val = inp.value.trim();
-    if (val === '') return;
-    if (!isNaN(val)) updates[key] = parseFloat(val);
+    if (val !== '' && !isNaN(val)) updates[key] = parseFloat(val);
     else updates[key] = val;
   });
   // Enrichment fields
@@ -7308,7 +9019,7 @@ async function saveConfig() {
   if (!isNaN(idle)) updates['enrich_idle_min'] = idle;
   const llm_url = el('cfg_enrich_llm_url').value.trim();
   if (llm_url) updates['enrich_llm_url'] = llm_url;
-  const llm_model = el('cfg_enrich_llm_model').value.trim();
+  const llm_model = _modelVal();
   if (llm_model) updates['enrich_llm_model'] = llm_model;
   const apiKey = el('cfg_enrich_llm_api_key').value.trim();
   if (apiKey) updates['enrich_llm_api_key'] = apiKey;
@@ -7325,11 +9036,11 @@ async function saveConfig() {
     // Sync current provider selection
     const pid = el('cfg_provider').value;
     if (pid && pid !== 'custom') {
-      const model = el('cfg_enrich_llm_model').value.trim();
+      const model = _modelVal();
       await fetch(BASE + '/providers/current', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider_id: pid, model: model || 'deepseek-v4-flash' })
+        body: JSON.stringify({ provider_id: pid, model: model || _currentProvider.model })
       });
     }
     toast('Config saved', 'success');
@@ -7368,42 +9079,6 @@ async function consolidateChat() {
 // ============================================
 // PROVIDER MANAGEMENT
 // ============================================
-async function loadLLMLock() {
-  try {
-    const data = await api('/llm-lock');
-    const locked = data.locked !== false;
-    el('llmLockIcon').textContent = locked ? '🔒' : '🔓';
-    el('llmLockLabel').textContent = locked ? 'LOCKED' : 'UNLOCKED';
-    el('llmLockLabel').style.color = locked ? 'var(--danger)' : 'var(--success, #4caf50)';
-    el('llmLockBtn').textContent = locked ? 'Unlock' : 'Lock';
-    el('llmLockBtn').className = locked ? 'btn btn-sm btn-warning' : 'btn btn-sm btn-accent';
-  } catch(e) {
-    el('llmLockLabel').textContent = '?';
-  }
-}
-
-async function toggleLLMLock() {
-  const btn = el('llmLockBtn');
-  const spinner = el('llmLockSpinner');
-  btn.disabled = true;
-  spinner.style.display = 'inline';
-  try {
-    const current = el('llmLockLabel').textContent === 'LOCKED';
-    const resp = await fetch(BASE + '/llm-lock', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ locked: !current })
-    });
-    if (!resp.ok) throw new Error('toggle failed');
-    await loadLLMLock();
-    toast(current ? 'LLM unlocked' : 'LLM locked', current ? 'success' : 'warning');
-  } catch(e) {
-    toast('Failed: ' + e.message, 'error');
-  } finally {
-    btn.disabled = false;
-    spinner.style.display = 'none';
-  }
-}
 
 function renderProviderList() {
   const container = el('providerList');
@@ -7418,7 +9093,7 @@ function renderProviderList() {
           (p.id === _currentProvider.provider_id ? ' <span class="badge badge-accent">active</span>' : '') +
         '</td>' +
         '<td style="padding:4px 6px;font-family:var(--mono);font-size:10px;color:var(--text-muted);max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + esc(p.base_url) + '">' + esc(p.base_url) + '</td>' +
-        '<td style="padding:4px 6px;color:' + (p.api_key ? 'var(--text-muted)' : 'var(--danger)') + '">' +
+        '<td style="padding:4px 6px;color:' + (p.api_key ? 'var(--text-muted)' : 'var(--error)') + '">' +
           (p.api_key ? '✓ key' : 'no key') +
         '</td>' +
         '<td style="padding:4px 6px;white-space:nowrap">' +
@@ -7547,30 +9222,44 @@ async function loadRoutes() {
   try {
     const data = await api('/routes');
     const routes = data.routes || {};
+    const curData = await api('/providers');
+    const curProvider = (curData.current && curData.current.provider_id) || '';
+    const curModel = (curData.current && curData.current.model) || '';
+    const curRoute = curProvider + '/' + curModel;
     const container = el('routesList');
     const agentNames = Object.keys(routes).sort();
     if (!agentNames.length) {
-      container.innerHTML = '<span class="text-muted">No routes configured</span>';
+      container.innerHTML = '<span class="text-muted">No routes configured — using current provider/model: ' + esc(curRoute) + '</span>';
       return;
     }
     container.innerHTML = '<table style="width:100%;border-collapse:collapse">' +
+      '<tr style="border-bottom:2px solid var(--border);font-weight:600;font-size:11px">' +
+        '<td style="padding:4px 6px">Agent</td>' +
+        '<td style="padding:4px 6px">Type</td>' +
+        '<td style="padding:4px 6px">Route</td>' +
+        '<td style="padding:4px 6px"></td>' +
+        '<td style="padding:4px 6px"></td>' +
+      '</tr>' +
       agentNames.map(function(name) {
         const r = routes[name];
         const isBalancer = r.indexOf('/') === -1;
         const badge = isBalancer ? '<span class="badge" style="background:#6c5ce7;color:#fff">balancer</span>' : '<span class="badge badge-accent">direct</span>';
+        const isStale = !isBalancer && r !== curRoute;
+        const staleWarn = isStale ? ' <span style="color:var(--warning);font-size:10px">⚠ stale</span>' : '';
         return '<tr style="border-bottom:1px solid var(--border)">' +
           '<td style="padding:4px 6px;font-weight:600">' + esc(name) + '</td>' +
           '<td style="padding:4px 6px">' + badge + '</td>' +
-          '<td style="padding:4px 6px;font-family:var(--mono);font-size:11px">' + esc(r) + '</td>' +
+          '<td style="padding:4px 6px;font-family:var(--mono);font-size:11px">' + esc(r) + staleWarn + '</td>' +
           '<td style="padding:4px 6px">' +
             '<input type="text" id="route_input_' + esc(name) + '" value="' + esc(r) + '" style="width:180px;font-size:11px;font-family:var(--mono);padding:2px 4px" placeholder="provider/model or qa-auto">' +
           '</td>' +
-          '<td style="padding:4px 6px">' +
-            '<button class="btn btn-xs" onclick="saveRoute(' + "'" + esc(name) + "'" + ')">💾</button>' +
+          '<td style="padding:4px 6px;white-space:nowrap">' +
+            '<button class="btn btn-xs" onclick="saveRoute(' + JSON.stringify(name) + ')" title="Save">💾</button>' +
+            '<button class="btn btn-xs" onclick="deleteRoute(' + JSON.stringify(name) + ')" title="Delete" style="margin-left:2px;color:var(--error)">✕</button>' +
           '</td></tr>';
       }).join('') +
       '</table>' +
-      '<div class="text-sm text-muted mt-1">Format: <code>provider_id/model</code> for direct provider, <code>qa-auto</code>/<code>qa-best</code>/<code>qa-fast</code> or any model name for loadbalancer.</div>';
+      '<div class="text-sm text-muted mt-1">Current: <code>' + esc(curRoute) + '</code>. Routes override this selection per-agent.</div>';
   } catch(e) {
     el('routesList').innerHTML = '<span class="error">Failed to load routes</span>';
   }
@@ -7594,6 +9283,65 @@ async function saveRoute(name) {
   }
 }
 
+async function deleteRoute(name) {
+  try {
+    const resp = await fetch(BASE + '/routes/' + encodeURIComponent(name), {
+      method: 'DELETE'
+    });
+    if (!resp.ok) throw new Error('delete failed');
+    await loadRoutes();
+    toast('Route deleted: ' + name, 'success');
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+function showAddRoute() {
+  const name = prompt('Route name (agent id, e.g. "sage", "builder"):');
+  if (!name) return;
+  const route = prompt('Route value (e.g. "lmstudio/mimo-vl-7b-rl" or "qa-auto"):');
+  if (!route) return;
+  saveRouteNew(name.trim(), route.trim());
+}
+
+async function saveRouteNew(name, route) {
+  try {
+    const resp = await fetch(BASE + '/routes/' + encodeURIComponent(name), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ route: route })
+    });
+    if (!resp.ok) throw new Error('save failed');
+    await loadRoutes();
+    toast('Route added: ' + name, 'success');
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+async function syncAllRoutesToCurrent() {
+  try {
+    const curData = await api('/providers');
+    const curProvider = (curData.current && curData.current.provider_id) || '';
+    const curModel = (curData.current && curData.current.model) || '';
+    if (!curProvider) { toast('No current provider set', 'error'); return; }
+    const routeStr = curProvider + '/' + curModel;
+    const data = await api('/routes');
+    const routes = data.routes || {};
+    for (const name of Object.keys(routes)) {
+      await fetch(BASE + '/routes/' + encodeURIComponent(name), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ route: routeStr })
+      });
+    }
+    await loadRoutes();
+    toast('All routes synced to ' + routeStr, 'success');
+  } catch(e) {
+    toast('Sync failed: ' + e.message, 'error');
+  }
+}
+
 // ============================================
 // BRAIN NETWORK VISUALIZATION
 // ============================================
@@ -7607,7 +9355,7 @@ let brainNodeElems = null;
 let brainEdgeElems = null;
 let brainLabelElems = null;
 let brainData = null;
-let brainTaskData = { pending: 0, assigned: 0, completed: 0, failed: 0 };
+let brainTaskData = { pending: 0, assigned: 0, running: 0, completed: 0, failed: 0 };
 let brainAgentData = [];
 let _brainRetries = 0;
 let _brainSvg = null;
@@ -7617,281 +9365,270 @@ function loadBrainDelayed() {
 }
 
 function loadBrain() {
-  const wrap = document.getElementById('brainWrap');
-  const svgEl = document.getElementById('brainSvg');
-  if (!wrap || !svgEl) return;
-  const W = wrap.clientWidth;
-  const H = wrap.clientHeight;
-  if (W < 50 || H < 50) {
-    if (++_brainRetries < 8) { setTimeout(loadBrainDelayed, 300); }
-    return;
-  }
-  _brainRetries = 0;
-
-  svgEl.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
-  svgEl.style.width = W + 'px';
-  svgEl.style.height = H + 'px';
-
-  if (!_brainSvg) {
-    _brainSvg = d3.select('#brainSvg');
-    // Dot grid background
-    const defs = _brainSvg.append('defs');
-    defs.append('pattern')
-      .attr('id', 'brainGrid')
-      .attr('width', 40).attr('height', 40)
-      .attr('patternUnits', 'userSpaceOnUse')
-      .append('circle').attr('cx', 20).attr('cy', 20).attr('r', 1).attr('fill', 'rgba(99,102,241,0.08)');
-    _brainSvg.append('rect').attr('width', '100%').attr('height', '100%').attr('fill', 'url(#brainGrid)');
-
-    // Glow filter
-    defs.append('filter').attr('id', 'nodeGlow')
-      .html('<feGaussianBlur stdDeviation="3" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>');
-  }
-
-  Promise.all([
-    fetch(BASE + '/cortex/status').then(r => r.json()).catch(() => ({})),
-    fetch(BASE + '/tasks').then(r => r.json()).catch(() => ({ tasks: [] })),
-    fetch(BASE + '/agents').then(r => r.json()).catch(() => ({ agents: [] })),
-  ]).then(([cortexData, tasksData, agentsData]) => {
-    const cortex = cortexData.cortex || {};
-    const tasks = tasksData.tasks || [];
-    const agents = agentsData.agents || [];
-    brainTaskData = {
-      pending: tasks.filter(t => t.status === 'pending').length,
-      assigned: tasks.filter(t => t.status === 'assigned').length,
-      running: tasks.filter(t => t.status === 'running').length,
-      completed: tasks.filter(t => t.status === 'completed' || t.status === 'done').length,
-      failed: tasks.filter(t => t.status === 'failed').length,
-    };
-    brainAgentData = agents;
-    renderBrainTasks(tasks);
-    renderBrainActivity();
-    renderBrainMonitor();
-    document.getElementById('brainTs').textContent = new Date().toLocaleTimeString();
-    updateSignalsPanel(cortex);
-    if (!brainData) {
-      renderD3Brain(W, H, cortex, agents);
-    } else {
-      // Update agent node colors/states without restarting simulation
-      brainNodeElems.each(function(d) {
-        if (d.type === 'agent') {
-          const a = agents.find(x => (x.chitchat_name || x.id.slice(0, 8)) === d.chitchat_name);
-          if (a) {
-            const alive = (Date.now() / 1000 - (a.last_heartbeat || 0)) < 300;
-            d.color = !alive ? '#f87171' : a.status === 'active' ? '#34d399' : a.status === 'idle' ? '#fbbf24' : '#94a3b8';
-            d.r = alive ? 20 : 14;
-          }
-        }
-      });
-      // Update visual state without full re-render
-      brainData.selectAll('g.node circle.core').attr('r', d => d.type === 'agent' ? d.r * 0.6 : d.r * 0.45).attr('stroke', d => d.color).attr('fill', d => d.type === 'agent' ? 'none' : d.color);
-      brainData.selectAll('g.node circle.inner').attr('fill', d => d.color);
-      brainData.selectAll('g.node circle.glow').attr('fill', d => d.color + '22');
-      brainData.selectAll('g.node text.nlabel').attr('fill', d => d.type === 'agent' ? d.color : '#e2e8f0');
+  try {
+    var wrap = document.getElementById('brainWrap');
+    var svgEl = document.getElementById('brainSvg');
+    if (!wrap || !svgEl) return;
+    var W = wrap.clientWidth;
+    var H = wrap.clientHeight;
+    if (W < 50 || H < 50) {
+      if (++_brainRetries < 8) { setTimeout(loadBrainDelayed, 300); }
+      return;
     }
-  }).catch(() => { renderBrainActivity(); renderBrainMonitor(); if (!brainData) renderD3Brain(W, H, {}, []); });
+    _brainRetries = 0;
+
+    svgEl.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    svgEl.style.width = W + 'px';
+    svgEl.style.height = H + 'px';
+
+    if (!_brainSvg) {
+      _brainSvg = d3.select('#brainSvg');
+      var defs = _brainSvg.append('defs');
+      defs.append('pattern')
+        .attr('id', 'brainGrid')
+        .attr('width', 40).attr('height', 40)
+        .attr('patternUnits', 'userSpaceOnUse')
+        .append('circle').attr('cx', 20).attr('cy', 20).attr('r', 1).attr('fill', 'rgba(99,102,241,0.08)');
+      _brainSvg.append('rect').attr('width', '100%').attr('height', '100%').attr('fill', 'url(#brainGrid)');
+      defs.append('filter').attr('id', 'nodeGlow')
+        .html('<feGaussianBlur stdDeviation="3" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>');
+    }
+
+    Promise.all([
+      fetch(BASE + '/cortex/status').then(r => r.json()).catch(function() { return {}; }),
+      fetch(BASE + '/tasks').then(r => r.json()).catch(function() { return { tasks: [] }; }),
+      fetch(BASE + '/agents').then(r => r.json()).catch(function() { return { agents: [] }; }),
+    ]).then(function(results) {
+      var cortexData = results[0], tasksData = results[1], agentsData = results[2];
+      var cortex = cortexData.cortex || {};
+      var tasks = tasksData.tasks || [];
+      var agents = agentsData.agents || [];
+      brainTaskData = {
+        pending: tasks.filter(function(t) { return t.status === 'pending'; }).length,
+        assigned: tasks.filter(function(t) { return t.status === 'assigned'; }).length,
+        running: tasks.filter(function(t) { return t.status === 'running'; }).length,
+        completed: tasks.filter(function(t) { return t.status === 'completed' || t.status === 'done'; }).length,
+        failed: tasks.filter(function(t) { return t.status === 'failed'; }).length,
+      };
+      brainAgentData = agents;
+      renderBrainTasks(tasks);
+      renderBrainActivity();
+      renderBrainMonitor();
+      document.getElementById('brainTs').textContent = new Date().toLocaleTimeString();
+      updateSignalsPanel(cortex);
+      renderD3Brain(W, H, cortex, agents);
+    }).catch(function(e) {
+      console.error('Brain load error:', e);
+      renderBrainActivity();
+      renderBrainMonitor();
+      if (!brainData) renderD3Brain(W, H, {}, []);
+    });
+  } catch(e) {
+    console.error('loadBrain error:', e);
+  }
 }
 
 function renderD3Brain(W, H, cortex, agents) {
-  const nodes = [
-    { id: 'pfc', label: 'PFC', sub: 'predictions', color: '#a78bfa', r: 32, desc: 'Prefrontal Cortex — goal predictions ↓, free energy minimization' },
-    { id: 'bg', label: 'BG', sub: 'gating', color: '#818cf8', r: 28, desc: 'Basal Ganglia — value predictions ↓, Go/NoGo gating, OpAL*' },
-    { id: 'dacc', label: 'dACC', sub: 'surprise', color: '#c084fc', r: 24, desc: 'Dorsal ACC — surprise tracking, epsilon modulation, meta-learning' },
-    { id: 'snd', label: 'SNc', sub: 'RPE ↑', color: '#fbbf24', r: 22, desc: 'SNc/VTA — dopamine reward prediction error broadcast' },
-    { id: 'sensory', label: 'Sensory', sub: 'errors ↑', color: '#34d399', r: 24, desc: 'Sensory (L0) — outcome observations, prediction errors ↑' },
-    { id: 'hip', label: 'HPC', sub: 'replay', color: '#2dd4bf', r: 28, desc: 'Hippocampus — episodic memory, pattern completion, replay buffer' },
-    { id: 'thal', label: 'Thalamus', sub: 'relay', color: '#94a3b8', r: 20, desc: 'Thalamus — winner-take-all relay, gates cortical output' },
-    { id: 'ctx', label: 'Context', sub: 'preload', color: '#f472b6', r: 22, desc: 'Context Preloader — pattern completion for current task' },
+  var neuralNodes = [
+    { id: 'pfc', label: 'PFC', sub: 'predictions', color: '#a78bfa', r: 32, desc: 'Prefrontal Cortex — goal predictions, free energy minimization', type: 'neural' },
+    { id: 'bg', label: 'BG', sub: 'gating', color: '#818cf8', r: 28, desc: 'Basal Ganglia — value predictions, Go/NoGo gating, OpAL*', type: 'neural' },
+    { id: 'dacc', label: 'dACC', sub: 'surprise', color: '#c084fc', r: 24, desc: 'Dorsal ACC — surprise tracking, epsilon modulation, meta-learning', type: 'neural' },
+    { id: 'snd', label: 'SNc', sub: 'RPE', color: '#fbbf24', r: 22, desc: 'SNc/VTA — dopamine reward prediction error broadcast', type: 'neural' },
+    { id: 'sensory', label: 'Sensory', sub: 'errors', color: '#34d399', r: 24, desc: 'Sensory (L0) — outcome observations, prediction errors', type: 'neural' },
+    { id: 'hip', label: 'HPC', sub: 'replay', color: '#2dd4bf', r: 28, desc: 'Hippocampus — episodic memory, pattern completion, replay buffer', type: 'neural' },
+    { id: 'thal', label: 'Thalamus', sub: 'relay', color: '#94a3b8', r: 20, desc: 'Thalamus — winner-take-all relay, gates cortical output', type: 'neural' },
+    { id: 'ctx', label: 'Context', sub: 'preload', color: '#f472b6', r: 22, desc: 'Context Preloader — pattern completion for current task', type: 'neural' },
   ];
-  const edges = [
-    { source: 'pfc', target: 'bg', label: 'goal μ↓', color: '#a78bfa', dash: false },
-    { source: 'bg', target: 'sensory', label: 'value μ↓', color: '#818cf8', dash: false },
-    { source: 'sensory', target: 'bg', label: 'PE ε↑', color: '#f87171', dash: false },
-    { source: 'bg', target: 'pfc', label: 'goal ε↑', color: '#f87171', dash: false },
+  var neuralEdges = [
+    { source: 'pfc', target: 'bg', label: 'goal', color: '#a78bfa', dash: false },
+    { source: 'bg', target: 'sensory', label: 'value', color: '#818cf8', dash: false },
+    { source: 'sensory', target: 'bg', label: 'PE', color: '#f87171', dash: false },
+    { source: 'bg', target: 'pfc', label: 'goal err', color: '#f87171', dash: false },
     { source: 'pfc', target: 'dacc', label: 'control', color: '#fbbf24', dash: true },
-    { source: 'bg', target: 'snd', label: 'action → RPE', color: '#f87171', dash: false },
+    { source: 'bg', target: 'snd', label: 'action', color: '#f87171', dash: false },
     { source: 'snd', target: 'dacc', label: 'surprise', color: '#fbbf24', dash: true },
-    { source: 'dacc', target: 'bg', label: 'ε mod', color: '#fbbf24', dash: true },
-    { source: 'hip', target: 'bg', label: 'replay → Q', color: '#2dd4bf', dash: false },
+    { source: 'dacc', target: 'bg', label: 'epsilon', color: '#fbbf24', dash: true },
+    { source: 'hip', target: 'bg', label: 'replay', color: '#2dd4bf', dash: false },
     { source: 'hip', target: 'ctx', label: 'episodes', color: '#f472b6', dash: true },
     { source: 'bg', target: 'thal', label: 'Go/NoGo', color: '#fbbf24', dash: false },
     { source: 'thal', target: 'pfc', label: 'gated', color: '#94a3b8', dash: true },
     { source: 'ctx', target: 'pfc', label: 'context', color: '#f472b6', dash: true },
   ];
 
-  // Kill existing simulation
+  var agentNodes = (agents || []).slice(0, 12).map(function(a, i) {
+    var name = a.chitchat_name || a.id.slice(0, 8);
+    var alive = (Date.now() / 1000 - (a.last_heartbeat || 0)) < 300;
+    var agentColors = ['#60a5fa', '#f472b6', '#a78bfa', '#34d399', '#fb923c', '#e879f9', '#38bdf8', '#fbbf24', '#4ade80', '#f87171', '#818cf8', '#2dd4bf'];
+    var nodeColor = agentColors[i % agentColors.length];
+    if (!alive) nodeColor = '#6b7280';
+    return {
+      id: 'agent-' + name, label: name.slice(0, 10), type: 'agent',
+      chitchat_name: name, alive: alive, status: a.status || 'unknown',
+      r: alive ? 22 : 16,
+      color: nodeColor,
+      desc: (alive ? 'active' : 'stale') + ' - ' + (a.status || 'unknown'),
+    };
+  });
+
+  var allNodes = neuralNodes.concat(agentNodes);
+  var neuralIds = neuralNodes.map(function(n) { return n.id; });
+  var allEdges = neuralEdges.slice();
+  agentNodes.forEach(function(ag, i) {
+    allEdges.push({ source: ag.id, target: neuralIds[i % neuralIds.length], label: ag.label, color: ag.color, dash: true });
+    if (i > 0) {
+      allEdges.push({ source: agentNodes[i - 1].id, target: ag.id, label: '', color: 'rgba(148,163,184,0.2)', dash: true });
+    }
+  });
+
+  var newNodeIds = allNodes.map(function(n) { return n.id; }).sort().join(',');
+  var _prevNodeIds = typeof _brainPrevNodeIds !== 'undefined' ? _brainPrevNodeIds : '';
+  if (brainSim && newNodeIds === _prevNodeIds) {
+    brainNodeElems.each(function(d) {
+      var match = allNodes.find(function(n) { return n.id === d.id; });
+      if (match) {
+        d.color = match.color;
+        d.r = match.r;
+        d.alive = match.alive;
+        d.label = match.label;
+        d.desc = match.desc;
+        d.chitchat_name = match.chitchat_name;
+      }
+    });
+    brainData.selectAll('.brain-node circle.core')
+      .attr('fill', function(d) { return d.type === 'agent' ? d.color + '33' : d.color; })
+      .attr('stroke', function(d) { return d.type === 'agent' ? d.color : '#fff'; })
+      .attr('r', function(d) { return d.type === 'agent' ? d.r : d.r * 0.45; });
+    brainData.selectAll('.brain-node circle.inner')
+      .attr('fill', function(d) { return d.color; });
+    brainData.selectAll('.brain-node circle.glow')
+      .attr('fill', function(d) { return d.color + '22'; });
+    brainData.selectAll('.brain-node text.nlabel')
+      .text(function(d) { return d.label; })
+      .attr('fill', function(d) { return d.type === 'agent' ? '#fff' : '#e2e8f0'; });
+    brainSim.alpha(0.3).restart();
+    return;
+  }
+  _brainPrevNodeIds = newNodeIds;
+
   if (brainSim) { brainSim.stop(); brainSim = null; }
 
-  // Seed positions using prior positions or center
-  const savedX = {}, savedY = {};
+  var savedX = {}, savedY = {};
   if (brainNodeElems) {
-    brainNodeElems.each(d => { savedX[d.id] = d.x; savedY[d.id] = d.y; });
+    brainNodeElems.each(function(d) { savedX[d.id] = d.x; savedY[d.id] = d.y; });
   }
-  nodes.forEach(n => {
+  allNodes.forEach(function(n) {
     n.x = savedX[n.id] !== undefined ? savedX[n.id] : W / 2 + (Math.random() - 0.5) * (W * 0.3);
     n.y = savedY[n.id] !== undefined ? savedY[n.id] : H / 2 + (Math.random() - 0.5) * (H * 0.3);
   });
 
-  // Root container with pan/zoom
   if (!brainData) {
     _brainSvg.selectAll('g.brainRoot').remove();
     brainData = _brainSvg.append('g').attr('class', 'brainRoot');
-    const zoom = d3.zoom()
+    var zoom = d3.zoom()
       .scaleExtent([0.4, 3])
-      .on('zoom', (e) => brainData.attr('transform', e.transform));
+      .on('zoom', function(e) { brainData.attr('transform', e.transform); });
     _brainSvg.call(zoom);
   }
 
-  // Edge particles (flowing dots)
-  const edgeG = brainData.selectAll('g.edge').data(edges, d => d.source + '-' + d.target);
+  var linkForce = allEdges.map(function(e) { return { source: e.source, target: e.target, label: e.label, color: e.color, dash: e.dash }; });
+
+  var edgeG = brainData.selectAll('.brain-edge').data(linkForce, function(d) { return d.source + '-' + d.target; });
   edgeG.exit().remove();
-  const edgeEnter = edgeG.enter().append('g').attr('class', 'edge');
+  var edgeEnter = edgeG.enter().append('g').attr('class', 'brain-edge');
+  edgeEnter.append('line').attr('class', 'edge-line')
+    .attr('stroke', function(d) { return d.color + '30'; }).attr('stroke-width', 1.2)
+    .attr('stroke-dasharray', function(d) { return d.dash ? '5,5' : null; });
+  edgeEnter.append('circle').attr('class', 'edge-particle').attr('r', 2.5).attr('fill', function(d) { return d.color; });
+  edgeEnter.append('text').attr('class', 'edge-label')
+    .attr('fill', 'rgba(148,163,184,0.5)').attr('font-size', '8px').attr('font-family', 'monospace')
+    .attr('text-anchor', 'middle').text(function(d) { return d.label; });
 
-  const edgeLines = brainData.selectAll('g.edge line').data(edges, d => 'line-' + d.source + '-' + d.target);
-  edgeLines.exit().remove();
-  edgeLines.enter().append('line').attr('stroke', d => d.color + '30').attr('stroke-width', 1.2)
-    .attr('stroke-dasharray', d => d.dash ? '5,5' : null);
-
-  // Edge particles (animated)
-  const particles = brainData.selectAll('g.edge circle').data(edges, d => 'p-' + d.source + '-' + d.target);
-  particles.exit().remove();
-  particles.enter().append('circle').attr('r', 2.5).attr('fill', d => d.color);
-
-  // Edge labels
-  const lbls = brainData.selectAll('g.edge text').data(edges, d => 't-' + d.source + '-' + d.target);
-  lbls.exit().remove();
-  lbls.enter().append('text')
-    .attr('fill', 'rgba(148,163,184,0.5)')
-    .attr('font-size', '8px').attr('font-family', 'monospace')
-    .attr('text-anchor', 'middle').text(d => d.label);
-
-  // Node groups
-  brainNodeElems = brainData.selectAll('g.node').data(nodes, d => d.id);
+  brainNodeElems = brainData.selectAll('.brain-node').data(allNodes, function(d) { return d.id; });
   brainNodeElems.exit().remove();
-  const nodeEnter = brainNodeElems.enter().append('g').attr('class', 'node')
+  var nodeEnter = brainNodeElems.enter().append('g').attr('class', 'brain-node')
     .attr('cursor', 'pointer').on('click', function(e, d) {
       if (d.type === 'agent') { filterBrainTasksByAgent(d.chitchat_name); }
     });
 
-  // Glow circles (neural only)
-  nodeEnter.filter(d => d.type !== 'agent').append('circle').attr('class', 'glow')
-    .attr('fill', d => d.color + '22')
-    .attr('stroke', 'none');
+  nodeEnter.filter(function(d) { return d.type !== 'agent'; }).append('circle').attr('class', 'glow')
+    .attr('fill', function(d) { return d.color + '22'; }).attr('stroke', 'none');
 
-  // Main circles — agents get a ring
-  const circ = nodeEnter.append('circle').attr('class', 'core')
-    .attr('r', d => d.type === 'agent' ? d.r * 0.6 : d.r * 0.45)
-    .attr('filter', d => d.type === 'agent' ? null : 'url(#nodeGlow)')
-    .attr('fill', d => d.type === 'agent' ? 'none' : d.color)
-    .attr('stroke', d => d.type === 'agent' ? d.color : '#fff')
-    .attr('stroke-width', d => d.type === 'agent' ? 2.5 : 1.5);
+  nodeEnter.append('circle').attr('class', 'core')
+    .attr('r', function(d) { return d.type === 'agent' ? d.r : d.r * 0.45; })
+    .attr('filter', function(d) { return d.type === 'agent' ? null : 'url(#nodeGlow)'; })
+    .attr('fill', function(d) { return d.type === 'agent' ? d.color + '33' : d.color; })
+    .attr('stroke', function(d) { return d.type === 'agent' ? d.color : '#fff'; })
+    .attr('stroke-width', function(d) { return d.type === 'agent' ? 2 : 1.5; });
 
-  // Agent inner dot
-  nodeEnter.filter(d => d.type === 'agent').append('circle').attr('class', 'inner')
-    .attr('r', 5).attr('fill', d => d.color).attr('stroke', 'none');
+  nodeEnter.filter(function(d) { return d.type === 'agent'; }).append('circle').attr('class', 'inner')
+    .attr('r', 6).attr('fill', function(d) { return d.color; }).attr('stroke', '#0f0f1a').attr('stroke-width', 2);
 
-  // Labels
   nodeEnter.append('text').attr('class', 'nlabel')
-    .attr('fill', d => d.type === 'agent' ? d.color : '#e2e8f0')
-    .attr('font-size', d => d.type === 'agent' ? '9px' : '11px')
+    .attr('fill', function(d) { return d.type === 'agent' ? '#fff' : '#e2e8f0'; })
+    .attr('font-size', function(d) { return d.type === 'agent' ? '11px' : '11px'; })
     .attr('font-family', '"SF Mono","Cascadia Code",monospace')
-    .attr('font-weight', d => d.type === 'agent' ? '400' : '600')
+    .attr('font-weight', function(d) { return d.type === 'agent' ? '700' : '600'; })
     .attr('text-anchor', 'middle')
-    .attr('dy', d => d.type === 'agent' ? 14 : 0)
-    .text(d => d.type === 'agent' ? d.label : d.label);
-  nodeEnter.filter(d => d.type !== 'agent').append('text').attr('class', 'sublabel')
+    .attr('dy', function(d) { return d.type === 'agent' ? 18 : 0; })
+    .text(function(d) { return d.label; });
+
+  nodeEnter.filter(function(d) { return d.type !== 'agent'; }).append('text').attr('class', 'sublabel')
     .attr('fill', 'rgba(148,163,184,0.5)').attr('font-size', '9px')
     .attr('font-family', 'monospace').attr('text-anchor', 'middle')
-    .text(d => d.sub);
+    .text(function(d) { return d.sub; });
 
-  // Tooltip
   brainNodeElems.on('mouseenter', function(e, d) {
-    const tip = document.getElementById('brainTooltip');
+    var tip = document.getElementById('brainTooltip');
     tip.style.display = 'block';
     if (d.type === 'agent') {
-      tip.innerHTML = '<strong style="color:' + d.color + '">' + d.chitchat_name + '</strong><br><span style="color:#94a3b8;font-size:11px;">' + (d.desc || '') + '</span><br><span style="color:#6366f1;font-size:10px;">click to filter tasks</span>';
+      tip.innerHTML = '<strong style="color:' + d.color + '">' + esc(d.chitchat_name) + '</strong><br><span style="color:#94a3b8;font-size:11px;">' + esc(d.desc || '') + '</span><br><span style="color:#6366f1;font-size:10px;">click to filter tasks</span>';
     } else {
-      tip.innerHTML = '<strong style="color:' + d.color + '">' + d.id.toUpperCase() + '</strong><br><span style="color:#94a3b8;font-size:11px;">' + (d.desc || '') + '</span>';
+      tip.innerHTML = '<strong style="color:' + d.color + '">' + d.id.toUpperCase() + '</strong><br><span style="color:#94a3b8;font-size:11px;">' + esc(d.desc || '') + '</span>';
     }
     d3.select(this).select('circle.core').transition().duration(150).attr('r', d.r * 0.55);
   }).on('mousemove', function(e) {
-    const tip = document.getElementById('brainTooltip');
-    tip.style.left = (e.offsetX + 16) + 'px';
-    tip.style.top = (e.offsetY - 8) + 'px';
+    var tip = document.getElementById('brainTooltip');
+    var rect = document.getElementById('brainWrap').getBoundingClientRect();
+    tip.style.left = (e.clientX - rect.left + 16) + 'px';
+    tip.style.top = (e.clientY - rect.top - 8) + 'px';
   }).on('mouseleave', function(e, d) {
     document.getElementById('brainTooltip').style.display = 'none';
-    d3.select(this).select('circle.core').transition().duration(150).attr('r', d.r * 0.45);
+    d3.select(this).select('circle.core').transition().duration(150).attr('r', d.type === 'agent' ? d.r : d.r * 0.45);
   });
 
-  // Build agent nodes for the force graph
-  const agentNodes = agents.slice(0, 12).map((a, i) => {
-    const name = a.chitchat_name || a.id.slice(0, 8);
-    const alive = (Date.now() / 1000 - (a.last_heartbeat || 0)) < 300;
-    return {
-      id: 'agent-' + name,
-      label: name.slice(0, 7),
-      type: 'agent',
-      chitchat_name: name,
-      alive: alive,
-      status: a.status || 'unknown',
-      r: alive ? 20 : 14,
-      color: !alive ? '#f87171' : a.status === 'active' ? '#34d399' : a.status === 'idle' ? '#fbbf24' : '#94a3b8',
-      desc: (alive ? 'active' : 'stale') + ' · ' + (a.status || 'unknown'),
-    };
-  });
-
-  // Add agent nodes to the simulation
-  nodes.push(...agentNodes);
-
-  // Build agent → nearest neural region edges
-  const neuralIds = nodes.filter(n => n.type !== 'agent').map(n => n.id);
-  agentNodes.forEach((ag, i) => {
-    const target = neuralIds[i % neuralIds.length];
-    edges.push({ source: ag.id, target, label: ag.label, color: ag.color, dash: true });
-    // If multiple agents, link them in a chain
-    if (i > 0) {
-      const prev = 'agent-' + (agents[i - 1]?.chitchat_name || agents[i - 1]?.id?.slice(0, 8));
-      edges.push({ source: prev, target: ag.id, label: '', color: 'rgba(148,163,184,0.2)', dash: true });
-    }
-  });
-
-  // D3 Force Simulation — real physics
-  const linkForce = edges.map(e => ({ ...e, source: e.source, target: e.target }));
-  brainSim = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(linkForce).id(d => d.id).distance(d => d.dash ? 150 : 110).strength(d => d.dash ? 0.005 : 0.04))
+  brainSim = d3.forceSimulation(allNodes)
+    .force('link', d3.forceLink(linkForce).id(function(d) { return d.id; }).distance(function(d) { return d.dash ? 150 : 110; }).strength(function(d) { return d.dash ? 0.005 : 0.04; }))
     .force('charge', d3.forceManyBody().strength(-400).distanceMin(60).distanceMax(300))
     .force('center', d3.forceCenter(W / 2, H / 2))
-    .force('collide', d3.forceCollide(d => d.r * 0.8))
+    .force('collide', d3.forceCollide(function(d) { return d.r * 0.8; }))
     .force('x', d3.forceX(W / 2).strength(0.02))
     .force('y', d3.forceY(H / 2).strength(0.02))
-    .alphaDecay(0.01)
-    .on('tick', () => {
-      // Edge lines
-      brainData.selectAll('g.edge line')
-        .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
-        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
-      // Edge particles (animated along path)
-      brainData.selectAll('g.edge circle')
-        .attr('cx', d => {
-          const t = ((Date.now() * 0.0008 + d.source.x * 0.01) % 1);
-          return d.source.x + (d.target.x - d.source.x) * t;
+    .alphaDecay(0.02)
+    .on('tick', function() {
+      brainData.selectAll('.edge-line')
+        .attr('x1', function(d) { return typeof d.source === 'object' ? d.source.x : 0; })
+        .attr('y1', function(d) { return typeof d.source === 'object' ? d.source.y : 0; })
+        .attr('x2', function(d) { return typeof d.target === 'object' ? d.target.x : 0; })
+        .attr('y2', function(d) { return typeof d.target === 'object' ? d.target.y : 0; });
+      brainData.selectAll('.edge-particle')
+        .attr('cx', function(d) {
+          if (typeof d.source !== 'object' || typeof d.target !== 'object') return 0;
+          var t = ((Date.now() * 0.0008 + (d.source.x || 0) * 0.01) % 1);
+          return (d.source.x || 0) + ((d.target.x || 0) - (d.source.x || 0)) * t;
         })
-        .attr('cy', d => {
-          const t = ((Date.now() * 0.0008 + d.source.y * 0.01) % 1);
-          return d.source.y + (d.target.y - d.source.y) * t;
+        .attr('cy', function(d) {
+          if (typeof d.source !== 'object' || typeof d.target !== 'object') return 0;
+          var t = ((Date.now() * 0.0008 + (d.source.y || 0) * 0.01) % 1);
+          return (d.source.y || 0) + ((d.target.y || 0) - (d.source.y || 0)) * t;
         });
-      // Edge labels
-      brainData.selectAll('g.edge text')
-        .attr('x', d => (d.source.x + d.target.x) / 2)
-        .attr('y', d => (d.source.y + d.target.y) / 2 + 10);
-      // Nodes
-      brainData.selectAll('g.node').attr('transform', d => 'translate(' + d.x + ',' + d.y + ')');
-      brainData.selectAll('g.node circle.glow').attr('r', d => d.r * 0.85);
-      // Agent inner dots follow parent
-      brainData.selectAll('g.node circle.inner').attr('r', d => (d.type === 'agent' ? d.r : 0) * 0.85);
-      // Pulse glow
+      brainData.selectAll('.edge-label')
+        .attr('x', function(d) { return typeof d.source === 'object' && typeof d.target === 'object' ? ((d.source.x || 0) + (d.target.x || 0)) / 2 : 0; })
+        .attr('y', function(d) { return typeof d.source === 'object' && typeof d.target === 'object' ? ((d.source.y || 0) + (d.target.y || 0)) / 2 + 10 : 0; });
+      brainData.selectAll('.brain-node').attr('transform', function(d) { return 'translate(' + (d.x || 0) + ',' + (d.y || 0) + ')'; });
+      brainData.selectAll('.brain-node circle.glow').attr('r', function(d) { return d.r * 0.85; });
+      brainData.selectAll('.brain-node circle.inner').attr('r', function(d) { return (d.type === 'agent' ? d.r : 0) * 0.85; });
       if (Math.floor(Date.now() / 80) % 2 === 0) {
-        brainData.selectAll('g.node circle.glow').attr('r', d => d.r * 0.95);
+        brainData.selectAll('.brain-node circle.glow').attr('r', function(d) { return d.r * 0.95; });
       }
     });
 }
@@ -7906,47 +9643,46 @@ function brainFreeze() {
   if (brainSim) brainSim.stop();
 }
 
-function easeInOut(t) {
-  return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-}
-
 function updateSignalsPanel(cortex) {
-  const el = document.getElementById('brainSignals');
+  var el = document.getElementById('brainSignals');
   if (!el) return;
-  const items = [
+  var items = [
     '<span style="color:#818cf8">\u25cf</span> Q-table: <b>' + (cortex.q_table_size || 0) + '</b> states',
     '<span style="color:#2dd4bf">\u25cf</span> Replay buffer: <b>' + (cortex.replay_buffer || 0) + '</b>',
     '<span style="color:#f472b6">\u25cf</span> Episodic memory: <b>' + (cortex.episodes || 0) + '</b>',
     '<span style="color:#fbbf24">\u25cf</span> Working memory: depth <b>' + (cortex.wm_stack_depth || 0) + '</b>',
-    '<span style="color:#f87171">\u25cf</span> Surprise \u03b1=' + ((cortex.alpha_surprise || 0)) + ' \u03b2=' + ((cortex.beta_surprise || 0)),
-    '<span style="color:#94a3b8">\u25cf</span> Agents: <b>' + (brainAgentData.length) + '</b> | Tasks: ' + (brainTaskData.pending + brainTaskData.assigned + brainTaskData.completed + brainTaskData.failed),
+    '<span style="color:#f87171">\u25cf</span> Surprise \u03b1=' + (cortex.alpha_surprise || 0) + ' \u03b2=' + (cortex.beta_surprise || 0),
+    '<span style="color:#94a3b8">\u25cf</span> Agents: <b>' + brainAgentData.length + '</b> | Tasks: ' + (brainTaskData.pending + brainTaskData.assigned + brainTaskData.running + brainTaskData.completed + brainTaskData.failed),
   ];
   if (cortex.pc_hierarchy) {
-    const pc = cortex.pc_hierarchy;
-    const lvls = pc.levels || {};
-    const pfcL = lvls.pfc || {};
-    const bgL = lvls.bg || {};
-    const senL = lvls.sensory || {};
-    if (pfcL.prediction !== undefined) {
+    var pc = cortex.pc_hierarchy;
+    var lvls = pc.levels || {};
+    var pfcL = lvls.pfc || {};
+    var bgL = lvls.bg || {};
+    var senL = lvls.sensory || {};
+    if (pfcL.prediction !== undefined && bgL.prediction !== undefined && senL.prediction !== undefined) {
       items.push('<span style="color:#a78bfa">\u25c9</span> PFC: \u03bc=' + pfcL.prediction.toFixed(3) + ' \u03c0=' + pfcL.precision.toFixed(2) + ' \u03b5=' + pfcL.error.toFixed(3));
       items.push('<span style="color:#818cf8">\u25c9</span> BG:  \u03bc=' + bgL.prediction.toFixed(3) + ' \u03c0=' + bgL.precision.toFixed(2) + ' \u03b5=' + bgL.error.toFixed(3));
       items.push('<span style="color:#34d399">\u25c9</span> SEN: \u03bc=' + senL.prediction.toFixed(3) + ' \u03c0=' + senL.precision.toFixed(2) + ' \u03b5=' + senL.error.toFixed(3));
     }
-    const feTrace = pc.totalFreeEnergyTrace;
+    var feTrace = pc.totalFreeEnergyTrace;
     if (feTrace && feTrace.length > 0) {
-      items.push('<span style="color:#fbbf24">\u25c9</span> Free Energy: <b>' + feTrace[feTrace.length - 1].toFixed(3) + '</b>');
+      var last = feTrace[feTrace.length - 1];
+      if (typeof last === 'number') {
+        items.push('<span style="color:#fbbf24">\u25c9</span> Free Energy: <b>' + last.toFixed(3) + '</b>');
+      }
     }
   }
-  el.innerHTML = items.map(s => '<div>' + s + '</div>').join('');
+  el.innerHTML = items.map(function(s) { return '<div>' + s + '</div>'; }).join('');
 }
 
 function renderBrainActivity() {
-  fetch(BASE + '/activity?limit=15').then(r => r.json()).then(d => {
-    const el = document.getElementById('brainActivity');
+  fetch(BASE + '/activity?limit=15').then(function(r) { return r.json(); }).then(function(d) {
+    var el = document.getElementById('brainActivity');
     if (!el) return;
-    const activity = d.activities || [];
+    var activity = d.activities || [];
     el.innerHTML = activity.slice().reverse().slice(-10).map(function(a) {
-      const icon = a.action === 'file_write' ? '[W]' : a.action === 'task_claim' ? '[C]' : a.action === 'task_complete' ? '[D]' : '[M]';
+      var icon = a.action === 'file_write' ? '[W]' : a.action === 'task_claim' ? '[C]' : a.action === 'task_complete' ? '[D]' : '[M]';
       return '<div style="display:flex;align-items:center;gap:4px;padding:2px 0;border-bottom:1px solid rgba(148,163,184,0.06);overflow:hidden;">' +
         '<span style="flex-shrink:0">' + icon + '</span>' +
         '<span style="font-weight:600;flex-shrink:0;color:#94a3b8">' + esc(a.agent || '?') + '</span>' +
@@ -7954,20 +9690,20 @@ function renderBrainActivity() {
         '</div>';
     }).join('');
     if (!activity.length) el.innerHTML = '<div style="color:rgba(148,163,184,0.4);text-align:center;padding:8px;font-size:10px;">No activity yet</div>';
-  }).catch(() => {});
+  }).catch(function() {});
 }
 
 function renderBrainMonitor() {
-  fetch(BASE + '/monitor').then(r => r.json()).then(d => {
-    const el = document.getElementById('brainMonitor');
-    const ts = document.getElementById('brainMonitorTs');
+  fetch(BASE + '/monitor').then(function(r) { return r.json(); }).then(function(d) {
+    var el = document.getElementById('brainMonitor');
+    var ts = document.getElementById('brainMonitorTs');
     if (!el) return;
     if (ts) ts.textContent = new Date().toLocaleTimeString();
-    const agents = d.agents || [];
-    const sys = d.system || {};
+    var agents = d.agents || [];
+    var sys = d.system || {};
     el.innerHTML = agents.map(function(a) {
-      const barW = Math.min(Math.round(a.cpu) + 1, 20);
-      const bar = '#'.repeat(barW) + '.'.repeat(Math.max(0, 20 - barW));
+      var barW = Math.min(Math.round(a.cpu) + 1, 20);
+      var bar = '#'.repeat(barW) + '.'.repeat(Math.max(0, 20 - barW));
       return '<div style="display:flex;align-items:center;gap:4px;padding:1px 0;">' +
         '<span style="width:70px;flex-shrink:0;color:#94a3b8;overflow:hidden;text-overflow:ellipsis">' + esc(a.name) + '</span>' +
         '<span style="font-family:monospace;font-size:9px;color:' + (a.cpu > 50 ? '#f87171' : 'rgba(148,163,184,0.5)') + '">' + bar + '</span>' +
@@ -7979,7 +9715,7 @@ function renderBrainMonitor() {
       el.innerHTML += '<div style="margin-top:4px;padding-top:4px;border-top:1px solid rgba(148,163,184,0.1);font-size:9px;color:rgba(148,163,184,0.4)">' +
         sys.cpu_count + ' CPUs \u00b7 ' + Math.round(sys.mem_used_mb / 1024) + '/' + Math.round(sys.mem_total_mb / 1024) + 'GB</div>';
     }
-  }).catch(() => {});
+  }).catch(function() {});
 }
 
 function renderBrainTasks(tasks, skipCounts) {
@@ -7990,7 +9726,7 @@ function renderBrainTasks(tasks, skipCounts) {
     const r = tasks.filter(t => t.status === 'running' || t.status === 'assigned').length;
     const d = tasks.filter(t => t.status === 'completed' || t.status === 'done').length;
     const f = tasks.filter(t => t.status === 'failed').length;
-    counts.innerHTML = '<span style="color:var(--warning)">●</span> ' + p + '  <span style="color:var(--accent)">●</span> ' + r + '  <span style="color:var(--success)">●</span> ' + d + '  <span style="color:var(--danger)">●</span> ' + f;
+    counts.innerHTML = '<span style="color:var(--warning)">●</span> ' + p + '  <span style="color:var(--accent)">●</span> ' + r + '  <span style="color:var(--success)">●</span> ' + d + '  <span style="color:var(--error)">●</span> ' + f;
   }
 
   // Filter tasks if agent is selected
@@ -8026,7 +9762,9 @@ function filterBrainTasksByAgent(name) {
 // INIT
 // ============================================
 initTabFromHash();
-updateEnrichToggle(false); // default off, loadEnrichStats will sync
+updateLockToggle(true); // default locked, loadLockState will sync
+updateSystemToggle(false); // default off, loadEnrichStats will sync
+loadLockState();
 
 // Poll enrich stats every 5s for sidebar toggle + idle countdown
 setInterval(loadEnrichStats, 5000);
@@ -8034,12 +9772,12 @@ loadEnrichStats();
 
 window.addEventListener('hashchange', function() {
   const m = location.hash.match(/tab=(\\d)/);
-  if (m) { const n = parseInt(m[1]); if (n >= 0 && n <= 8 && n !== state.tab) switchTab(n); }
+  if (m) { const n = parseInt(m[1]); if (n >= 0 && n <= 9 && n !== state.tab) switchTab(n); }
 });
 
 setInterval(() => {
   if (state.tab === 0) loadOverview();
-  else if (state.tab === 1) loadAgents();
+  else if (state.tab === 1) { if (agentView === 'services') loadServices(); else loadAgents(); }
   else if (state.tab === 2) loadTasks();
   else if (state.tab === 3) loadMemory();
   else if (state.tab === 4) loadRecall();
@@ -8052,6 +9790,107 @@ setInterval(() => {
 setInterval(() => {
   if (state.tab === 5 && state.chatRoom) loadChatMessages();
 }, 3000);
+
+// ── Notebooks ──────────────────────────────────────────────────
+
+function loadNotebooks() {
+  fetch('/notebooks/config').then(r => r.json()).then(cfg => {
+    const list = el('notebooksList');
+    if (!cfg.notebooks || cfg.notebooks.length === 0) {
+      list.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:40px;">No notebooks configured yet.<br>Add a notebook or sync from NotebookLM.</div>';
+      return;
+    }
+    let html = '<div style="display:grid;gap:12px;">';
+    for (const nb of cfg.notebooks) {
+      const rooms = nb.room_mapping ? Object.entries(nb.room_mapping).filter(([,v]) => v).map(([k]) => '#' + k).join(', ') : 'none';
+      html += `<div style="background:var(--bg-elevated);border-radius:8px;padding:12px 16px;display:flex;align-items:center;gap:12px;">`
+        + `<div style="font-size:24px;">${nb.emoji || '📓'}</div>`
+        + `<div style="flex:1;">`
+        + `<div style="font-weight:600;">${esc(nb.name || nb.id)}</div>`
+        + `<div style="font-size:11px;color:var(--text-muted);">ID: ${esc(nb.id)} · Rooms: ${esc(rooms)} · Topics: ${esc((nb.topics || []).join(', ') || 'none')}${nb.default_for_unmapped ? ' · DEFAULT' : ''}</div>`
+        + `</div>`
+        + `<label style="display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer;"><input type="checkbox" ${nb.enabled !== false ? 'checked' : ''} onchange="toggleNotebook('${nb.id}', this.checked)"> Enabled</label>`
+        + `<button class="btn btn-sm" onclick="editNotebookModal('${nb.id}')">Edit</button>`
+        + `<button class="btn btn-sm" style="color:var(--error);" onclick="deleteNotebook('${nb.id}')">✕</button>`
+        + `</div>`;
+    }
+    html += '</div>';
+    list.innerHTML = html;
+  }).catch(e => {
+    el('notebooksList').innerHTML = '<div style="color:var(--error);">Error loading notebooks: ' + esc(e.message) + '</div>';
+  });
+}
+
+function syncLiveNotebooks() {
+  fetch('/notebooks/live').then(r => r.json()).then(data => {
+    if (data.error) { alert('Error: ' + data.error); return; }
+    const nbs = data.notebooks || [];
+    if (nbs.length === 0) { alert('No notebooks found on NotebookLM.'); return; }
+    fetch('/notebooks/config').then(r2 => r2.json()).then(cfg => {
+      const existingIds = new Set((cfg.notebooks || []).map(n => n.id));
+      let added = 0;
+      for (const nb of nbs) {
+        if (!existingIds.has(nb.id)) {
+          cfg.notebooks.push({
+            id: nb.id, name: nb.title || nb.id, emoji: nb.emoji || '',
+            enabled: true, room_mapping: {}, default_for_unmapped: cfg.notebooks.length === 0,
+            topics: [], chat_style: 'DEFAULT', chat_length: 'DEFAULT'
+          });
+          existingIds.add(nb.id);
+          added++;
+        }
+      }
+      if (!cfg.default_notebook_id && cfg.notebooks.length > 0) {
+        cfg.default_notebook_id = cfg.notebooks[0].id;
+      }
+      fetch('/notebooks/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(cfg)}).then(() => {
+        alert('Synced ' + added + ' new notebooks from NotebookLM.');
+        loadNotebooks();
+      });
+    });
+  }).catch(e => alert('Sync failed: ' + e.message));
+}
+
+function addNotebookModal() {
+  const id = prompt('Notebook ID (UUID from NotebookLM URL):');
+  if (!id) return;
+  const name = prompt('Notebook name:', id);
+  fetch('/notebooks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id, name: name || id})}).then(r => {
+    if (r.ok) loadNotebooks();
+    else r.text().then(t => alert('Error: ' + t));
+  });
+}
+
+function editNotebookModal(nbId) {
+  fetch('/notebooks/config').then(r => r.json()).then(cfg => {
+    const nb = (cfg.notebooks || []).find(n => n.id === nbId);
+    if (!nb) return;
+    const newName = prompt('Name:', nb.name);
+    if (newName === null) return;
+    const topics = prompt('Topics (comma-separated):', (nb.topics || []).join(', '));
+    if (topics === null) return;
+    const rooms = prompt('Rooms (comma-separated, rooms where this notebook is active):', Object.keys(nb.room_mapping || {}).filter(k => nb.room_mapping[k]).join(', '));
+    if (rooms === null) return;
+    const isDefault = confirm('Set as default for unmapped rooms?');
+    nb.name = newName;
+    nb.topics = topics.split(',').map(t => t.trim()).filter(Boolean);
+    const roomMapping = {};
+    rooms.split(',').map(r => r.trim()).filter(Boolean).forEach(r => { roomMapping[r] = true; });
+    nb.room_mapping = roomMapping;
+    nb.default_for_unmapped = isDefault;
+    if (isDefault) cfg.default_notebook_id = nbId;
+    fetch('/notebooks/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(cfg)}).then(() => loadNotebooks());
+  });
+}
+
+function deleteNotebook(nbId) {
+  if (!confirm('Remove notebook ' + nbId + '?')) return;
+  fetch('/notebooks/' + nbId, {method:'DELETE'}).then(() => loadNotebooks());
+}
+
+function toggleNotebook(nbId, enabled) {
+  fetch('/notebooks/' + nbId, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})}).then(() => {});
+}
 </script>
 </body>
 </html>"""

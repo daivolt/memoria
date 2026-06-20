@@ -1,0 +1,15 @@
+[Unit]
+Description=Warden Session Manager
+After=network-online.target xvfb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/external-drive/code/warden/session-manager
+EnvironmentFile=/home/daivolt/conf/warden/session-manager.env
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

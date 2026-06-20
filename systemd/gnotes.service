@@ -1,0 +1,27 @@
+[Unit]
+Description=gNotes — NotebookLM chat context agent
+After=network-online.target warden-session-manager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/daivolt/conf/chitchat/gnotes.py
+Restart=on-failure
+RestartSec=5
+ReadWritePaths=/mnt/external-drive/code /home/daivolt/conf/chitchat
+Environment=HOME=/home/daivolt
+Environment=CHITCHAT_HOST=localhost
+Environment=CHITCHAT_PORT=19999
+Environment=CHITCHAT_ROOMS=general,logs,memoria
+Environment=MEMORIA_URL=http://localhost:19998
+Environment=WARDEN_SM_URL=http://localhost:3100
+Environment=GNOTES_SESSION_NAME=dbarrett@applausemail.com
+Environment=GNOTES_CDP_PORT=9224
+Environment=GNOTES_HTTP_PORT=3101
+Environment=GNOTES_RATE_LIMIT_SEC=3
+Environment=GNOTES_GENERAL_RATE_LIMIT_SEC=60
+Environment=GNOTES_MAX_RESPONSE_CHARS=1500
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
