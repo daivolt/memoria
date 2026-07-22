@@ -79,12 +79,13 @@ def _save_sync_state(state: dict):
 
 # ── Peer Registration ──────────────────────────────────────
 
-def register_peer(name: str, url: str, api_key: str = "") -> dict:
+def register_peer(name: str, url: str, api_key: str = "", adapter: str = "") -> dict:
     peers = _load_peers()
     existing = next((p for p in peers if p["name"] == name), None)
     if existing:
         existing["url"] = url.rstrip("/")
         existing["api_key"] = api_key
+        existing["adapter"] = adapter
         existing["updated_at"] = time.time()
         action = "updated"
     else:
@@ -92,6 +93,7 @@ def register_peer(name: str, url: str, api_key: str = "") -> dict:
             "name": name,
             "url": url.rstrip("/"),
             "api_key": api_key,
+            "adapter": adapter,
             "created_at": time.time(),
             "updated_at": time.time(),
         })
@@ -548,7 +550,17 @@ def push_to_peer(peer_name: str, types: list[str] | None = None) -> dict:
 
 
 def sync_full(peer_name: str, types: list[str] | None = None) -> dict:
-    """Bidirectional sync: pull then push."""
+    """Bidirectional sync: pull then push. Uses PneuralAdapter for pneural peers."""
+    peers = _load_peers()
+    peer = next((p for p in peers if p["name"] == peer_name), None)
+    if peer is None:
+        return {"error": f"peer '{peer_name}' not found"}
+
+    if peer.get("adapter") == "pneural":
+        adapter = PneuralAdapter(url=peer["url"], api_key=peer.get("api_key", ""))
+        result = adapter.sync_with_pneural()
+        return {"ok": True, "peer": peer_name, "action": "full_pneural", "result": result}
+
     pull_result = pull_from_peer(peer_name, types)
     if "error" in pull_result:
         return pull_result
@@ -575,3 +587,149 @@ def sync_all(types: list[str] | None = None) -> list[dict]:
         result = sync_full(peer["name"], types)
         results.append({"peer": peer["name"], "result": result})
     return results
+
+
+# ── Pneural-Context Adapter ──────────────────────────────────
+
+
+class PneuralAdapter:
+    """Adapter for syncing with a pneural-context instance.
+
+    Translates between memoria's file-based format and pneural-context's
+    relational API (GET /api/memory/full, POST /api/memory).
+    """
+
+    def __init__(self, url: str = "http://localhost:8777", api_key: str = ""):
+        self.url = url.rstrip("/")
+        self.api_key = api_key
+
+    def _req(self, method: str, path: str, data: dict | None = None) -> dict | None:
+        url = f"{self.url}{path}"
+        body = json.dumps(data).encode() if data is not None else None
+        req = urllib.request.Request(url, data=body, method=method)
+        req.add_header("Content-Type", "application/json")
+        if self.api_key:
+            req.add_header("X-Api-Key", self.api_key)
+        try:
+            with urllib.request.urlopen(req, timeout=SYNC_TIMEOUT) as resp:
+                return json.loads(resp.read())
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
+            return None
+
+    def pull_from_pneural(self, project: str) -> list[dict]:
+        """Pull memory entries from pneural-context for a project."""
+        result = self._req("GET", f"/api/memory/full?project={urllib.parse.quote(project)}")
+        if result is None or not isinstance(result, list):
+            return []
+        entries = []
+        for row in result:
+            entries.append({
+                "text": row.get("entry", ""),
+                "priority": row.get("priority", "normal"),
+                "memory_type": row.get("memory_type", "temporal"),
+                "source_system": row.get("pb_sync_source", "local"),
+            })
+        return entries
+
+    def push_to_pneural(self, project: str, text: str, priority: str = "normal",
+                         memory_type: str | None = None) -> dict | None:
+        """Push a single memory entry to pneural-context."""
+        payload: dict[str, Any] = {
+            "project": project,
+            "text": text,
+            "priority": priority,
+        }
+        if memory_type:
+            payload["memory_type"] = memory_type
+        return self._req("POST", "/api/memory", payload)
+
+    def get_changelog_for_pneural(self, since: float = 0.0) -> dict[str, list[dict]]:
+        """Convert memoria's file-based changelog into pneural-context API format.
+
+        Returns dict of project -> list of entries suitable for POST /api/memory.
+        Only includes 'memory' type (no topics, sessions, tasks, proposals).
+        """
+        if WORKDIR is None:
+            return {}
+        result: dict[str, list[dict]] = {}
+        memory_dir = WORKDIR
+        for entry in memory_dir.iterdir():
+            if entry.is_dir() and (entry / "MEMORY.md").exists():
+                project = entry.name
+                facts = _load_memory_facts(WORKDIR, project)
+                changed = [f for f in facts if f["updated_at"] > since]
+                if changed:
+                    result[project] = [
+                        {
+                            "text": f["text"],
+                            "priority": "normal",
+                            "memory_type": "temporal",
+                        }
+                        for f in changed
+                    ]
+        return result
+
+    def apply_pneural_changelog(self, entries_by_project: dict[str, list[dict]]) -> dict:
+        """Apply pneural-context memory entries to memoria's file-based storage.
+
+        Each entry: {"text": str, "priority": str, "memory_type": str}.
+        Dedup by normalized text.
+        """
+        if WORKDIR is None:
+            return {"error": "federation not initialized"}
+        applied = 0
+        for project, entries in entries_by_project.items():
+            p = WORKDIR / project / "MEMORY.md"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            local = []
+            if p.exists():
+                raw = p.read_text().strip()
+                if raw:
+                    local = [e.strip() for e in raw.split("§") if e.strip()]
+            local_set = set(local)
+            for entry in entries:
+                text = entry.get("text", "").strip()
+                if text and text not in local_set:
+                    local.append(text)
+                    local_set.add(text)
+                    applied += 1
+            p.write_text("\n§\n".join(local) + "\n" if local else "")
+        return {"applied": applied}
+
+    def sync_with_pneural(self) -> dict:
+        """Full sync: pull from pneural + push to pneural (memory type only)."""
+        pull_result = {"projects_pulled": 0, "entries_pulled": 0}
+        push_result = {"projects_pushed": 0, "entries_pushed": 0}
+
+        if WORKDIR is None:
+            return {"error": "federation not initialized"}
+
+        # Discover projects
+        projects = set()
+        for entry in WORKDIR.iterdir():
+            if entry.is_dir() and (entry / "MEMORY.md").exists():
+                projects.add(entry.name)
+
+        # Pull from pneural for each project
+        for project in projects:
+            entries = self.pull_from_pneural(project)
+            if entries:
+                self.apply_pneural_changelog({project: entries})
+                pull_result["projects_pulled"] += 1
+                pull_result["entries_pulled"] += len(entries)
+
+        # Push memoria's changelog to pneural
+        changelog = self.get_changelog_for_pneural()
+        for project, entries in changelog.items():
+            for entry in entries:
+                self.push_to_pneural(
+                    project,
+                    entry["text"],
+                    entry.get("priority", "normal"),
+                    entry.get("memory_type"),
+                )
+                push_result["entries_pushed"] += 1
+            if entries:
+                push_result["projects_pushed"] += 1
+
+        return {"pull": pull_result, "push": push_result}
