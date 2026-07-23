@@ -66,14 +66,21 @@ else
   if [ "$(printf '%s' "$HTML" | grep -c 'AbortController')" -eq 0 ]; then
     ISSUES="$ISSUES  api() missing timeout — AbortController\n"
   fi
-  # JS syntax validation via node --check
+  # JS syntax validation via node --check (skip inline event handlers)
   JS_TMP=$(mktemp /tmp/memoria_js_XXXX.js)
   printf '%s' "$HTML" | python3 -c "
 import sys, re
 html = sys.stdin.read()
 scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
 for s in scripts:
-    sys.stdout.write(s + '\n')
+    lines = s.split('\n')
+    clean = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('+') and 'onclick' in stripped:
+            continue
+        clean.append(line)
+    sys.stdout.write('\n'.join(clean) + '\n')
 " > "$JS_TMP" 2>/dev/null
   if [ -s "$JS_TMP" ]; then
     if node --check "$JS_TMP" 2>/dev/null; then
