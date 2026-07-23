@@ -429,17 +429,32 @@ CREATE INDEX IF NOT EXISTS idx_enrich_queue_surface ON enrichment_queue(surface,
 
 CREATE TABLE IF NOT EXISTS papers (
     id              BIGSERIAL PRIMARY KEY,
-    filename        TEXT NOT NULL UNIQUE,
+    filename        TEXT NOT NULL,
+    folder          TEXT NOT NULL DEFAULT 'papers',
     title           TEXT NOT NULL DEFAULT '',
     text            TEXT NOT NULL DEFAULT '',
     enriched_text   TEXT NOT NULL DEFAULT '',
     file_mtime      DOUBLE PRECISION NOT NULL DEFAULT 0,
-    indexed_at      DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now())
+    indexed_at      DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now()),
+    UNIQUE (filename, folder)
 );
 
 CREATE INDEX IF NOT EXISTS idx_papers_filename ON papers(filename);
+CREATE INDEX IF NOT EXISTS idx_papers_folder ON papers(folder);
 CREATE INDEX IF NOT EXISTS idx_papers_text_trgm ON papers USING gin (text gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_papers_enriched_trgm ON papers USING gin (enriched_text gin_trgm_ops);
+
+-- Migration: add folder column to existing papers table
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'papers' AND column_name = 'folder') THEN
+        ALTER TABLE papers ADD COLUMN folder TEXT NOT NULL DEFAULT 'papers';
+        ALTER TABLE papers DROP CONSTRAINT IF EXISTS papers_filename_key;
+        ALTER TABLE papers ADD CONSTRAINT papers_filename_folder_unique UNIQUE (filename, folder);
+        CREATE INDEX IF NOT EXISTS idx_papers_folder ON papers(folder);
+    END IF;
+END $$;
 
 -- ═════════════════════════════════════════════════════════════════
 --  Schema Migrations — search enrichment columns
@@ -485,3 +500,194 @@ END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_enrich_queue_dedup
     ON enrichment_queue (surface, record_id)
     WHERE status IN ('pending', 'processing');
+
+-- ═════════════════════════════════════════════════════════════════
+--  Paper Brain — Red Ink (priority + memory_type + strength)
+-- ═════════════════════════════════════════════════════════════════
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'project_memory' AND column_name = 'priority') THEN
+        ALTER TABLE project_memory ADD COLUMN priority VARCHAR(10) NOT NULL DEFAULT 'normal';
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'project_memory' AND column_name = 'memory_type') THEN
+        ALTER TABLE project_memory ADD COLUMN memory_type VARCHAR(20) NOT NULL DEFAULT 'temporal';
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'project_memory' AND column_name = 'strength') THEN
+        ALTER TABLE project_memory ADD COLUMN strength DOUBLE PRECISION NOT NULL DEFAULT 1.0;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'project_memory' AND column_name = 'last_accessed') THEN
+        ALTER TABLE project_memory ADD COLUMN last_accessed DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now());
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_memory_priority ON project_memory(priority);
+CREATE INDEX IF NOT EXISTS idx_memory_type ON project_memory(memory_type);
+CREATE INDEX IF NOT EXISTS idx_memory_strength ON project_memory(strength);
+CREATE INDEX IF NOT EXISTS idx_memory_last_accessed ON project_memory(last_accessed);
+CREATE INDEX IF NOT EXISTS idx_memory_project_priority ON project_memory(project, priority);
+CREATE INDEX IF NOT EXISTS idx_memory_project_type ON project_memory(project, memory_type);
+CREATE INDEX IF NOT EXISTS idx_memory_project_type_created ON project_memory(project, memory_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_project_created ON sessions(project, created);
+
+DO $$ BEGIN
+    ALTER TABLE project_memory ADD CONSTRAINT chk_priority
+        CHECK (priority IN ('critical', 'important', 'normal'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE project_memory ADD CONSTRAINT chk_memory_type
+        CHECK (memory_type IN ('red', 'concept', 'procedural', 'temporal', 'relation'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- ═════════════════════════════════════════════════════════════════
+--  Paper Brain — Procedural Memory (basal ganglia)
+-- ═════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS procedural_memory (
+    id SERIAL PRIMARY KEY,
+    project VARCHAR(200) NOT NULL,
+    task_pattern VARCHAR(500) NOT NULL,
+    task_type VARCHAR(100),
+    steps JSONB NOT NULL DEFAULT '[]',
+    success_count INTEGER NOT NULL DEFAULT 0,
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    reinforcement_score DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    last_success_at DOUBLE PRECISION,
+    proven_by TEXT[] NOT NULL DEFAULT '{}',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now()),
+    retired BOOLEAN NOT NULL DEFAULT FALSE,
+    search_enrichments TEXT[] NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_proc_project ON procedural_memory(project);
+CREATE INDEX IF NOT EXISTS idx_proc_pattern ON procedural_memory USING gin (task_pattern gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_proc_score ON procedural_memory(reinforcement_score DESC);
+CREATE INDEX IF NOT EXISTS idx_proc_retired ON procedural_memory(retired);
+
+DO $$ BEGIN
+    ALTER TABLE procedural_memory ADD CONSTRAINT chk_proc_score_range
+        CHECK (reinforcement_score >= 0 AND reinforcement_score <= 1);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE procedural_memory ADD CONSTRAINT chk_proc_counts_nonneg
+        CHECK (success_count >= 0 AND fail_count >= 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- ═════════════════════════════════════════════════════════════════
+--  Paper Brain — Consolidated Memory (3-tier cortex)
+-- ═════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS consolidated_memory (
+    id SERIAL PRIMARY KEY,
+    project VARCHAR(200) NOT NULL,
+    tier VARCHAR(20) NOT NULL DEFAULT 'consolidated',
+    content TEXT NOT NULL,
+    source_sessions TEXT[] NOT NULL DEFAULT '{}',
+    source_episode_ids TEXT[] NOT NULL DEFAULT '{}',
+    memory_type VARCHAR(20) NOT NULL DEFAULT 'concept',
+    priority VARCHAR(10) NOT NULL DEFAULT 'normal',
+    strength DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    created_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now()),
+    last_accessed DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now()),
+    search_enrichments TEXT[] NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_consolidated_project_tier ON consolidated_memory(project, tier);
+CREATE INDEX IF NOT EXISTS idx_consolidated_priority ON consolidated_memory(priority);
+CREATE INDEX IF NOT EXISTS idx_consolidated_type ON consolidated_memory(memory_type);
+CREATE INDEX IF NOT EXISTS idx_consolidated_memory_last_accessed ON consolidated_memory(last_accessed);
+CREATE INDEX IF NOT EXISTS idx_consolidated_memory_strength ON consolidated_memory(strength);
+
+DO $$ BEGIN
+    ALTER TABLE consolidated_memory ADD CONSTRAINT chk_consolidated_priority
+        CHECK (priority IN ('critical', 'important', 'normal'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE consolidated_memory ADD CONSTRAINT chk_consolidated_memory_type
+        CHECK (memory_type IN ('red', 'concept', 'procedural', 'temporal', 'relation'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE consolidated_memory DROP CONSTRAINT IF EXISTS chk_consolidated_tier;
+EXCEPTION WHEN undefined_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE consolidated_memory ADD CONSTRAINT chk_consolidated_tier
+        CHECK (tier IN ('immediate', 'consolidated', 'timeless'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- Migrate existing rows from old tier values
+UPDATE consolidated_memory SET tier = 'immediate' WHERE tier = 'short_term';
+UPDATE consolidated_memory SET tier = 'timeless' WHERE tier = 'archived';
+
+-- ═════════════════════════════════════════════════════════════════
+--  Paper Brain — Memory Archive (forgotten but searchable)
+-- ═════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS memory_archive (
+    id BIGSERIAL PRIMARY KEY,
+    original_id BIGINT NOT NULL,
+    project TEXT NOT NULL,
+    entry TEXT NOT NULL,
+    priority VARCHAR(10) NOT NULL DEFAULT 'normal',
+    memory_type VARCHAR(20) NOT NULL DEFAULT 'temporal',
+    strength DOUBLE PRECISION NOT NULL DEFAULT 0.1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    archived_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now()),
+    search_enrichments TEXT[] NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_project ON memory_archive(project);
+CREATE INDEX IF NOT EXISTS idx_archive_type ON memory_archive(memory_type);
+
+-- ═════════════════════════════════════════════════════════════════
+--  Paper Brain — Memory Cost Analytics
+-- ═════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS memory_costs (
+    id BIGSERIAL PRIMARY KEY,
+    session_id VARCHAR(100),
+    project VARCHAR(200) NOT NULL,
+    tokens_injected INTEGER NOT NULL DEFAULT 0,
+    tokens_saved_injection INTEGER NOT NULL DEFAULT 0,
+    tokens_saved_forgetting INTEGER NOT NULL DEFAULT 0,
+    context_type VARCHAR(20) NOT NULL DEFAULT 'full',
+    task_outcome VARCHAR(20),
+    created_at DOUBLE PRECISION NOT NULL DEFAULT extract(epoch from now()),
+    breakdown JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_costs_project ON memory_costs(project);
+CREATE INDEX IF NOT EXISTS idx_costs_created ON memory_costs(created_at);
+
+DO $$ BEGIN
+    ALTER TABLE memory_costs ADD COLUMN IF NOT EXISTS breakdown JSONB;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;

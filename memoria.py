@@ -3,26 +3,41 @@ memoria — CLI for opencode session memory + AgentOS orchestration.
 
 Memory:
   memoria init                  Verify server connectivity
-  memoria add <text>            Save durable fact to MEMORY.md
+  memoria add [--red|--important] <text>  Save fact (with optional priority)
   memoria list                  Show all facts
+  memoria list-full             Show all facts with priority/type/strength
   memoria replace <old> <new>   Replace matching entry
-   memoria recall <query>        Search past sessions (SIRA-enriched)
-   memoria review [N]            Summarize last N sessions
-   memoria learnings             Show accumulated project knowledge
-   memoria context <query>       Unified search across ALL surfaces (sessions, topics, memory, papers, cortex)
-   memoria reindex               Re-enqueue all records for LLM search enrichment
-   memoria papers rescan         Force rescan of papers/ directory
-   memoria compress              Compress tool outputs (stdin) via REST
+  memoria recall <query>        Search past sessions (SIRA-enriched)
+  memoria review [N]            Summarize last N sessions
+  memoria learnings             Show accumulated project knowledge
+  memoria context <query>       Unified search across ALL surfaces
+  memoria reindex               Re-enqueue all records for enrichment
+  memoria papers rescan         Force rescan of papers/ directory
+  memoria compress              Compress tool outputs (stdin) via REST
   memoria status                Server health + project memory
-   memoria topics                List cross-project topics
-   memoria topic <name> [text]   Show topic facts or add one
-   memoria topic delete <name>   Delete entire topic
-   memoria topic edit <n> <i> <t> Edit fact at index i
-   memoria topic remove <n> <i>  Remove fact at index i
-   memoria propose <topic> <txt> Propose cross-project fact
-   memoria proposals             List pending proposals
-   memoria proposals clear       Clear all pending proposals
-   memoria accept <id>           Accept proposal
+  memoria red-ink               List all critical (red ink) entries
+  memoria promote <idx>         Promote entry to critical priority
+  memoria demote <idx>          Demote entry to normal priority
+  memoria type <idx> <type>     Set memory type (red|concept|procedural|temporal|relation)
+  memoria classify              Auto-classify temporal entries via LLM
+  memoria decay                 Show entries with fading strength
+  memoria boost <idx>          Boost an entry's strength (recall)
+  memoria briefing <task>       Assemble task-specific briefing card
+  memoria procedure list        List procedures for current project
+  memoria procedure add <pattern> <step1> <step2>...  Add procedure
+  memoria procedure search <q>  Search matching procedures
+  memoria consolidation [status|trigger]  Memory tier status
+  memoria anchors                 Show environmental anchors
+  memoria costs [days]          Memory cost analytics
+  memoria topics                List cross-project topics
+  memoria topic <name> [text]   Show topic facts or add one
+  memoria topic delete <name>   Delete entire topic
+  memoria topic edit <n> <i> <t> Edit fact at index i
+  memoria topic remove <n> <i>  Remove fact at index i
+  memoria propose <topic> <txt> Propose cross-project fact
+  memoria proposals             List pending proposals
+  memoria proposals clear       Clear all pending proposals
+  memoria accept <id>           Accept proposal
   memoria reject <id>           Reject proposal
 
 Orchestration:
@@ -121,8 +136,11 @@ def cmd_init():
         print(f"topics: {t}")
 
 
-def cmd_add(text: str):
-    r = _req("POST", f"/memory/{project_name()}", {"text": text})
+def cmd_add(text: str, priority: str = "normal", memory_type: str | None = None):
+    payload: dict = {"text": text, "priority": priority}
+    if memory_type:
+        payload["memory_type"] = memory_type
+    r = _req("POST", f"/memory/{project_name()}", payload)
     if "error" in r:
         print(r["error"], file=sys.stderr)
         sys.exit(1)
@@ -130,7 +148,7 @@ def cmd_add(text: str):
 
 
 def cmd_list():
-    r = _req("GET", f"/memory/{project_name()}")
+    r = _req("GET", f"/memory/{project_name()}/full")
     if "error" in r:
         print(r["error"], file=sys.stderr)
         sys.exit(1)
@@ -138,8 +156,18 @@ def cmd_list():
     if not entries:
         print("MEMORY.md is empty")
         return
+    type_icons = {
+        "red": "🔴",
+        "concept": "💡",
+        "procedural": "🔧",
+        "temporal": "🕐",
+        "relation": "🔗",
+    }
     for i, e in enumerate(entries, 1):
-        print(f"{i}. {e}")
+        mt = e.get("memory_type", "temporal")
+        icon = type_icons.get(mt, "🕐")
+        text = e.get("entry", str(e)) if isinstance(e, dict) else e
+        print(f"{i}. {icon} {text}")
 
 
 def cmd_replace(old: str, new: str):
@@ -836,6 +864,336 @@ def cmd_diversity(project: str):
             print(f"    {t[:30]:30s}  {c} lessons")
 
 
+def cmd_red_ink():
+    r = _req("GET", f"/red-ink/{project_name()}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    entries = r.get("entries", [])
+    if not entries:
+        print("No critical (red ink) entries")
+        return
+    for e in entries:
+        print(f"  [{e.get('id', '?')}] {e['entry']}")
+
+
+def cmd_promote(index: int):
+    r = _req(
+        "PUT",
+        f"/memory/{project_name()}/priority",
+        {"index": index, "priority": "critical"},
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"entry {index} promoted to critical")
+
+
+def cmd_demote(index: int):
+    r = _req(
+        "PUT",
+        f"/memory/{project_name()}/priority",
+        {"index": index, "priority": "normal"},
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"entry {index} demoted to normal")
+
+
+def cmd_set_type(index: int, memory_type: str):
+    r = _req(
+        "PUT",
+        f"/memory/{project_name()}/type",
+        {"index": index, "memory_type": memory_type},
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"entry {index} type set to {memory_type}")
+
+
+def cmd_classify():
+    r = _req("POST", f"/memory/{project_name()}/classify")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    classified = r.get("classified", 0)
+    skipped = r.get("skipped", 0)
+    total = r.get("total", 0)
+    print(f"classified {classified}/{total} entries ({skipped} kept as temporal)")
+
+
+def cmd_touch(index: int):
+    r = _req(
+        "POST",
+        f"/memory/{project_name()}/touch",
+        {"index": index},
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"entry {index} touched (strength +0.3)")
+
+
+def cmd_list_full():
+    r = _req("GET", f"/memory/{project_name()}/full")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    entries = r.get("entries", [])
+    if not entries:
+        print("MEMORY.md is empty")
+        return
+    icons = {"critical": "🔴", "important": "🟡", "normal": "⚪"}
+    type_icons = {
+        "red": "🔴",
+        "concept": "💡",
+        "procedural": "🔧",
+        "temporal": "🕐",
+        "relation": "🔗",
+    }
+    for i, e in enumerate(entries, 1):
+        pri = e.get("priority", "normal")
+        mt = e.get("memory_type", "temporal")
+        pri_icon = icons.get(pri, "⚪")
+        type_icon = type_icons.get(mt, "🕐")
+        strength = e.get("strength", 1.0)
+        text = e.get("entry", "")
+        print(f"{i}. {pri_icon}{type_icon} [{pri}/{mt}] s={strength:.2f} {text[:100]}")
+
+
+def cmd_briefing(task_description: str):
+    r = _req(
+        "POST",
+        "/briefing",
+        {"task_description": task_description, "project": project_name()},
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(r.get("briefing", ""))
+    print(f"\n--- Sources: {r.get('sources', {})}")
+    print(f"--- Token estimate: {r.get('token_estimate', 0)}")
+
+
+def cmd_procedure_list(show_retired: bool = False):
+    url = f"/procedural/{project_name()}"
+    if show_retired:
+        url += "?retired=true"
+    r = _req("GET", url)
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    procedures = r.get("procedures", [])
+    if not procedures:
+        print("No procedures recorded")
+        return
+    for p in procedures:
+        steps = p.get("steps", [])
+        if isinstance(steps, str):
+            try:
+                steps = json.loads(steps)
+            except (json.JSONDecodeError, TypeError):
+                steps = [steps]
+        score = p.get("reinforcement_score", 0)
+        succ = p.get("success_count", 0)
+        fail = p.get("fail_count", 0)
+        retired = " [RETIRED]" if p.get("retired") else ""
+        print(
+            f"  [{p['id']}] {p.get('task_pattern', '?')} (score={score:.2f}, {succ}✓/{fail}✗){retired}"
+        )
+        for s in steps[:5]:
+            print(f"    → {s}")
+        if len(steps) > 5:
+            print(f"    ... and {len(steps) - 5} more steps")
+
+
+def cmd_procedure_add(task_pattern: str, steps: list[str], task_type: str = ""):
+    r = _req(
+        "POST",
+        f"/procedural/{project_name()}",
+        {
+            "task_pattern": task_pattern,
+            "task_type": task_type,
+            "steps": steps,
+        },
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"procedure added (id={r.get('id', '?')})")
+
+
+def cmd_procedure_search(query: str):
+    r = _req("POST", f"/procedural/{project_name()}/search", {"query": query})
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    results = r.get("results", [])
+    if not results:
+        print(f"No matching procedures for: {query}")
+        return
+    for p in results:
+        steps = p.get("steps", [])
+        if isinstance(steps, str):
+            try:
+                steps = json.loads(steps)
+            except (json.JSONDecodeError, TypeError):
+                steps = [steps]
+        score = p.get("reinforcement_score", 0)
+        print(f"  [{p['id']}] {p.get('task_pattern', '?')} (score={score:.2f})")
+        for s in steps[:5]:
+            print(f"    → {s}")
+
+
+def cmd_consolidation_status():
+    r = _req("GET", f"/consolidation/{project_name()}/status")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"Consolidation status for '{r.get('project', '?')}':")
+    tiers = r.get("tiers", {})
+    for tier, count in tiers.items():
+        print(f"  {tier}: {count} entries")
+    print(f"  total: {r.get('total', 0)}")
+
+
+def cmd_consolidate(project: str | None = None):
+    proj = project or project_name()
+    r = _req("POST", f"/consolidation/{urllib.parse.quote(proj)}/trigger")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"Consolidation complete for '{r.get('project', '?')}':")
+    print(f"  insights created: {r.get('insights_created', 0)}")
+    print(f"  consolidated → timeless: {r.get('consolidated_to_timeless', 0)}")
+    print(f"  archived temporal: {r.get('archived_temporal', 0)}")
+    print(f"  errors: {r.get('errors', 0)}")
+    tiers = r.get("tiers", {})
+    if tiers:
+        print("  tier counts:")
+        for tier, count in tiers.items():
+            print(f"    {tier}: {count}")
+
+
+def cmd_costs(days: int = 30):
+    r = _req(
+        "GET",
+        f"/costs/analysis?project={urllib.parse.quote(project_name())}&days={days}",
+    )
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"Memory cost analysis for '{r.get('project', '?')}' (last {days} days):")
+    print(f"  records:            {r.get('records', 0)}")
+    print(f"  total injected:     {r.get('total_injected', 0)} tokens")
+    print(f"  saved (injection):  {r.get('total_saved_injection', 0)} tokens")
+    print(f"  saved (forgetting):  {r.get('total_saved_forgetting', 0)} tokens")
+    summary = r.get("summary", {})
+    if summary:
+        print(
+            f"  avg injected:       {summary.get('avg_injected', 0):.0f} tokens/session"
+        )
+    eff = r.get("effectiveness", {})
+    if eff:
+        print(f"\nEffectiveness:")
+        print(f"  outcomes:           {eff.get('total_outcomes', 0)}")
+        print(f"  success:            {eff.get('success_count', 0)}")
+        print(f"  fail:               {eff.get('fail_count', 0)}")
+        print(f"  partial:            {eff.get('partial_count', 0)}")
+        print(f"  success rate:       {eff.get('success_rate', 0):.1%}")
+        print(
+            f"  avg ctx/success:    {eff.get('avg_context_per_success', 0):.0f} tokens"
+        )
+        print(f"  avg ctx/fail:       {eff.get('avg_context_per_fail', 0):.0f} tokens")
+    by_type = r.get("by_context_type", {})
+    if by_type:
+        print(f"\nBy context type:")
+        for ct, stats in by_type.items():
+            print(
+                f"  {ct}: {stats['count']} records, {stats['tokens_injected']} tokens injected"
+            )
+
+
+def cmd_decay():
+    r = _req("GET", f"/memory/{urllib.parse.quote(project_name())}/decay")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    total = r.get("total", 0)
+    fading = r.get("fading", [])
+    fading_count = r.get("fading_count", 0)
+    stable_count = r.get("stable_count", 0)
+    print(f"Decay status: {total} total, {stable_count} stable, {fading_count} fading")
+    if fading:
+        print("\n  Fading entries:")
+        for e in fading:
+            text = e.get("entry", "")[:60]
+            s = e.get("strength", 1.0)
+            p = e.get("priority", "normal")
+            print(f"    [{e.get('id', '?')}] s={s:.2f} p={p} {text}")
+
+
+def cmd_boost(idx: int):
+    r = _req("POST", f"/memory/{urllib.parse.quote(project_name())}/boost/{idx}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"Entry {idx} strength boosted")
+
+
+def cmd_anchors():
+    r = _req("GET", f"/anchors/{urllib.parse.quote(project_name())}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    print(f"Environmental anchors for '{r.get('project', '?')}':")
+    completed = r.get("completed_tasks", [])
+    if completed:
+        print("\n  Completed tasks:")
+        for t in completed:
+            print(f"    ✓ {t.get('title', '?')[:80]}")
+            if t.get("result"):
+                print(f"      result: {t['result'][:100]}")
+    active = r.get("active_tasks", [])
+    if active:
+        print("\n  Active tasks:")
+        for t in active:
+            assigned = t.get("assigned_to", "unassigned")[:20]
+            print(
+                f"    → [{t.get('status', '?')}] {t.get('title', '?')[:80]} ({assigned})"
+            )
+    red_ink = r.get("red_ink", [])
+    if red_ink:
+        print("\n  Red ink reminders:")
+        for entry in red_ink:
+            print(f"    🔴 {entry[:100]}")
+    commits = r.get("commit_log", [])
+    if commits:
+        print("\n  Recent commits:")
+        for c in commits:
+            print(f"    {c[:100]}")
+    if not completed and not active and not red_ink and not commits:
+        print("  (no anchors yet)")
+
+
+def cmd_recall_boost(query: str, limit: int = 5):
+    r = _req("GET", f"/recall?q={urllib.parse.quote(query)}&limit={limit}")
+    if "error" in r:
+        print(r["error"], file=sys.stderr)
+        sys.exit(1)
+    results = r.get("results", [])
+    if not results:
+        print(f"No matches for: {query}")
+        return
+    print(f"Found {len(results)} relevant sessions (strength boosted):\n")
+    for s in results:
+        print(f"  [{s['id'][:12]}...]")
+        print(f"  title: {s['title']}")
+        print(f"  summary: {s['summary']}\n")
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
@@ -845,10 +1203,28 @@ def main():
     if cmd == "init":
         cmd_init()
     elif cmd == "add":
-        if len(args) < 2:
-            print("usage: memoria add <text>", file=sys.stderr)
+        priority = "normal"
+        memory_type = None
+        text_args = args[1:]
+        while text_args:
+            if text_args[0] == "--red":
+                priority = "critical"
+                text_args = text_args[1:]
+            elif text_args[0] == "--important":
+                priority = "important"
+                text_args = text_args[1:]
+            elif text_args[0] == "--type" and len(text_args) > 1:
+                memory_type = text_args[1]
+                text_args = text_args[2:]
+            else:
+                break
+        if not text_args:
+            print(
+                "usage: memoria add [--red|--important] [--type <red|concept|procedural|temporal|relation>] <text>",
+                file=sys.stderr,
+            )
             sys.exit(1)
-        cmd_add(" ".join(args[1:]))
+        cmd_add(" ".join(text_args), priority=priority, memory_type=memory_type)
     elif cmd == "list":
         cmd_list()
     elif cmd == "replace":
@@ -1196,10 +1572,10 @@ def main():
             sys.exit(1)
         cmd_culture(args[1])
     elif cmd == "consolidate":
-        if len(args) < 2:
-            print("usage: memoria consolidate <project>", file=sys.stderr)
-            sys.exit(1)
-        cmd_consolidate_culture(args[1])
+        if len(args) >= 2:
+            cmd_consolidate(args[1])
+        else:
+            cmd_consolidate()
     elif cmd == "evolve":
         if len(args) < 2:
             print("usage: memoria evolve <project> [topic]", file=sys.stderr)
@@ -1210,6 +1586,85 @@ def main():
             print("usage: memoria diversity <project>", file=sys.stderr)
             sys.exit(1)
         cmd_diversity(args[1])
+    elif cmd == "red-ink":
+        cmd_red_ink()
+    elif cmd == "promote":
+        if len(args) < 2:
+            print("usage: memoria promote <index>", file=sys.stderr)
+            sys.exit(1)
+        cmd_promote(int(args[1]))
+    elif cmd == "demote":
+        if len(args) < 2:
+            print("usage: memoria demote <index>", file=sys.stderr)
+            sys.exit(1)
+        cmd_demote(int(args[1]))
+    elif cmd == "type":
+        if len(args) < 3:
+            print(
+                "usage: memoria type <index> <red|concept|procedural|temporal|relation>",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        cmd_set_type(int(args[1]), args[2])
+    elif cmd == "classify":
+        cmd_classify()
+    elif cmd == "list-full":
+        cmd_list_full()
+    elif cmd == "touch":
+        if len(args) < 2:
+            print("usage: memoria touch <index>", file=sys.stderr)
+            sys.exit(1)
+        cmd_touch(int(args[1]))
+    elif cmd == "briefing":
+        if len(args) < 2:
+            print("usage: memoria briefing <task description>", file=sys.stderr)
+            sys.exit(1)
+        cmd_briefing(" ".join(args[1:]))
+    elif cmd == "procedure":
+        if len(args) < 2:
+            print("usage: memoria procedure <list|add|search> ...", file=sys.stderr)
+            sys.exit(1)
+        sub = args[1]
+        if sub == "list":
+            show_retired = "--retired" in args or "-r" in args
+            cmd_procedure_list(show_retired=show_retired)
+        elif sub == "add":
+            if len(args) < 4:
+                print(
+                    "usage: memoria procedure add <task_pattern> <step1> <step2> ...",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            cmd_procedure_add(args[2], args[3:])
+        elif sub == "search":
+            if len(args) < 3:
+                print("usage: memoria procedure search <query>", file=sys.stderr)
+                sys.exit(1)
+            cmd_procedure_search(" ".join(args[2:]))
+        else:
+            print(f"unknown procedure subcommand: {sub}", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "consolidation":
+        if len(args) < 2:
+            cmd_consolidation_status()
+        elif args[1] == "status":
+            cmd_consolidation_status()
+        elif args[1] == "trigger":
+            cmd_consolidate()
+        else:
+            print(f"unknown consolidation subcommand: {args[1]}", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "costs":
+        cmd_costs(int(args[1]) if len(args) > 1 else 30)
+    elif cmd == "decay":
+        cmd_decay()
+    elif cmd == "boost":
+        if len(args) < 2:
+            print("usage: memoria boost <index>", file=sys.stderr)
+            sys.exit(1)
+        cmd_boost(int(args[1]))
+    elif cmd == "anchors":
+        cmd_anchors()
     else:
         print(f"unknown: {cmd}", file=sys.stderr)
         sys.exit(1)

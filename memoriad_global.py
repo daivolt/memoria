@@ -42,7 +42,7 @@ import numpy as np
 
 from compress import compress
 from context import current_state, write_state, release_state, claim_file
-from cortex import get_engine, CortexEngine
+from cortex import get_engine, CortexEngine, HippocampalMemory
 from social_learning import (
     Lesson,
     save_lesson,
@@ -76,6 +76,7 @@ WORKDIR = Path("/var/tmp/memoria")
 AGENTS_DIR = WORKDIR / "agents"
 TASKS_DIR = WORKDIR / "tasks"
 SAFETY_DIR = WORKDIR / "safety"
+ANCHORS_DIR = WORKDIR / "anchors"
 OPENCODE_DB = Path.home() / ".local/share/opencode/opencode.db"
 MEMORY_LIMIT = 5000
 POLL_INTERVAL = 30
@@ -120,6 +121,16 @@ PAPERS_DIR = Path(
     os.environ.get("MEMORIA_PAPERS_DIR", str(Path(__file__).parent / "papers"))
 )
 _last_paper_mtimes: dict[str, float] = {}
+
+# ── Paper Brain configurable parameters ────────────────────────
+
+DECAY_FACTOR = float(os.environ.get("PB_DECAY_FACTOR", "0.95"))
+RECENT_THRESHOLD_SECONDS = float(os.environ.get("PB_RECENT_THRESHOLD_SECONDS", "3600"))
+ARCHIVE_THRESHOLD = float(os.environ.get("PB_ARCHIVE_THRESHOLD", "0.1"))
+PROCEDURAL_SEARCH_THRESHOLD = float(
+    os.environ.get("PB_PROCEDURAL_SEARCH_THRESHOLD", "0.7")
+)
+PAPERS_FOLDERS: list[dict] = [{"path": str(PAPERS_DIR), "label": "Default"}]
 
 # ── Background task references ────────────────────────────────
 
@@ -1289,6 +1300,33 @@ async def _sleep_cycle_loop():
             await _deep_consolidate()
         except Exception:
             pass
+        try:
+            if _pool:
+                projects = await pg.get_all_projects()
+                for proj in projects:
+                    try:
+                        await pg.run_consolidation(proj)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            decay_result = await pg.apply_decay(
+                decay_factor=DECAY_FACTOR,
+                recent_threshold_seconds=RECENT_THRESHOLD_SECONDS,
+            )
+            archive_result = await pg.archive_decay(threshold=ARCHIVE_THRESHOLD)
+            if (
+                decay_result.get("total", 0) > 0
+                or archive_result.get("archived", 0) > 0
+            ):
+                _notify_chitchat_logs(
+                    f"[memoria] decay: {decay_result.get('decayed', 0)} entries decayed, "
+                    f"{decay_result.get('red_ink_protected', 0)} red-ink protected; "
+                    f"archived {archive_result.get('archived', 0)} entries"
+                )
+        except Exception:
+            pass
         await asyncio.sleep(SLEEP_CYCLE_HOURS * 3600)
 
 
@@ -1430,58 +1468,77 @@ async def _enrich_worker_loop():
 
 
 async def _papers_watcher_loop():
-    """Watch the papers/ directory for new or modified PDFs."""
-    global _last_paper_mtimes
+    """Watch configured knowledge folders for new or modified files."""
+    global _last_paper_mtimes, PAPERS_FOLDERS
     await asyncio.sleep(15)
     while True:
         try:
-            if not PAPERS_DIR.exists():
-                await asyncio.sleep(PAPERS_WATCH_INTERVAL)
-                continue
-            for pdf_path in sorted(PAPERS_DIR.glob("*.pdf")):
-                fname = pdf_path.name
-                mtime = pdf_path.stat().st_mtime
-                if _last_paper_mtimes.get(fname) == mtime:
+            for folder_entry in PAPERS_FOLDERS:
+                folder_path = Path(folder_entry["path"])
+                folder_label = folder_entry.get("label", folder_path.name)
+                if not folder_path.exists():
                     continue
-                _last_paper_mtimes[fname] = mtime
-                if not _pool:
-                    continue
-                async with _pool.acquire() as conn:
-                    existing = await conn.fetchval(
-                        "SELECT file_mtime FROM papers WHERE filename = $1", fname
-                    )
-                    if existing is not None and abs(existing - mtime) < 1.0:
-                        continue
-                try:
-                    result = subprocess.run(
-                        ["pdftotext", "-layout", str(pdf_path), "-"],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
-                    text = result.stdout.strip()[:10000]
-                except Exception:
-                    text = ""
-                if not text:
-                    continue
-                if not _pool:
-                    continue
-                title = fname.replace(".pdf", "").replace("_", " ")
-                async with _pool.acquire() as conn:
-                    await conn.execute(
-                        "INSERT INTO papers (filename, title, text, file_mtime) "
-                        "VALUES ($1, $2, $3, $4) "
-                        "ON CONFLICT (filename) DO UPDATE SET "
-                        "text = $3, file_mtime = $4, indexed_at = extract(epoch from now())",
-                        fname,
-                        title,
-                        text,
-                        mtime,
-                    )
-                    pid_row = await conn.fetchrow(
-                        "SELECT id FROM papers WHERE filename = $1", fname
-                    )
-                print(f"[papers] indexed {fname} ({len(text)} chars)", flush=True)
+                for ext in ("*.pdf", "*.txt", "*.md"):
+                    for fpath in sorted(folder_path.glob(ext)):
+                        fname = fpath.name
+                        mtime = fpath.stat().st_mtime
+                        mtime_key = f"{folder_label}:{fname}"
+                        if _last_paper_mtimes.get(mtime_key) == mtime:
+                            continue
+                        _last_paper_mtimes[mtime_key] = mtime
+                        if not _pool:
+                            continue
+                        async with _pool.acquire() as conn:
+                            existing = await conn.fetchval(
+                                "SELECT file_mtime FROM papers WHERE filename = $1 AND folder = $2",
+                                fname,
+                                folder_label,
+                            )
+                            if existing is not None and abs(existing - mtime) < 1.0:
+                                continue
+                        text = ""
+                        if fpath.suffix.lower() == ".pdf":
+                            try:
+                                result = subprocess.run(
+                                    ["pdftotext", "-layout", str(fpath), "-"],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=30,
+                                )
+                                text = result.stdout.strip()[:10000]
+                            except Exception:
+                                text = ""
+                        else:
+                            try:
+                                text = fpath.read_text()[:10000]
+                            except Exception:
+                                text = ""
+                        if not text:
+                            continue
+                        if not _pool:
+                            continue
+                        title = (
+                            fname.replace(".pdf", "")
+                            .replace(".txt", "")
+                            .replace(".md", "")
+                            .replace("_", " ")
+                        )
+                        async with _pool.acquire() as conn:
+                            await conn.execute(
+                                "INSERT INTO papers (filename, folder, title, text, file_mtime) "
+                                "VALUES ($1, $2, $3, $4, $5) "
+                                "ON CONFLICT (filename, folder) DO UPDATE SET "
+                                "text = $4, file_mtime = $5, indexed_at = extract(epoch from now())",
+                                fname,
+                                folder_label,
+                                title,
+                                text,
+                                mtime,
+                            )
+                        print(
+                            f"[papers] indexed {folder_label}/{fname} ({len(text)} chars)",
+                            flush=True,
+                        )
         except Exception as e:
             print(f"[papers] watcher error: {e}", flush=True)
         await asyncio.sleep(PAPERS_WATCH_INTERVAL)
@@ -1593,6 +1650,7 @@ async def recall(
     project: Optional[str] = None,
     source: Optional[str] = None,
     enrich: bool = True,
+    boost: bool = True,
 ):
     results = []
 
@@ -1655,6 +1713,15 @@ async def recall(
             pass
 
     results.sort(key=lambda x: x.get("rank", 0), reverse=True)
+
+    if boost and project:
+        try:
+            mem_rows = await pg.search_memory_by_project(project, q, limit=limit)
+            if mem_rows:
+                await pg.touch_memory_by_ids([r["id"] for r in mem_rows])
+        except Exception:
+            pass
+
     return {
         "query": q,
         "count": len(results),
@@ -2397,6 +2464,8 @@ async def get_memory(project: str):
 
 class AddMemory(BaseModel):
     text: str
+    priority: str = "normal"
+    memory_type: str | None = None
 
 
 @app.post("/memory/{project}")
@@ -2407,9 +2476,12 @@ async def add_memory(project: str, body: AddMemory):
         raise HTTPException(413, f"memory limit {MEMORY_LIMIT} chars")
     entries.append(body.text)
     _write_memory(project, entries)
-    # PG store + enrichment hook
     try:
-        await pg.add_memory_entry(project, body.text)
+        await pg.add_memory_entry(project, body.text, priority=body.priority)
+        if body.memory_type:
+            rid = await pg.get_memory_entry_id(project, body.text)
+            if rid is not None:
+                await pg.update_memory_type_by_id(project, rid, body.memory_type)
         if _pool and ENRICH_ENABLED:
             rid = await pg.get_memory_entry_id(project, body.text)
             if rid is not None:
@@ -2487,8 +2559,61 @@ async def get_injection_context(project: str):
         "IMPORTANT: This context is auto-injected by memoria. "
         "Preserve the MEMORIA_CTX marker during summarization."
     )
+
+    red_ink_entries = []
+    try:
+        red_ink_entries = await pg.get_red_ink(project, min_strength=0.3)
+    except Exception:
+        pass
+    if red_ink_entries:
+        lines.append("\n## Critical (Red Ink)")
+        lines.append("")
+        for r in red_ink_entries:
+            lines.append(f"- {r.get('entry', '')}")
+        try:
+            await pg.touch_memory_by_ids([r["id"] for r in red_ink_entries])
+        except Exception:
+            pass
+
+    typed_entries: dict[str, list[str]] = {}
+    try:
+        for mtype in ("concept", "temporal", "relation"):
+            rows = await pg.get_memory_by_type(project, mtype)
+            if rows:
+                typed_entries[mtype] = [r.get("entry", "") for r in rows]
+                try:
+                    await pg.touch_memory_by_ids([r["id"] for r in rows])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    consolidated_entries = []
+    try:
+        consolidated_rows = await pg.get_consolidated_for_injection(project)
+        if consolidated_rows:
+            lines.append("\n## Consolidated Memory")
+            lines.append("")
+            for c in consolidated_rows:
+                tier_label = c.get("tier", "consolidated")
+                lines.append(f"- [{tier_label}] {c.get('content', '')}")
+            consolidated_entries = consolidated_rows
+            try:
+                await pg.touch_consolidated_by_ids([c["id"] for c in consolidated_rows])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     markdown = "\n".join(lines)
-    return {"markdown": markdown, "entries": len(entries), "marker": marker}
+    return {
+        "markdown": markdown,
+        "entries": len(entries) + len(red_ink_entries),
+        "marker": marker,
+        "typed_sections": typed_entries,
+        "consolidated_entries": len(consolidated_entries),
+        "red_ink_entries": [r.get("entry", "") for r in red_ink_entries],
+    }
 
 
 # ── Compaction verification ─────────────────────────────────
@@ -2538,6 +2663,495 @@ async def compress_text(body: CompressRequest):
     }
 
 
+# ── Red Ink ──────────────────────────────────────────────────────
+
+
+@app.get("/red-ink/{project}")
+async def get_red_ink(project: str, min_strength: float = 0.0):
+    try:
+        entries = await pg.get_red_ink(project, min_strength=min_strength)
+        return {"project": project, "entries": entries, "count": len(entries)}
+    except Exception as exc:
+        raise HTTPException(500, f"failed to get red ink: {exc}")
+
+
+class SetPriority(BaseModel):
+    index: int
+    priority: str
+
+
+@app.put("/memory/{project}/priority")
+async def set_memory_priority(project: str, body: SetPriority):
+    result = await pg.update_memory_priority(project, body.index, body.priority)
+    if not result:
+        raise HTTPException(404, "entry not found")
+    return {"ok": True}
+
+
+class SetMemoryType(BaseModel):
+    index: int
+    memory_type: str
+
+
+@app.get("/memory/{project}/full")
+async def get_memory_full(project: str):
+    try:
+        entries = await pg.get_memory_entries_full(project)
+        return {"project": project, "entries": entries, "count": len(entries)}
+    except Exception as exc:
+        raise HTTPException(500, f"failed to get full memory: {exc}")
+
+
+@app.post("/memory/{project}/touch")
+async def touch_memory(project: str, body: dict):
+    index = body.get("index", 1)
+    try:
+        result = await pg.touch_memory_access(project, index)
+        if not result:
+            raise HTTPException(404, "entry not found")
+        return {"ok": True, "index": index}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"failed to touch: {exc}")
+
+
+@app.post("/memory/{project}/classify")
+async def classify_memory(project: str):
+    try:
+        result = await pg.auto_classify_migration(project)
+        return result
+    except Exception as exc:
+        raise HTTPException(500, f"failed to classify: {exc}")
+
+
+@app.put("/memory/{project}/type")
+async def set_memory_type_put(project: str, body: SetMemoryType):
+    result = await pg.update_memory_type(project, body.index, body.memory_type)
+    if not result:
+        raise HTTPException(404, "entry not found")
+    return {"ok": True}
+
+
+@app.patch("/memory/{project}/type")
+async def set_memory_type_patch(project: str, body: SetMemoryType):
+    result = await pg.update_memory_type(project, body.index, body.memory_type)
+    if not result:
+        raise HTTPException(404, "entry not found")
+    return {"ok": True}
+
+
+@app.post("/memory/{project}/boost/{idx}")
+async def boost_memory(project: str, idx: int):
+    try:
+        result = await pg.touch_memory_access(project, idx)
+        if not result:
+            raise HTTPException(404, "entry not found")
+        return {"ok": True, "index": idx}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"failed to boost: {exc}")
+
+
+# ── Briefing Cards ──────────────────────────────────────────────
+
+
+class BriefingRequest(BaseModel):
+    task_description: str
+    project: str = ""
+    max_tokens: int = 2000
+
+
+@app.post("/briefing")
+async def generate_briefing(body: BriefingRequest):
+    project = body.project or "default"
+    sources: dict[str, int] = {
+        "hippocampal": 0,
+        "topic": 0,
+        "session": 0,
+        "cultural": 0,
+        "procedural": 0,
+        "red_ink": 0,
+        "lessons": 0,
+    }
+    parts: list[str] = []
+
+    try:
+        red_ink = await pg.get_red_ink(project, min_strength=0.3)
+        if red_ink:
+            sources["red_ink"] = len(red_ink)
+            parts.append("## Critical (Red Ink)")
+            for r in red_ink:
+                parts.append(f"- {r.get('entry', '')}")
+            parts.append("")
+    except Exception:
+        pass
+
+    try:
+        proc_results = await pg.search_procedures(
+            project,
+            body.task_description,
+            limit=5,
+            similarity_threshold=PROCEDURAL_SEARCH_THRESHOLD,
+        )
+        active = [p for p in proc_results if not p.get("retired", False)]
+        if active:
+            sources["procedural"] = len(active)
+            parts.append("## Proven Procedures")
+            for p in active:
+                steps = p.get("steps", [])
+                steps_str = (
+                    " → ".join(steps) if isinstance(steps, list) else str(steps)[:200]
+                )
+                score = p.get("reinforcement_score", 0)
+                parts.append(
+                    f"- [{p.get('task_type', 'task')}] {p.get('task_pattern', '')} (score: {score:.2f}): {steps_str}"
+                )
+            parts.append("")
+    except Exception:
+        pass
+
+    task_lower = body.task_description.lower()
+    try:
+        topics = await pg.search_topics_enriched(task_lower, limit=5)
+        if topics:
+            sources["topic"] = len(topics)
+            parts.append("## Relevant Topics")
+            for t in topics:
+                parts.append(f"- {t.get('name', '')}: {t.get('summary', '')[:100]}")
+            parts.append("")
+    except Exception:
+        pass
+
+    try:
+        sessions = await pg.search_sessions_enriched(task_lower, limit=3)
+        if sessions:
+            sources["session"] = len(sessions)
+            parts.append("## Related Sessions")
+            for s in sessions:
+                parts.append(f"- {s.get('title', '')}: {s.get('summary', '')[:100]}")
+            parts.append("")
+    except Exception:
+        pass
+
+    try:
+        hipp = HippocampalMemory(project)
+        ctx = hipp.context_for_task(body.task_description, top_k=3)
+        if ctx:
+            sources["hippocampal"] = len(ctx)
+            parts.append("## Hippocampal Recall")
+            for ep in ctx[:3]:
+                summary = ep.get("summary", ep.get("meta", {}).get("summary", ""))
+                if summary:
+                    parts.append(f"- {summary[:150]}")
+            parts.append("")
+    except Exception:
+        pass
+
+    try:
+        cultural = await pg.read_cultural_memory(project)
+        if cultural and cultural.get("facts"):
+            sources["cultural"] = len(cultural["facts"])
+            parts.append("## Cultural Knowledge")
+            for c in cultural["facts"][:20]:
+                parts.append(f"- {c}")
+            parts.append("")
+    except Exception:
+        pass
+
+    try:
+        lessons = find_lessons_for_topic(task_lower, top_k=5)
+        if lessons:
+            sources["lessons"] = len(lessons)
+            parts.append("## Lessons")
+            for l in lessons:
+                parts.append(
+                    f"- {l.get('title', l.get('name', ''))}: {l.get('summary', l.get('content', ''))[:150]}"
+                )
+            parts.append("")
+    except Exception:
+        pass
+
+    briefing = "\n".join(parts) if parts else ""
+    return {
+        "briefing": briefing,
+        "sources": sources,
+        "token_estimate": len(briefing) // 4,
+    }
+
+
+# ── Procedural Memory ────────────────────────────────────────────
+
+
+@app.get("/procedural/{project}")
+async def list_procedures(project: str):
+    try:
+        rows = await pg.list_procedures(project)
+        return {"project": project, "procedures": rows, "count": len(rows)}
+    except Exception as exc:
+        raise HTTPException(500, f"failed to list procedures: {exc}")
+
+
+class AddProcedure(BaseModel):
+    task_pattern: str
+    steps: list[str]
+    task_type: str | None = None
+
+
+@app.post("/procedural/{project}")
+async def add_procedure(project: str, body: AddProcedure):
+    try:
+        row = await pg.add_procedure(
+            project, body.task_pattern, body.steps, task_type=body.task_type
+        )
+        return {"ok": True, "id": row["id"]}
+    except Exception as exc:
+        raise HTTPException(500, f"failed to add procedure: {exc}")
+
+
+class SearchProcedure(BaseModel):
+    query: str
+    limit: int = 5
+
+
+@app.post("/procedural/{project}/search")
+async def search_procedures(project: str, body: SearchProcedure):
+    try:
+        rows = await pg.search_procedures(
+            project,
+            body.query,
+            limit=body.limit,
+            similarity_threshold=PROCEDURAL_SEARCH_THRESHOLD,
+        )
+        return {"project": project, "results": rows, "count": len(rows)}
+    except Exception as exc:
+        raise HTTPException(500, f"failed to search procedures: {exc}")
+
+
+class ProcedureOutcome(BaseModel):
+    outcome: str
+
+
+@app.patch("/procedural/{project}/{proc_id}")
+async def update_procedure_outcome(project: str, proc_id: int, body: ProcedureOutcome):
+    try:
+        result = await pg.update_procedure_outcome(project, proc_id, body.outcome)
+        return result
+    except Exception as exc:
+        raise HTTPException(500, f"failed to update procedure: {exc}")
+
+
+@app.post("/procedural/{project}/retire/{proc_id}")
+async def retire_procedure(project: str, proc_id: int):
+    try:
+        result = await pg.retire_procedure(project, proc_id)
+        return result
+    except Exception as exc:
+        raise HTTPException(500, f"failed to retire procedure: {exc}")
+
+
+# ── Consolidated Memory (3-tier cortex) ────────────────────────
+
+
+@app.get("/consolidation/{project}")
+async def get_consolidated(project: str, tier: str | None = None):
+    try:
+        rows = await pg.get_consolidated(project, tier=tier)
+        return {"project": project, "entries": rows, "count": len(rows)}
+    except Exception as exc:
+        raise HTTPException(500, f"failed to get consolidated: {exc}")
+
+
+@app.post("/consolidation/{project}/trigger")
+async def trigger_memory_consolidation(project: str):
+    try:
+        result = await pg.run_consolidation(project)
+        return {"ok": True, "result": result}
+    except Exception as exc:
+        raise HTTPException(500, f"consolidation failed: {exc}")
+
+
+@app.get("/consolidation/{project}/status")
+async def consolidation_status(project: str):
+    try:
+        rows = await pg.get_consolidated(project)
+        by_tier: dict[str, int] = {}
+        for e in rows:
+            t = e.get("tier", "unknown")
+            by_tier.setdefault(t, 0)
+            by_tier[t] += 1
+        return {"project": project, "tiers": by_tier, "total": len(rows)}
+    except Exception as exc:
+        raise HTTPException(500, f"status failed: {exc}")
+
+
+# ── Environmental Anchors ───────────────────────────────────────
+
+
+@app.get("/anchors/{project}")
+async def get_anchors(project: str):
+    anchors = _load_anchors(project)
+    if anchors is None:
+        anchors = await _generate_anchors(project)
+    return anchors
+
+
+# ── Ebbinghaus Decay & Archive ──────────────────────────────────
+
+
+@app.get("/memory/{project}/decay")
+async def get_decay_status(project: str):
+    try:
+        return await pg.get_decay_status(project)
+    except Exception as exc:
+        raise HTTPException(500, f"failed to get decay status: {exc}")
+
+
+@app.get("/memory/{project}/archive")
+async def search_archive(project: str, q: str = "", limit: int = 20):
+    try:
+        rows = await pg.search_archived(project, query=q, limit=limit)
+        return {"project": project, "entries": rows, "count": len(rows)}
+    except Exception as exc:
+        raise HTTPException(500, f"archive search failed: {exc}")
+
+
+@app.post("/memory/{project}/decay/trigger")
+async def trigger_decay(project: str):
+    try:
+        decay_result = await pg.apply_decay(
+            decay_factor=DECAY_FACTOR,
+            recent_threshold_seconds=RECENT_THRESHOLD_SECONDS,
+        )
+        archive_result = await pg.archive_decay(threshold=ARCHIVE_THRESHOLD)
+        return {
+            "ok": True,
+            "project": project,
+            "decay": decay_result,
+            "archive": archive_result,
+        }
+    except Exception as exc:
+        raise HTTPException(500, f"decay trigger failed: {exc}")
+
+
+# ── Memory Cost Analytics ───────────────────────────────────────
+
+
+@app.get("/costs/analysis")
+async def get_cost_analysis(project: str = "", days: int = 30):
+    if not project:
+        return {"error": "project parameter required"}
+    rows = await pg.get_memory_costs(project, days=days)
+    total_injected = sum(r.get("tokens_injected", 0) for r in rows)
+    total_saved_injection = sum(r.get("tokens_saved_injection", 0) for r in rows)
+    total_saved_forgetting = sum(r.get("tokens_saved_forgetting", 0) for r in rows)
+    summary = await pg.get_memory_cost_summary(project, days=days)
+
+    outcomes = [r for r in rows if r.get("task_outcome")]
+    success_count = sum(1 for r in outcomes if r.get("task_outcome") == "success")
+    fail_count = sum(1 for r in outcomes if r.get("task_outcome") == "fail")
+    partial_count = sum(1 for r in outcomes if r.get("task_outcome") == "partial")
+    total_outcomes = len(outcomes)
+    success_rate = success_count / total_outcomes if total_outcomes > 0 else 0
+
+    by_type: dict[str, dict] = {}
+    for r in rows:
+        ct = r.get("context_type", "unknown")
+        entry = by_type.setdefault(
+            ct,
+            {
+                "count": 0,
+                "tokens_injected": 0,
+                "tokens_saved_injection": 0,
+                "tokens_saved_forgetting": 0,
+            },
+        )
+        entry["count"] += 1
+        entry["tokens_injected"] += r.get("tokens_injected", 0)
+        entry["tokens_saved_injection"] += r.get("tokens_saved_injection", 0)
+        entry["tokens_saved_forgetting"] += r.get("tokens_saved_forgetting", 0)
+
+    injection_by_session: dict[str, int] = {}
+    for r in rows:
+        sid = r.get("session_id", "")
+        if sid and r.get("context_type") == "full":
+            injection_by_session[sid] = r.get("tokens_injected", 0)
+
+    avg_injected_success = 0
+    avg_injected_fail = 0
+    success_injections = [
+        injection_by_session.get(r.get("session_id", ""), 0)
+        for r in outcomes
+        if r.get("task_outcome") == "success"
+        and injection_by_session.get(r.get("session_id", ""))
+    ]
+    fail_injections = [
+        injection_by_session.get(r.get("session_id", ""), 0)
+        for r in outcomes
+        if r.get("task_outcome") == "fail"
+        and injection_by_session.get(r.get("session_id", ""))
+    ]
+    if success_injections:
+        avg_injected_success = sum(success_injections) / len(success_injections)
+    if fail_injections:
+        avg_injected_fail = sum(fail_injections) / len(fail_injections)
+
+    return {
+        "project": project,
+        "days": days,
+        "records": len(rows),
+        "total_injected": total_injected,
+        "total_saved_injection": total_saved_injection,
+        "total_saved_forgetting": total_saved_forgetting,
+        "summary": summary,
+        "effectiveness": {
+            "total_outcomes": total_outcomes,
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "partial_count": partial_count,
+            "success_rate": round(success_rate, 3),
+            "avg_context_per_success": round(avg_injected_success, 1),
+            "avg_context_per_fail": round(avg_injected_fail, 1),
+        },
+        "by_context_type": by_type,
+    }
+
+
+@app.get("/costs/trends")
+async def get_cost_trends(project: str = "", days: int = 90):
+    if not project:
+        return {"error": "project parameter required"}
+    rows = await pg.get_memory_costs(project, days=days)
+    return {"project": project, "days": days, "records": len(rows), "rows": rows}
+
+
+class RecordCostBody(BaseModel):
+    project: str
+    session_id: str = ""
+    tokens_injected: int = 0
+    tokens_saved_injection: int = 0
+    tokens_saved_forgetting: int = 0
+    context_type: str = "full"
+    task_outcome: str = ""
+    breakdown: dict | None = None
+
+
+@app.post("/costs/record")
+async def record_cost(body: RecordCostBody):
+    await pg.record_memory_cost(
+        project=body.project,
+        session_id=body.session_id,
+        tokens_injected=body.tokens_injected,
+        tokens_saved_injection=body.tokens_saved_injection,
+        tokens_saved_forgetting=body.tokens_saved_forgetting,
+        context_type=body.context_type,
+        task_outcome=body.task_outcome,
+        breakdown=body.breakdown,
+    )
+    return {"ok": True}
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Agent Registry
 # ═══════════════════════════════════════════════════════════════
@@ -2565,6 +3179,102 @@ def _delete_agent(agent_id: str):
     p = _agent_path(agent_id)
     if p.exists():
         p.unlink()
+
+
+def _load_anchors(project: str) -> dict | None:
+    ANCHORS_DIR.mkdir(parents=True, exist_ok=True)
+    path = ANCHORS_DIR / f"{project}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+async def _generate_anchors(project: str) -> dict:
+    ANCHORS_DIR.mkdir(parents=True, exist_ok=True)
+    anchors: dict[str, Any] = {
+        "active_tasks": [],
+        "completed_tasks": [],
+        "commit_log": [],
+        "_ts": time.time(),
+    }
+    tasks = _list_tasks(project, None)
+    active = [
+        t
+        for t in tasks
+        if t.get("project") == project
+        and t.get("status") in ("in_progress", "assigned")
+    ]
+    completed = sorted(
+        [
+            t
+            for t in tasks
+            if t.get("project") == project and t.get("status") == "completed"
+        ],
+        key=lambda t: t.get("updated_at", 0),
+        reverse=True,
+    )
+    for t in active[:5]:
+        anchors["active_tasks"].append(
+            {
+                "id": t.get("id", ""),
+                "title": t.get("title", ""),
+                "status": t.get("status", ""),
+                "assigned_to": t.get("assigned_to", ""),
+            }
+        )
+    for t in completed[:3]:
+        anchors["completed_tasks"].append(
+            {
+                "id": t.get("id", ""),
+                "title": t.get("title", ""),
+                "result": (t.get("result") or "")[:80],
+            }
+        )
+    agents = _list_agents(project)
+    commit_log: list[str] = []
+    for a in agents:
+        for c in a.get("commit_log", [])[-5:]:
+            if c not in commit_log:
+                commit_log.append(c)
+    anchors["commit_log"] = commit_log[:10]
+
+    try:
+        red_ink = await pg.get_red_ink(project, min_strength=0.5)
+        if red_ink:
+            anchors["red_ink_reminders"] = [
+                {"id": r["id"], "entry": r["entry"][:120]} for r in red_ink[:5]
+            ]
+    except Exception:
+        pass
+
+    try:
+        agents_for_files = _list_agents(project)
+        file_edit_counts: dict[str, int] = {}
+        for a in agents_for_files:
+            for entry in a.get("tool_log", [])[-50:]:
+                if isinstance(entry, dict) and entry.get("tool") in (
+                    "edit",
+                    "write",
+                    "Edit",
+                    "Write",
+                ):
+                    fp = entry.get("file_path", entry.get("path", ""))
+                    if fp:
+                        file_edit_counts[fp] = file_edit_counts.get(fp, 0) + 1
+        if file_edit_counts:
+            top_files = sorted(file_edit_counts.items(), key=lambda x: -x[1])[:3]
+            anchors["most_edited_files"] = [
+                {"path": fp, "edits": count} for fp, count in top_files
+            ]
+    except Exception:
+        pass
+
+    path = ANCHORS_DIR / f"{project}.json"
+    path.write_text(json.dumps(anchors, ensure_ascii=False, indent=2))
+    return anchors
 
 
 def _agent_route_key(agent: dict) -> str:
@@ -2812,6 +3522,14 @@ async def heartbeat(agent_id: str, body: AgentHeartbeat):
     _save_agent(a)
     if body.provider_id or body.model:
         _sync_agent_route(a)
+    if body.activity:
+        try:
+            anchors = _load_anchors(a.get("project", "unknown"))
+            now = time.time()
+            if not anchors or now - anchors.get("_ts", 0) >= 300:
+                await _generate_anchors(a.get("project", "unknown"))
+        except Exception:
+            pass
     return {"ok": True}
 
 
@@ -3277,6 +3995,49 @@ async def update_task(task_id: str, body: UpdateTask):
         t["archived"] = True
         t["archived_at"] = time.time()
     _save_task(t)
+
+    if t.get("status") == "completed" and t.get("project"):
+        try:
+            task_pattern = t.get("title", "")
+            steps = []
+            if t.get("result"):
+                steps.append(f"Result: {t['result'][:500]}")
+            if t.get("rubric"):
+                rubric = t["rubric"]
+                if isinstance(rubric, dict):
+                    steps = [f"{k}: {v}" for k, v in list(rubric.items())[:5]]
+                elif isinstance(rubric, list):
+                    steps = [str(r)[:200] for r in rubric[:5]]
+            try:
+                import enrichment
+
+                extracted = await enrichment.extract_procedure(
+                    task_title=task_pattern,
+                    task_type=t.get("type", "task"),
+                    task_result=t.get("result", ""),
+                )
+                if extracted and extracted.get("steps"):
+                    steps = extracted["steps"]
+                    if extracted.get("task_pattern"):
+                        task_pattern = extracted["task_pattern"]
+            except Exception:
+                pass
+            if not steps:
+                steps = ["completed task"]
+            existing = await pg.search_procedures(t["project"], task_pattern, limit=1)
+            if existing and existing[0].get("similarity", 0) >= 0.7:
+                await pg.update_procedure_outcome(existing[0]["id"], success=True)
+            else:
+                await pg.add_procedure(
+                    project=t["project"],
+                    task_pattern=task_pattern,
+                    task_type=t.get("type", "task"),
+                    steps=steps,
+                    proven_by=[task_id] if task_id else [],
+                )
+        except Exception:
+            pass
+
     return {"ok": True}
 
 
@@ -3586,6 +4347,98 @@ async def cortex_replay(body: CortexReplayRequest):
         "updates": len(updates),
         "signals": body.signals,
         "replay_steps": updates,
+    }
+
+
+class CortexParamsUpdate(BaseModel):
+    epsilon: float | None = None
+    alpha: float | None = None
+    gamma: float | None = None
+    alpha_decay: float | None = None
+    min_epsilon: float | None = None
+    merge_threshold: float | None = None
+    split_threshold: float | None = None
+    boundary_lr: float | None = None
+
+
+GATING_DIR = Path("/var/tmp/memoria/cortex")
+
+
+@app.get("/cortex/{project}/params")
+async def get_cortex_params(project: str):
+    gating_path = GATING_DIR / f"gating_{project}.json"
+    if not gating_path.exists():
+        return {
+            "project": project,
+            "epsilon": 0.3,
+            "alpha": 0.15,
+            "gamma": 0.9,
+            "alpha_decay": 0.995,
+            "min_epsilon": 0.05,
+            "message": "no saved params yet, showing defaults",
+        }
+    try:
+        data = json.loads(gating_path.read_text())
+        return {
+            "project": project,
+            "epsilon": data.get("epsilon", 0.3),
+            "alpha": data.get("alpha", 0.15),
+            "gamma": data.get("gamma", 0.9),
+            "alpha_decay": data.get("alpha_decay", 0.995),
+            "min_epsilon": data.get("min_epsilon", 0.05),
+            "merge_threshold": data.get("meta_learner", {}).get(
+                "merge_threshold", 0.85
+            ),
+            "split_threshold": data.get("meta_learner", {}).get(
+                "split_threshold", 0.25
+            ),
+            "boundary_lr": data.get("meta_learner", {}).get("boundary_lr", 0.03),
+        }
+    except Exception as exc:
+        raise HTTPException(500, f"failed to read cortex params: {exc}")
+
+
+@app.put("/cortex/{project}/params")
+async def update_cortex_params(project: str, body: CortexParamsUpdate):
+    gating_path = GATING_DIR / f"gating_{project}.json"
+    existing = {}
+    if gating_path.exists():
+        try:
+            existing = json.loads(gating_path.read_text())
+        except Exception:
+            pass
+    if body.epsilon is not None:
+        existing["epsilon"] = body.epsilon
+    if body.alpha is not None:
+        existing["alpha"] = body.alpha
+    if body.gamma is not None:
+        existing["gamma"] = body.gamma
+    if body.alpha_decay is not None:
+        existing["alpha_decay"] = body.alpha_decay
+    if body.min_epsilon is not None:
+        existing["min_epsilon"] = body.min_epsilon
+    if (
+        body.merge_threshold is not None
+        or body.split_threshold is not None
+        or body.boundary_lr is not None
+    ):
+        ml = existing.get("meta_learner", {})
+        if body.merge_threshold is not None:
+            ml["merge_threshold"] = body.merge_threshold
+        if body.split_threshold is not None:
+            ml["split_threshold"] = body.split_threshold
+        if body.boundary_lr is not None:
+            ml["boundary_lr"] = body.boundary_lr
+        existing["meta_learner"] = ml
+    gating_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        gating_path.write_text(json.dumps(existing, indent=2))
+    except Exception as exc:
+        raise HTTPException(500, f"failed to write cortex params: {exc}")
+    return {
+        "ok": True,
+        "project": project,
+        "updated": list(body.model_dump(exclude_none=True).keys()),
     }
 
 
@@ -4174,6 +5027,12 @@ async def get_config():
         "enrich_temperature": enrichment.ENRICH_TEMPERATURE,
         "enrich_idle_min": enrichment.IDLE_TIMEOUT_MINUTES,
         "papers_dir": str(PAPERS_DIR),
+        "decay_factor": DECAY_FACTOR,
+        "recent_threshold_seconds": RECENT_THRESHOLD_SECONDS,
+        "archive_threshold": ARCHIVE_THRESHOLD,
+        "procedural_search_threshold": PROCEDURAL_SEARCH_THRESHOLD,
+        "papers_watch_interval": PAPERS_WATCH_INTERVAL,
+        "papers_folders": PAPERS_FOLDERS,
     }
 
 
@@ -4204,6 +5063,12 @@ class ConfigUpdate(BaseModel):
     enrich_df_ratio: Optional[float] = None
     enrich_temperature: Optional[float] = None
     enrich_idle_min: Optional[int] = None
+    decay_factor: Optional[float] = None
+    recent_threshold_seconds: Optional[float] = None
+    archive_threshold: Optional[float] = None
+    procedural_search_threshold: Optional[float] = None
+    papers_watch_interval: Optional[int] = None
+    papers_folders: Optional[list[dict]] = None
 
 
 def _load_config():
@@ -4250,6 +5115,20 @@ def _load_config():
         enrichment.ENRICH_TEMPERATURE = data["enrich_temperature"]
     if "enrich_idle_min" in data:
         enrichment.IDLE_TIMEOUT_MINUTES = data["enrich_idle_min"]
+
+    paper_brain_map = {
+        "decay_factor": "DECAY_FACTOR",
+        "recent_threshold_seconds": "RECENT_THRESHOLD_SECONDS",
+        "archive_threshold": "ARCHIVE_THRESHOLD",
+        "procedural_search_threshold": "PROCEDURAL_SEARCH_THRESHOLD",
+        "papers_watch_interval": "PAPERS_WATCH_INTERVAL",
+    }
+    for field, var_name in paper_brain_map.items():
+        if field in data:
+            globals()[var_name] = data[field]
+    if "papers_folders" in data and isinstance(data["papers_folders"], list):
+        global PAPERS_FOLDERS
+        PAPERS_FOLDERS = data["papers_folders"]
 
 
 def _save_config(data: dict):
@@ -4307,6 +5186,20 @@ async def update_config(updates: ConfigUpdate):
         enrichment.ENRICH_TEMPERATURE = data["enrich_temperature"]
     if "enrich_idle_min" in data:
         enrichment.IDLE_TIMEOUT_MINUTES = data["enrich_idle_min"]
+
+    paper_brain_map = {
+        "decay_factor": "DECAY_FACTOR",
+        "recent_threshold_seconds": "RECENT_THRESHOLD_SECONDS",
+        "archive_threshold": "ARCHIVE_THRESHOLD",
+        "procedural_search_threshold": "PROCEDURAL_SEARCH_THRESHOLD",
+        "papers_watch_interval": "PAPERS_WATCH_INTERVAL",
+    }
+    for field, var_name in paper_brain_map.items():
+        if field in data:
+            globals()[var_name] = data[field]
+    if "papers_folders" in data and isinstance(data["papers_folders"], list):
+        global PAPERS_FOLDERS
+        PAPERS_FOLDERS = data["papers_folders"]
 
     _save_config(data)
     if any(k.startswith("enrich_") for k in data):
@@ -5270,23 +6163,130 @@ async def list_clients():
 PAPERS_DIR = Path(__file__).parent / "papers"
 
 
+class PapersFolderAdd(BaseModel):
+    path: str
+    label: str = ""
+
+
+@app.get("/papers/folders")
+async def list_papers_folders():
+    try:
+        result = []
+        if _pool:
+            async with _pool.acquire() as conn:
+                for entry in PAPERS_FOLDERS:
+                    folder_label = entry.get("label", Path(entry["path"]).name)
+                    count = await conn.fetchval(
+                        "SELECT COUNT(*) FROM papers WHERE folder = $1", folder_label
+                    )
+                    result.append(
+                        {
+                            "path": entry["path"],
+                            "label": folder_label,
+                            "file_count": count or 0,
+                        }
+                    )
+        else:
+            result = [
+                {
+                    "path": e["path"],
+                    "label": e.get("label", Path(e["path"]).name),
+                    "file_count": 0,
+                }
+                for e in PAPERS_FOLDERS
+            ]
+        return {"folders": result, "count": len(result)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/papers/folders")
+async def add_papers_folder(body: PapersFolderAdd):
+    global PAPERS_FOLDERS
+    folder_path = str(Path(body.path).resolve())
+    label = body.label or Path(folder_path).name
+    if not Path(folder_path).exists():
+        raise HTTPException(400, f"folder does not exist: {folder_path}")
+    for entry in PAPERS_FOLDERS:
+        if entry["path"] == folder_path:
+            raise HTTPException(400, f"folder already added: {folder_path}")
+    PAPERS_FOLDERS.append({"path": folder_path, "label": label})
+    _save_config({"papers_folders": PAPERS_FOLDERS})
+    return {"ok": True, "folder": {"path": folder_path, "label": label}}
+
+
+@app.delete("/papers/folders/{idx}")
+async def remove_papers_folder(idx: int):
+    global PAPERS_FOLDERS
+    if idx < 0 or idx >= len(PAPERS_FOLDERS):
+        raise HTTPException(404, "folder index out of range")
+    removed = PAPERS_FOLDERS.pop(idx)
+    _save_config({"papers_folders": PAPERS_FOLDERS})
+    return {"ok": True, "removed": removed}
+
+
 @app.get("/papers")
-async def list_papers():
+async def list_papers(folder: str = ""):
     files = []
-    for f in sorted(PAPERS_DIR.iterdir()):
-        if f.is_file() and f.suffix.lower() in (".pdf", ".txt", ".md"):
-            files.append({"name": f.name, "size": f.stat().st_size})
+    if folder:
+        for entry in PAPERS_FOLDERS:
+            entry_label = entry.get("label", "")
+            if entry_label != folder:
+                continue
+            folder_path = Path(entry["path"])
+            if not folder_path.exists():
+                break
+            for f in sorted(folder_path.iterdir()):
+                if f.is_file() and f.suffix.lower() in (".pdf", ".txt", ".md"):
+                    files.append(
+                        {
+                            "name": f.name,
+                            "folder": entry_label,
+                            "size": f.stat().st_size,
+                        }
+                    )
+            break
+    else:
+        for entry in PAPERS_FOLDERS:
+            folder_path = Path(entry["path"])
+            entry_label = entry.get("label", Path(entry["path"]).name)
+            if not folder_path.exists():
+                continue
+            for f in sorted(folder_path.iterdir()):
+                if f.is_file() and f.suffix.lower() in (".pdf", ".txt", ".md"):
+                    files.append(
+                        {
+                            "name": f.name,
+                            "folder": entry_label,
+                            "size": f.stat().st_size,
+                        }
+                    )
     return {"papers": files, "count": len(files)}
 
 
 @app.get("/papers/{filename}")
-async def get_paper(filename: str):
-    path = PAPERS_DIR / filename
-    if not path.exists() or not path.is_file():
+async def get_paper(filename: str, folder: str = ""):
+    path = None
+    if folder:
+        for entry in PAPERS_FOLDERS:
+            if entry.get("label", "") == folder:
+                p = Path(entry["path"]) / filename
+                if p.exists():
+                    path = p
+                    break
+    else:
+        for entry in PAPERS_FOLDERS:
+            p = Path(entry["path"]) / filename
+            if p.exists():
+                path = p
+                break
+        if path is None:
+            p = PAPERS_DIR / filename
+            if p.exists():
+                path = p
+    if path is None or not path.is_file():
         raise HTTPException(404, "paper not found")
     if path.suffix.lower() == ".pdf":
-        import subprocess
-
         try:
             result = subprocess.run(
                 ["pdftotext", "-layout", str(path), "-"],
@@ -6384,6 +7384,8 @@ body {
     <div class="nav-item" data-tab="7" onclick="switchTab(7)"><span class="icon">⚙</span> Settings</div>
     <div class="nav-item" data-tab="8" onclick="switchTab(8)"><span class="icon">🧠</span> Brain</div>
     <div class="nav-item" data-tab="9" onclick="switchTab(9)"><span class="icon">📓</span> Notebooks</div>
+    <div class="sidebar-label">Paper Brain</div>
+    <div class="nav-item" data-tab="10" onclick="switchTab(10)"><span class="icon">🧩</span> Paper Brain</div>
     <div class="sidebar-spacer"></div>
     <div class="sidebar-llm-toggle" id="lockToggle" onclick="toggleGlobalLock()" title="Global LLM Lock — blocks all token usage when locked">
       <span class="dot" id="lockDot"></span>
@@ -6859,6 +7861,197 @@ body {
           </div>
         </div>
 
+    <!-- Tab 10: Paper Brain -->
+    <div class="tab-content" id="tab10">
+      <div class="tab-header">
+        <div class="tab-title">🧩 Paper Brain</div>
+        <div class="tab-actions">
+          <select class="project-select" id="pbProject" onchange="loadPaperBrain()"></select>
+        </div>
+      </div>
+
+      <!-- Decay Parameters -->
+      <div class="card mb-4">
+        <div class="card-title">📉 Decay Parameters</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;align-items:end">
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">Decay Factor</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="pbDecayFactor" min="0.5" max="0.99" step="0.01" style="flex:1" oninput="el('pbDecayFactorVal').textContent=this.value">
+              <span id="pbDecayFactorVal" style="font-size:12px;min-width:36px;text-align:right">0.95</span>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">Recent Threshold (sec)</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="pbRecentThreshold" min="300" max="7200" step="60" style="flex:1" oninput="el('pbRecentThresholdVal').textContent=this.value+'s'">
+              <span id="pbRecentThresholdVal" style="font-size:12px;min-width:48px;text-align:right">3600s</span>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">Archive Threshold</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="pbArchiveThreshold" min="0.05" max="0.5" step="0.01" style="flex:1" oninput="el('pbArchiveThresholdVal').textContent=this.value">
+              <span id="pbArchiveThresholdVal" style="font-size:12px;min-width:36px;text-align:right">0.10</span>
+            </div>
+          </div>
+        </div>
+        <div class="flex gap-2 mt-3">
+          <button class="btn btn-accent btn-sm" onclick="saveDecayParams()">💾 Save Decay Params</button>
+          <button class="btn btn-sm" onclick="triggerDecayNow()">⚡ Run Decay Now</button>
+        </div>
+        <div id="pbDecayResult" style="margin-top:8px;font-size:11px;color:var(--text-muted)"></div>
+      </div>
+
+      <!-- Decay/Archive Status -->
+      <div class="card mb-4">
+        <div class="card-title">📊 Decay & Archive Status</div>
+        <div id="pbDecayStatus" style="font-size:12px"><span style="color:var(--text-muted)">Loading...</span></div>
+      </div>
+
+      <!-- PFC-BG Learning Params -->
+      <div class="card mb-4">
+        <div class="card-title">🧠 PFC-BG Learning Parameters</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;align-items:end">
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">Epsilon (exploration)</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="pbEpsilon" min="0.01" max="0.5" step="0.01" style="flex:1" oninput="el('pbEpsilonVal').textContent=this.value">
+              <span id="pbEpsilonVal" style="font-size:12px;min-width:36px;text-align:right">0.30</span>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">Alpha (learning rate)</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="pbAlpha" min="0.01" max="0.5" step="0.01" style="flex:1" oninput="el('pbAlphaVal').textContent=this.value">
+              <span id="pbAlphaVal" style="font-size:12px;min-width:36px;text-align:right">0.15</span>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">Gamma (discount)</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="pbGamma" min="0.5" max="0.99" step="0.01" style="flex:1" oninput="el('pbGammaVal').textContent=this.value">
+              <span id="pbGammaVal" style="font-size:12px;min-width:36px;text-align:right">0.90</span>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">Alpha Decay</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="pbAlphaDecay" min="0.95" max="0.999" step="0.001" style="flex:1" oninput="el('pbAlphaDecayVal').textContent=this.value">
+              <span id="pbAlphaDecayVal" style="font-size:12px;min-width:48px;text-align:right">0.995</span>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">Min Epsilon</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="pbMinEpsilon" min="0.01" max="0.2" step="0.01" style="flex:1" oninput="el('pbMinEpsilonVal').textContent=this.value">
+              <span id="pbMinEpsilonVal" style="font-size:12px;min-width:36px;text-align:right">0.05</span>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">Merge Threshold</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="pbMergeThreshold" min="0.5" max="0.99" step="0.01" style="flex:1" oninput="el('pbMergeThresholdVal').textContent=this.value">
+              <span id="pbMergeThresholdVal" style="font-size:12px;min-width:36px;text-align:right">0.85</span>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">Split Threshold</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="pbSplitThreshold" min="0.05" max="0.5" step="0.01" style="flex:1" oninput="el('pbSplitThresholdVal').textContent=this.value">
+              <span id="pbSplitThresholdVal" style="font-size:12px;min-width:36px;text-align:right">0.25</span>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">Boundary LR</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="pbBoundaryLr" min="0.005" max="0.1" step="0.005" style="flex:1" oninput="el('pbBoundaryLrVal').textContent=this.value">
+              <span id="pbBoundaryLrVal" style="font-size:12px;min-width:36px;text-align:right">0.03</span>
+            </div>
+          </div>
+        </div>
+        <div class="flex gap-2 mt-3">
+          <button class="btn btn-accent btn-sm" onclick="saveCortexParams()">💾 Save Cortex Params</button>
+          <button class="btn btn-sm" onclick="resetCortexParams()">🔄 Reset to Defaults</button>
+        </div>
+        <div id="pbCortexResult" style="margin-top:8px;font-size:11px;color:var(--text-muted)"></div>
+      </div>
+
+      <!-- Procedural Search Threshold -->
+      <div class="card mb-4">
+        <div class="card-title">🔍 Procedural Search Threshold</div>
+        <div style="display:flex;align-items:center;gap:12px">
+          <label style="font-size:11px;color:var(--text-muted)">Similarity Threshold</label>
+          <div style="display:flex;align-items:center;gap:8px;flex:1;max-width:300px">
+            <input type="range" id="pbProcThreshold" min="0.3" max="0.95" step="0.05" style="flex:1" oninput="el('pbProcThresholdVal').textContent=this.value">
+            <span id="pbProcThresholdVal" style="font-size:12px;min-width:36px;text-align:right">0.70</span>
+          </div>
+          <button class="btn btn-accent btn-sm" onclick="saveProcThreshold()">💾 Save</button>
+        </div>
+      </div>
+
+      <!-- Red Ink Management -->
+      <div class="card mb-4">
+        <div class="card-title">🔴 Red Ink (Critical Memory)</div>
+        <div id="pbRedInkList" style="font-size:12px"><span style="color:var(--text-muted)">Loading...</span></div>
+      </div>
+
+      <!-- Consolidation -->
+      <div class="card mb-4">
+        <div class="card-title">🔄 Consolidation</div>
+        <div id="pbConsolidationStatus" style="font-size:12px;margin-bottom:8px"><span style="color:var(--text-muted)">Loading...</span></div>
+        <button class="btn btn-accent btn-sm" onclick="triggerConsolidation()">⚡ Trigger Consolidation</button>
+        <div id="pbConsolidationResult" style="margin-top:8px;font-size:11px;color:var(--text-muted)"></div>
+      </div>
+
+      <!-- Procedural Memory -->
+      <div class="card mb-4">
+        <div class="card-title">⚡ Procedural Memory</div>
+        <div style="display:flex;gap:8px;margin-bottom:8px">
+          <input type="text" id="pbProcSearch" placeholder="Search procedures..." style="flex:1;font-size:12px;padding:4px 8px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius-xs);color:var(--text-primary)">
+          <button class="btn btn-sm" onclick="searchProcedures()">🔍 Search</button>
+        </div>
+        <div id="pbProcList" style="font-size:12px"><span style="color:var(--text-muted)">Loading...</span></div>
+      </div>
+
+      <!-- Cost Analytics -->
+      <div class="card mb-4">
+        <div class="card-title">💰 Cost Analytics</div>
+        <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+          <label style="font-size:11px;color:var(--text-muted)">Days:</label>
+          <select id="pbCostDays" style="font-size:12px;padding:4px 8px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius-xs);color:var(--text-primary)">
+            <option value="7">7</option>
+            <option value="30" selected>30</option>
+            <option value="90">90</option>
+          </select>
+          <button class="btn btn-sm" onclick="loadCostAnalytics()">📊 Refresh</button>
+        </div>
+        <div id="pbCostSummary" style="font-size:12px"></div>
+        <div style="margin-top:12px">
+          <svg id="pbCostChart" width="100%" height="200" style="background:var(--bg-elevated);border-radius:var(--radius-xs)"></svg>
+        </div>
+        <div id="pbCostByType" style="margin-top:8px;font-size:11px;color:var(--text-muted)"></div>
+      </div>
+
+      <!-- Knowledge Folders -->
+      <div class="card mb-4">
+        <div class="card-title">📁 Knowledge Folders</div>
+        <div id="pbFoldersList" style="font-size:12px;margin-bottom:8px"><span style="color:var(--text-muted)">Loading...</span></div>
+        <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+          <div style="flex:1;min-width:200px">
+            <label style="font-size:11px;color:var(--text-muted)">Folder Path</label>
+            <input type="text" id="pbFolderPath" placeholder="/path/to/folder" style="width:100%;font-size:12px;padding:4px 8px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius-xs);color:var(--text-primary)">
+          </div>
+          <div style="flex:0 0 120px">
+            <label style="font-size:11px;color:var(--text-muted)">Label</label>
+            <input type="text" id="pbFolderLabel" placeholder="auto" style="width:100%;font-size:12px;padding:4px 8px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius-xs);color:var(--text-primary)">
+          </div>
+          <button class="btn btn-accent btn-sm" onclick="addKnowledgeFolder()">+ Add</button>
+          <button class="btn btn-sm" onclick="rescanPapers()">📄 Rescan All</button>
+        </div>
+      </div>
+    </div>
+
 <!-- Search Overlay -->
 <div class="search-overlay" id="searchOverlay"></div>
 
@@ -6922,15 +8115,15 @@ function switchTab(n) {
   document.querySelector('.nav-item[data-tab="' + n + '"]')?.classList.add('active');
   document.getElementById('sidebar').classList.remove('open');
   location.hash = 'tab=' + n;
-  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, loadRecall, loadChat, loadSafety, loadSettings, loadBrainDelayed, loadNotebooks];
+  const loaders = [loadOverview, loadAgents, loadTasks, loadMemory, loadRecall, loadChat, loadSafety, loadSettings, loadBrainDelayed, loadNotebooks, loadPaperBrain];
   if (loaders[n]) loaders[n]();
 }
 
 function initTabFromHash() {
-  const m = location.hash.match(/tab=(\\d)/);
+  const m = location.hash.match(/tab=(\\d+)/);
   if (m) {
     const n = parseInt(m[1]);
-    if (n >= 0 && n <= 9) { switchTab(n); return; }
+    if (n >= 0 && n <= 10) { switchTab(n); return; }
   }
   loadOverview();
 }
@@ -9890,6 +11083,396 @@ function deleteNotebook(nbId) {
 
 function toggleNotebook(nbId, enabled) {
   fetch('/notebooks/' + nbId, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})}).then(() => {});
+}
+
+// ============================================
+// TAB 10: PAPER BRAIN
+// ============================================
+async function loadPaperBrain() {
+  try {
+    const projects = await getProjects();
+    const sel = el('pbProject');
+    const cur = sel.value || projects[0] || 'memoria';
+    sel.innerHTML = projects.map(p => '<option value="' + esc(p) + '"' + (p === cur ? ' selected' : '') + '>' + esc(p) + '</option>').join('');
+    const project = sel.value;
+    const [cfg, decayData, archiveData, cortexData, redInkData, consolData, procData] = await Promise.all([
+      api('/config').catch(() => ({})),
+      api('/memory/' + encodeURIComponent(project) + '/decay').catch(() => ({entries:[]})),
+      api('/memory/' + encodeURIComponent(project) + '/archive').catch(() => ({entries:[]})),
+      api('/cortex/' + encodeURIComponent(project) + '/params').catch(() => ({})),
+      api('/red-ink/' + encodeURIComponent(project)).catch(() => ({entries:[]})),
+      api('/consolidation/' + encodeURIComponent(project) + '/status').catch(() => ({tiers:{}})),
+      api('/procedural/' + encodeURIComponent(project)).catch(() => ({procedures:[]})),
+    ]);
+    // Decay params
+    el('pbDecayFactor').value = cfg.decay_factor ?? 0.95;
+    el('pbDecayFactorVal').textContent = cfg.decay_factor ?? 0.95;
+    el('pbRecentThreshold').value = cfg.recent_threshold_seconds ?? 3600;
+    el('pbRecentThresholdVal').textContent = (cfg.recent_threshold_seconds ?? 3600) + 's';
+    el('pbArchiveThreshold').value = cfg.archive_threshold ?? 0.1;
+    el('pbArchiveThresholdVal').textContent = cfg.archive_threshold ?? 0.1;
+    // Cortex params
+    el('pbEpsilon').value = cortexData.epsilon ?? 0.3;
+    el('pbEpsilonVal').textContent = cortexData.epsilon ?? 0.3;
+    el('pbAlpha').value = cortexData.alpha ?? 0.15;
+    el('pbAlphaVal').textContent = cortexData.alpha ?? 0.15;
+    el('pbGamma').value = cortexData.gamma ?? 0.9;
+    el('pbGammaVal').textContent = cortexData.gamma ?? 0.9;
+    el('pbAlphaDecay').value = cortexData.alpha_decay ?? 0.995;
+    el('pbAlphaDecayVal').textContent = cortexData.alpha_decay ?? 0.995;
+    el('pbMinEpsilon').value = cortexData.min_epsilon ?? 0.05;
+    el('pbMinEpsilonVal').textContent = cortexData.min_epsilon ?? 0.05;
+    el('pbMergeThreshold').value = cortexData.merge_threshold ?? 0.85;
+    el('pbMergeThresholdVal').textContent = cortexData.merge_threshold ?? 0.85;
+    el('pbSplitThreshold').value = cortexData.split_threshold ?? 0.25;
+    el('pbSplitThresholdVal').textContent = cortexData.split_threshold ?? 0.25;
+    el('pbBoundaryLr').value = cortexData.boundary_lr ?? 0.03;
+    el('pbBoundaryLrVal').textContent = cortexData.boundary_lr ?? 0.03;
+    // Proc threshold
+    el('pbProcThreshold').value = cfg.procedural_search_threshold ?? 0.7;
+    el('pbProcThresholdVal').textContent = cfg.procedural_search_threshold ?? 0.7;
+    // Decay status
+    renderDecayStatus(decayData, archiveData, cfg.archive_threshold ?? 0.1);
+    // Red ink
+    renderRedInk(redInkData.entries || [], project);
+    // Consolidation
+    renderConsolidationStatus(consolData, project);
+    // Procedural
+    renderProcedures(procData.procedures || [], project);
+    // Cost analytics
+    loadCostAnalytics();
+    // Folders
+    loadKnowledgeFolders();
+    setConn(true);
+  } catch(e) {
+    setConn(false);
+    console.error('loadPaperBrain error:', e);
+  }
+}
+
+function renderDecayStatus(decayData, archiveData, threshold) {
+  const entries = decayData.entries || decayData || [];
+  const archived = archiveData.entries || archiveData || [];
+  let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">';
+  html += '<div><div style="font-weight:600;margin-bottom:4px">Active Entries (' + entries.length + ')</div>';
+  if (entries.length === 0) {
+    html += '<div style="color:var(--text-muted)">No entries</div>';
+  } else {
+    html += '<div style="max-height:200px;overflow-y:auto">';
+    for (const e of entries.slice(0, 50)) {
+      const strength = e.strength ?? 1;
+      const nearArchive = strength < (threshold + 0.05);
+      const pct = Math.round(strength * 100);
+      const color = pct > 70 ? 'var(--success)' : pct > 40 ? 'var(--warning)' : 'var(--error)';
+      html += '<div style="display:flex;align-items:center;gap:6px;padding:2px 0;' + (nearArchive ? 'background:rgba(239,68,68,0.1);border-radius:3px;' : '') + '">'
+        + '<span style="width:60px;font-size:10px;color:var(--text-muted)">#' + (e.idx ?? e.index ?? '?') + '</span>'
+        + '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px">' + esc((e.content || e.text || '').substring(0, 60)) + '</span>'
+        + '<div style="width:80px;height:6px;background:var(--bg-primary);border-radius:3px;overflow:hidden"><div style="width:' + pct + '%;height:100%;background:' + color + ';border-radius:3px"></div></div>'
+        + '<span style="font-size:10px;width:28px;text-align:right;color:' + color + '">' + pct + '%</span>'
+        + '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  html += '<div><div style="font-weight:600;margin-bottom:4px">Archived (' + archived.length + ')</div>';
+  if (archived.length === 0) {
+    html += '<div style="color:var(--text-muted)">No archived entries</div>';
+  } else {
+    html += '<div style="max-height:200px;overflow-y:auto">';
+    for (const e of archived.slice(0, 30)) {
+      html += '<div style="padding:2px 0;font-size:11px;color:var(--text-muted)">'
+        + '<span style="color:var(--text-primary)">#' + (e.idx ?? e.index ?? '?') + '</span> '
+        + esc((e.content || e.text || '').substring(0, 80)) + '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div></div>';
+  el('pbDecayStatus').innerHTML = html;
+}
+
+function renderRedInk(entries, project) {
+  if (!entries || entries.length === 0) {
+    el('pbRedInkList').innerHTML = '<div style="color:var(--text-muted)">No red ink entries</div>';
+    return;
+  }
+  let html = '<div style="max-height:200px;overflow-y:auto">';
+  for (const e of entries) {
+    const idx = e.idx ?? e.index ?? '?';
+    const pri = e.priority || 'normal';
+    html += '<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">'
+      + '<span style="font-size:10px;color:var(--text-muted);min-width:28px">#' + idx + '</span>'
+      + '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc((e.content || e.text || '').substring(0, 100)) + '</span>'
+      + '<select id="redInkPri' + idx + '" style="font-size:11px;padding:2px 4px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius-xs);color:var(--text-primary)">'
+      + '<option value="critical"' + (pri === 'critical' ? ' selected' : '') + '>critical</option>'
+      + '<option value="important"' + (pri === 'important' ? ' selected' : '') + '>important</option>'
+      + '<option value="normal"' + (pri === 'normal' ? ' selected' : '') + '>normal</option>'
+      + '</select>'
+      + '<button class="btn btn-xs" onclick="setRedInkPriority(\'' + esc(project) + '\',' + idx + ')">Set</button>'
+      + '</div>';
+  }
+  html += '</div>';
+  el('pbRedInkList').innerHTML = html;
+}
+
+async function setRedInkPriority(project, idx) {
+  const sel = document.getElementById('redInkPri' + idx);
+  if (!sel) return;
+  try {
+    await api('/memory/' + encodeURIComponent(project) + '/priority', 'PUT', {index: idx, priority: sel.value});
+    toast('Priority updated');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+function renderConsolidationStatus(data, project) {
+  const tiers = data.tiers || {};
+  let html = '<div style="display:flex;gap:16px;align-items:center">';
+  const tierColors = {immediate: '#818cf8', consolidated: '#a78bfa', timeless: '#34d399'};
+  for (const [t, c] of Object.entries(tiers)) {
+    html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700;color:' + (tierColors[t] || 'var(--text-primary)') + '">' + c + '</div><div style="font-size:10px;color:var(--text-muted)">' + esc(t) + '</div></div>';
+  }
+  html += '</div>';
+  el('pbConsolidationStatus').innerHTML = html;
+}
+
+async function triggerConsolidation() {
+  const project = el('pbProject').value;
+  try {
+    const result = await api('/consolidation/' + encodeURIComponent(project) + '/trigger', 'POST');
+    el('pbConsolidationResult').textContent = 'Consolidation complete: ' + JSON.stringify(result.result || result);
+    loadPaperBrain();
+  } catch(e) { el('pbConsolidationResult').textContent = 'Error: ' + e.message; }
+}
+
+function renderProcedures(procedures, project) {
+  if (!procedures || procedures.length === 0) {
+    el('pbProcList').innerHTML = '<div style="color:var(--text-muted)">No procedures found</div>';
+    return;
+  }
+  let html = '<div style="max-height:300px;overflow-y:auto">';
+  for (const p of procedures) {
+    const pid = p.id ?? p.proc_id ?? '?';
+    const steps = (p.steps || []).length;
+    const score = p.reinforcement_score ?? p.score ?? 0;
+    html += '<div style="padding:8px;border-bottom:1px solid var(--border)">'
+      + '<div style="display:flex;align-items:center;gap:8px">'
+      + '<span style="font-weight:600">Proc #' + pid + '</span>'
+      + '<span style="font-size:10px;color:var(--text-muted)">' + steps + ' steps · score: ' + score.toFixed(2) + '</span>'
+      + '<span style="flex:1"></span>'
+      + '<select id="procOutcome' + pid + '" style="font-size:10px;padding:2px 4px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius-xs);color:var(--text-primary)">'
+      + '<option value="success">success</option><option value="partial">partial</option><option value="fail">fail</option></select>'
+      + '<button class="btn btn-xs" onclick="updateProcOutcome(\'' + esc(project) + '\',' + pid + ')">Score</button>'
+      + '<button class="btn btn-xs" style="color:var(--error)" onclick="retireProc(\'' + esc(project) + '\',' + pid + ')">Retire</button>'
+      + '</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">' + esc((p.task_pattern || p.description || '').substring(0, 120)) + '</div>'
+      + '</div>';
+  }
+  html += '</div>';
+  el('pbProcList').innerHTML = html;
+}
+
+async function searchProcedures() {
+  const project = el('pbProject').value;
+  const query = el('pbProcSearch').value.trim();
+  if (!query) { loadPaperBrain(); return; }
+  try {
+    const data = await api('/procedural/' + encodeURIComponent(project) + '/search', 'POST', {query: query});
+    renderProcedures(data.procedures || data.results || [], project);
+  } catch(e) { el('pbProcList').innerHTML = '<div class="empty-state error">' + esc(e.message) + '</div>'; }
+}
+
+async function updateProcOutcome(project, procId) {
+  const sel = document.getElementById('procOutcome' + procId);
+  if (!sel) return;
+  try {
+    await api('/procedural/' + encodeURIComponent(project) + '/' + procId, 'PATCH', {outcome: sel.value});
+    toast('Outcome recorded');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function retireProc(project, procId) {
+  if (!confirm('Retire procedure #' + procId + '?')) return;
+  try {
+    await api('/procedural/' + encodeURIComponent(project) + '/retire/' + procId, 'POST');
+    toast('Procedure retired');
+    loadPaperBrain();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function saveDecayParams() {
+  const data = {
+    decay_factor: parseFloat(el('pbDecayFactor').value),
+    recent_threshold_seconds: parseInt(el('pbRecentThreshold').value),
+    archive_threshold: parseFloat(el('pbArchiveThreshold').value),
+  };
+  try {
+    await api('/config', 'PATCH', data);
+    el('pbDecayResult').textContent = '✓ Saved decay parameters';
+    toast('Decay params saved');
+  } catch(e) { el('pbDecayResult').textContent = '✗ Error: ' + e.message; }
+}
+
+async function triggerDecayNow() {
+  const project = el('pbProject').value;
+  try {
+    const result = await api('/memory/' + encodeURIComponent(project) + '/decay/trigger', 'POST');
+    el('pbDecayResult').textContent = '✓ Decay applied: ' + JSON.stringify(result);
+    loadPaperBrain();
+  } catch(e) { el('pbDecayResult').textContent = '✗ Error: ' + e.message; }
+}
+
+async function saveCortexParams() {
+  const project = el('pbProject').value;
+  const data = {
+    epsilon: parseFloat(el('pbEpsilon').value),
+    alpha: parseFloat(el('pbAlpha').value),
+    gamma: parseFloat(el('pbGamma').value),
+    alpha_decay: parseFloat(el('pbAlphaDecay').value),
+    min_epsilon: parseFloat(el('pbMinEpsilon').value),
+    merge_threshold: parseFloat(el('pbMergeThreshold').value),
+    split_threshold: parseFloat(el('pbSplitThreshold').value),
+    boundary_lr: parseFloat(el('pbBoundaryLr').value),
+  };
+  try {
+    await api('/cortex/' + encodeURIComponent(project) + '/params', 'PUT', data);
+    el('pbCortexResult').textContent = '✓ Cortex params saved';
+    toast('Cortex params saved');
+  } catch(e) { el('pbCortexResult').textContent = '✗ Error: ' + e.message; }
+}
+
+function resetCortexParams() {
+  const defaults = {epsilon:0.3,alpha:0.15,gamma:0.9,alpha_decay:0.995,min_epsilon:0.05,merge_threshold:0.85,split_threshold:0.25,boundary_lr:0.03};
+  el('pbEpsilon').value = defaults.epsilon; el('pbEpsilonVal').textContent = defaults.epsilon;
+  el('pbAlpha').value = defaults.alpha; el('pbAlphaVal').textContent = defaults.alpha;
+  el('pbGamma').value = defaults.gamma; el('pbGammaVal').textContent = defaults.gamma;
+  el('pbAlphaDecay').value = defaults.alpha_decay; el('pbAlphaDecayVal').textContent = defaults.alpha_decay;
+  el('pbMinEpsilon').value = defaults.min_epsilon; el('pbMinEpsilonVal').textContent = defaults.min_epsilon;
+  el('pbMergeThreshold').value = defaults.merge_threshold; el('pbMergeThresholdVal').textContent = defaults.merge_threshold;
+  el('pbSplitThreshold').value = defaults.split_threshold; el('pbSplitThresholdVal').textContent = defaults.split_threshold;
+  el('pbBoundaryLr').value = defaults.boundary_lr; el('pbBoundaryLrVal').textContent = defaults.boundary_lr;
+}
+
+async function saveProcThreshold() {
+  const val = parseFloat(el('pbProcThreshold').value);
+  try {
+    await api('/config', 'PATCH', {procedural_search_threshold: val});
+    toast('Search threshold saved');
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function loadCostAnalytics() {
+  const project = el('pbProject').value;
+  const days = el('pbCostDays') ? parseInt(el('pbCostDays').value) : 30;
+  try {
+    const data = await api('/costs/analysis?project=' + encodeURIComponent(project) + '&days=' + days);
+    renderCostAnalytics(data);
+  } catch(e) {
+    el('pbCostSummary').innerHTML = '<div style="color:var(--text-muted)">No cost data available</div>';
+  }
+}
+
+function renderCostAnalytics(data) {
+  const eff = data.effectiveness || {};
+  const byType = data.by_context_type || {};
+  let html = '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:8px">';
+  html += statCard('Total Injected', (data.total_injected || 0).toLocaleString(), 'tokens');
+  html += statCard('Saved (Injection)', (data.total_saved_injection || 0).toLocaleString(), 'tokens');
+  html += statCard('Saved (Decay)', (data.total_saved_forgetting || 0).toLocaleString(), 'tokens');
+  html += statCard('Success Rate', (eff.success_rate || 0) * 100 + '%', (eff.success_count || 0) + '/' + (eff.total_outcomes || 0));
+  html += '</div>';
+  el('pbCostSummary').innerHTML = html;
+  // SVG bar chart
+  const types = Object.entries(byType);
+  const svg = el('pbCostChart');
+  if (types.length === 0) {
+    svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="var(--text-muted)" font-size="13">No data</text>';
+    return;
+  }
+  const maxVal = Math.max(...types.map(([,v]) => v.tokens_injected || 0), 1);
+  const barW = Math.max(20, Math.min(60, 800 / types.length - 8));
+  const chartH = 160;
+  const topPad = 20;
+  let svgHtml = '';
+  const totalW = types.length * (barW + 12);
+  svg.setAttribute('viewBox', '0 0 ' + Math.max(400, totalW) + ' 200');
+  types.forEach(([type, v], i) => {
+    const h = Math.max(2, ((v.tokens_injected || 0) / maxVal) * chartH);
+    const x = 40 + i * (barW + 12);
+    const y = topPad + chartH - h;
+    svgHtml += '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + h + '" rx="3" fill="var(--accent,#6366f1)" opacity="0.85"/>';
+    svgHtml += '<text x="' + (x + barW/2) + '" y="' + (y - 4) + '" text-anchor="middle" font-size="10" fill="var(--text-muted)">' + (v.tokens_injected || 0).toLocaleString() + '</text>';
+    svgHtml += '<text x="' + (x + barW/2) + '" y="' + (topPad + chartH + 14) + '" text-anchor="middle" font-size="9" fill="var(--text-muted)" transform="rotate(-30,' + (x + barW/2) + ',' + (topPad + chartH + 14) + ')">' + esc(type) + '</text>';
+  });
+  svg.innerHTML = svgHtml;
+  // By type table
+  let typeHtml = '<div style="margin-top:4px">';
+  for (const [type, v] of types) {
+    typeHtml += '<div style="display:flex;gap:8px"><span style="font-weight:500">' + esc(type) + '</span><span>' + (v.count || 0) + ' records · ' + (v.tokens_injected || 0).toLocaleString() + ' injected</span></div>';
+  }
+  typeHtml += '</div>';
+  el('pbCostByType').innerHTML = typeHtml;
+}
+
+function statCard(title, value, subtitle) {
+  return '<div style="background:var(--bg-elevated);border-radius:8px;padding:8px 12px;text-align:center">'
+    + '<div style="font-size:18px;font-weight:700;color:var(--accent)">' + value + '</div>'
+    + '<div style="font-size:10px;color:var(--text-muted)">' + esc(title) + '</div>'
+    + '<div style="font-size:10px;color:var(--text-muted)">' + esc(subtitle) + '</div>'
+    + '</div>';
+}
+
+async function loadKnowledgeFolders() {
+  try {
+    const data = await api('/papers/folders');
+    const folders = data.folders || [];
+    if (folders.length === 0) {
+      el('pbFoldersList').innerHTML = '<div style="color:var(--text-muted)">No knowledge folders configured</div>';
+      return;
+    }
+    let html = '<div style="display:grid;gap:6px">';
+    folders.forEach((f, i) => {
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--bg-elevated);border-radius:6px">'
+        + '<span style="font-size:13px">📁</span>'
+        + '<span style="font-weight:500">' + esc(f.label) + '</span>'
+        + '<span style="font-size:11px;color:var(--text-muted);flex:1">' + esc(f.path) + '</span>'
+        + '<span class="badge" style="font-size:10px">' + (f.file_count ?? 0) + ' files</span>'
+        + '<button class="btn btn-xs" style="color:var(--error)" onclick="removeKnowledgeFolder(' + i + ')">✕</button>'
+        + '</div>';
+    });
+    html += '</div>';
+    el('pbFoldersList').innerHTML = html;
+  } catch(e) {
+    el('pbFoldersList').innerHTML = '<div style="color:var(--text-muted)">Error loading folders</div>';
+  }
+}
+
+async function addKnowledgeFolder() {
+  const path = el('pbFolderPath').value.trim();
+  const label = el('pbFolderLabel').value.trim();
+  if (!path) { toast('Enter a folder path', 'error'); return; }
+  try {
+    await api('/papers/folders', 'POST', {path: path, label: label || null});
+    el('pbFolderPath').value = '';
+    el('pbFolderLabel').value = '';
+    toast('Folder added');
+    loadKnowledgeFolders();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function removeKnowledgeFolder(idx) {
+  if (!confirm('Remove folder #' + idx + '?')) return;
+  try {
+    await api('/papers/folders/' + idx, 'DELETE');
+    toast('Folder removed');
+    loadKnowledgeFolders();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function rescanPapers() {
+  try {
+    await api('/papers/rescan', 'POST');
+    toast('Rescan triggered');
+    loadKnowledgeFolders();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
 }
 </script>
 </body>

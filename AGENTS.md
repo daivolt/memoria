@@ -1,4 +1,27 @@
-# Agents
+# Memoria — AgentOS Memory Server
+
+Monolithic memory server (port 19998). All memory processes live here: CRUD, recall, consolidation, decay, red-ink, briefing, procedures, anchors, costs, cortex, agents, tasks, services, federation, chitchat consolidation, providers, enrichment, papers, config.
+
+## Project Scope
+
+**IN scope** (this repo):
+- Memory CRUD, recall, review, context, topics, proposals
+- Consolidation, decay, red-ink, briefing, archive
+- Procedural memory, anchoring, cost analytics
+- Cortex engine (task board, bidding, gating, replay)
+- Agent registration, services, task management
+- Chitchat polling and consolidation (memory process)
+- Social learning, teach/cultural memory
+- Safety snapshots, federation sync
+- Providers, enrichment, papers, config
+- LM Studio integration, LLM lock
+
+**OUT of scope** (moved to `memoria-agents/`):
+- TUI (Go terminal UI)
+- Dashboard HTML + static assets
+- Agent scripts (orchestrator, researcher, pilosopher, sage, builder, mini, gnotes)
+- Agent systemd services (bridge, chitchat-server, sidepane, opencode-serve, warden, xvfb)
+- `start_all.sh`
 
 ## Deploy
 
@@ -6,9 +29,7 @@
 ./deploy.sh  # ci_check → restart → verify
 ```
 
-**NEVER use `--force`**. It skips ci_check and can leave services in a broken state. If deploy fails, fix the issue first, then deploy cleanly.
-
-Full service restart: stops chitchat-server, memoria-server, and all agents, then starts in order. CI check gates the deploy. If ci_check hangs because services are down, start services manually first, then run deploy.sh.
+**NEVER use `--force`**. It skips ci_check and can leave services in a broken state.
 
 ## CI
 
@@ -29,12 +50,6 @@ JS check extracts `<script>` from Python `"""` HTML string. If you add escaped q
 - No calls to `/lmstudio/load` or `/lmstudio/unload` from any automated process
 - No calls to `lmstudio` SDK `load_new_instance()` or `unload()` from agents or server code
 - No subprocess calls that invoke `python3 -c "import lmstudio; ..."` for model loading/unloading
-- No specifying a model name in LLM requests that differs from the currently loaded model in LM Studio (this triggers JIT reload which is the root cause of model thrashing)
+- No specifying a model name in LLM requests that differs from the currently loaded model in LM Studio
 
-**ONLY the user** can load/unload/configure models, via the Settings dashboard in the web UI. The `/lmstudio/load` and `/lmstudio/unload` endpoints exist solely for manual user interaction from the dashboard.
-
-### Why this matters
-LM Studio has Just-In-Time (JIT) model loading: if a request specifies a model name that doesn't match the currently loaded model, LM Studio will **unload the current model and load the requested one**. With 7 agents and an enrichment worker all making LLM calls every 5-30 seconds, a model name mismatch causes continuous unload/load cycles that consume all GPU memory and crash the machine.
-
-### How agents handle model names
-Agents and enrichment must dynamically query LM Studio's `/api/v1/models` endpoint to find the currently loaded model, then use that model key in all LLM requests. The static `model` field in `providers.json` is only used as a fallback.
+**ONLY the user** can load/unload/configure models, via the Settings dashboard in the web UI.

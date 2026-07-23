@@ -28,9 +28,9 @@ import aiohttp
 logger = logging.getLogger("enrichment")
 
 LLM_URL = os.environ.get(
-    "MEMORIA_LLM_URL", "http://localhost:11434/v1/chat/completions"
+    "MEMORIA_LLM_URL", "https://zen-proxy.daivolt.workers.dev/v1/chat/completions"
 )
-LLM_MODEL = os.environ.get("MEMORIA_LLM_MODEL", "deepseek-v4-flash:cloud")
+LLM_MODEL = os.environ.get("MEMORIA_LLM_MODEL", "deepseek-v4-flash-free")
 LLM_API_KEY = os.environ.get("MEMORIA_LLM_API_KEY", "")
 ENRICH_ENABLED = os.environ.get("MEMORIA_ENRICH_ENABLED", "true").lower() == "true"
 EXPANSION_WEIGHT = float(os.environ.get("MEMORIA_ENRICH_WEIGHT", "0.5"))
@@ -40,8 +40,8 @@ ENRICH_MAX_TOKENS_PAPERS = int(
     os.environ.get("MEMORIA_ENRICH_MAX_TOKENS_PAPERS", "2048")
 )
 ENRICH_TEMPERATURE = float(os.environ.get("MEMORIA_ENRICH_TEMPERATURE", "0.0"))
-ENRICH_MAX_RETRIES = 3
-ENRICH_CONCURRENCY = int(os.environ.get("MEMORIA_ENRICH_CONCURRENCY", "4"))
+ENRICH_MAX_RETRIES = 1
+ENRICH_CONCURRENCY = int(os.environ.get("MEMORIA_ENRICH_CONCURRENCY", "1"))
 STALE_PROCESSING_SEC = int(os.environ.get("MEMORIA_ENRICH_STALE_SEC", "600"))
 IDLE_TIMEOUT_MINUTES = int(os.environ.get("MEMORIA_ENRICH_IDLE_MIN", "5"))
 
@@ -82,8 +82,8 @@ class _TokenBucket:
         return False
 
 
-_ZEN_RATE_LIMIT = 4 / 60.0
-_ZEN_BURST = 2
+_ZEN_RATE_LIMIT = 10 / 60.0
+_ZEN_BURST = 4
 _zen_rate_bucket = _TokenBucket(_ZEN_RATE_LIMIT, _ZEN_BURST)
 _ZEN_BACKOFF_UNTIL = 0.0
 
@@ -214,6 +214,44 @@ Query: {query}
 
 {{"keywords": ['term1', 'term2']}}"""
 
+CLASSIFY_PROMPT = """Classify this memory entry into exactly one type:
+- red: critical, must never be forgotten, pinned or high-priority
+- concept: architectural decision, key insight, factual knowledge
+- procedural: step-by-step how-to, instructions, imperative actions
+- temporal: time-stamped event, date reference, occurrence
+- relation: dependency, connection, "depends on", "uses", "requires"
+
+Entry: {text}
+
+Output only the type name (one word):"""
+
+CONSOLIDATE_PROMPT = """Given these session summaries from the past week, extract 3-5 key insights that
+span multiple sessions. Focus on patterns, decisions, and outcomes that repeat or build on each other.
+For each insight, classify it as one of: concept (architectural decision or key insight),
+procedural (how-to or step-by-step), or relation (dependency or connection).
+
+Sessions:
+{text}
+
+Output a JSON object with a single key "insights" containing an array of objects,
+each with "content" (the insight text) and "type" (concept/procedural/relation).
+Example: {{"insights": [{{"content": "Always use parameterized queries", "type": "concept"}}]}}"""
+
+PROCEDURE_EXTRACT_PROMPT = """Given this completed task, extract the key steps that led to its successful resolution.
+Focus on the repeatable procedure — what someone should do to accomplish the same task again.
+Remove task-specific details, keep the generalizable steps.
+
+Task: {task_title}
+Type: {task_type}
+Result: {task_result}
+
+Output a JSON object with:
+- "task_pattern": a short generalized description of the task type (e.g., "deploy to production", "fix failing test")
+- "steps": an array of step descriptions in order, each step as a string
+- "task_type": the category (e.g., "deployment", "bugfix", "refactor", "feature")
+
+Example: {{"task_pattern": "deploy to production", "steps": ["run test suite", "update version number", "build docker image", "push to registry", "update kubernetes manifest"], "task_type": "deployment"}}"""
+
 # ── LLM Client ───────────────────────────────────────────────
 
 
@@ -228,7 +266,7 @@ async def _post_chat(
             raise RuntimeError(f"zen backoff {_ZEN_BACKOFF_UNTIL - now:.0f}s remaining")
         if not _zen_rate_bucket.consume():
             raise RuntimeError("zen rate limited, skipping")
-    headers = {}
+    headers = {"User-Agent": "Mozilla/5.0"}
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
     for attempt in range(retries):
@@ -237,7 +275,7 @@ async def _post_chat(
                 LLM_URL,
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
@@ -254,45 +292,7 @@ async def _post_chat(
             if attempt < retries - 1:
                 await asyncio.sleep(2**attempt)
                 continue
-            raise RuntimeError(f"LLM connection failed: {e}") from e
-
-
-async def _fallback_lmstudio_enrich(
-    prompt: str, messages: list, max_tokens: int, session: aiohttp.ClientSession
-) -> dict | None:
-    try:
-        import providers as _prov
-
-        data = _prov.load_data()
-        provs = {p["id"]: p for p in data.get("providers", [])}
-        lmstudio = provs.get("lmstudio")
-        if not lmstudio:
-            return None
-        url = lmstudio["base_url"].rstrip("/")
-        if not url.endswith("/api/v1/chat"):
-            url = url.replace("/v1/chat/completions", "") + "/api/v1/chat"
-        model = _get_lmstudio_loaded_model()
-        if not model:
-            return None
-        logger.info("enrichment falling back to lmstudio model %s", model)
-        payload = {
-            "model": model,
-            "input": prompt,
-            "max_output_tokens": max_tokens,
-            "temperature": ENRICH_TEMPERATURE,
-        }
-        async with session.post(
-            url,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=120),
-        ) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            logger.warning("lmstudio fallback HTTP %s", resp.status)
-            return None
-    except Exception as e:
-        logger.warning("lmstudio fallback failed: %s", e)
-        return None
+            raise RuntimeError(f"LLM connection failed ({LLM_URL}): {e}") from e
 
 
 def _extract_content(data: dict) -> str:
@@ -420,19 +420,7 @@ async def _enrich_internal(
         session = aiohttp.ClientSession()
     t0 = time.time()
     try:
-        try:
-            data = await _post_chat(session, payload)
-        except RuntimeError as e:
-            if "429" in str(e) or "rate limit" in str(e).lower():
-                fallback = await _fallback_lmstudio_enrich(
-                    prompt, messages, max_tokens, session
-                )
-                if fallback is not None:
-                    data = fallback
-                else:
-                    raise
-            else:
-                raise
+        data = await _post_chat(session, payload)
         stats = data.get("stats") if "/api/v1/chat" in LLM_URL else None
         if stats:
             pt = stats.get("input_tokens", 0) or 0
@@ -469,7 +457,10 @@ async def _enrich_internal(
             error=str(e)[:200],
             duration_ms=int((time.time() - t0) * 1000),
         )
-        logger.warning("enrich_internal failed: %s", e)
+        if "rate limited" in str(e) or "backoff" in str(e):
+            logger.debug("enrich skipped: %s", e)
+        else:
+            logger.warning("enrich_internal failed: %s", e)
         return []
     finally:
         if own_session:
@@ -495,6 +486,129 @@ async def expand_query(
     return await _enrich_internal(
         query, QUERY_PROMPT, 10, session, pipeline_ctx=pipeline_ctx
     )
+
+
+async def classify_memory_entry(
+    text: str, session: aiohttp.ClientSession = None
+) -> str | None:
+    valid_types = ("red", "concept", "procedural", "temporal", "relation")
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession()
+    try:
+        prompt = CLASSIFY_PROMPT.format(text=text[:3000])
+        messages = [{"role": "user", "content": prompt}]
+        payload = {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "max_tokens": ENRICH_MAX_TOKENS,
+            "temperature": ENRICH_TEMPERATURE,
+        }
+        data = await _post_chat(session, payload)
+        raw = _extract_content(data).strip().lower()
+        if raw in valid_types:
+            return raw
+        for word in raw.split():
+            word = word.strip(".,;:!?\"'()")
+            if word in valid_types:
+                return word
+        return None
+    except Exception:
+        logger.warning("classify_memory_entry failed", exc_info=True)
+        return None
+    finally:
+        if own_session:
+            await session.close()
+
+
+async def consolidate_sessions(
+    session_summaries: list[str], session: aiohttp.ClientSession | None = None
+) -> list[dict]:
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession()
+    try:
+        combined = "\n---\n".join(session_summaries[:10])
+        prompt = CONSOLIDATE_PROMPT.format(text=combined[:4000])
+        messages = [{"role": "user", "content": prompt}]
+        payload = {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "max_tokens": ENRICH_MAX_TOKENS,
+            "temperature": ENRICH_TEMPERATURE,
+        }
+        data = await _post_chat(session, payload)
+        raw = _extract_content(data)
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            return parsed.get("insights", [])
+        except json.JSONDecodeError:
+            idx = raw.rfind('{"insights"')
+            if idx != -1:
+                end = raw.find("]}", idx)
+                if end != -1:
+                    try:
+                        parsed = json.loads(raw[idx : end + 2])
+                        return parsed.get("insights", [])
+                    except json.JSONDecodeError:
+                        pass
+        return []
+    except Exception:
+        logger.warning("consolidate_sessions failed", exc_info=True)
+        return []
+    finally:
+        if own_session:
+            await session.close()
+
+
+async def extract_procedure(
+    task_title: str,
+    task_type: str = "task",
+    task_result: str = "",
+    session: aiohttp.ClientSession | None = None,
+) -> dict | None:
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession()
+    try:
+        prompt = PROCEDURE_EXTRACT_PROMPT.format(
+            task_title=task_title[:200],
+            task_type=task_type,
+            task_result=(task_result or "N/A")[:1000],
+        )
+        messages = [{"role": "user", "content": prompt}]
+        payload = {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "max_tokens": ENRICH_MAX_TOKENS,
+            "temperature": ENRICH_TEMPERATURE,
+        }
+        data = await _post_chat(session, payload)
+        raw = _extract_content(data)
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+            if "task_pattern" in parsed and "steps" in parsed:
+                return parsed
+        except json.JSONDecodeError:
+            idx = raw.find("{")
+            if idx != -1:
+                try:
+                    parsed = json.loads(raw[idx:])
+                    if "task_pattern" in parsed and "steps" in parsed:
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+        return None
+    except Exception:
+        logger.warning("extract_procedure failed", exc_info=True)
+        return None
+    finally:
+        if own_session:
+            await session.close()
 
 
 # ── DF (Document Frequency) Filter ───────────────────────────

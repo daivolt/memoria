@@ -32,6 +32,7 @@ SELECTION_PRESSURE = 0.7  # fraction of top facts that survive selection
 
 # ── Lesson Model ───────────────────────────────────────────────
 
+
 class Lesson:
     """A structured teaching unit created by one agent for another.
 
@@ -63,7 +64,9 @@ class Lesson:
         n_students: int = 0,
         created_at: float | None = None,
     ):
-        self.lesson_id = lesson_id or f"lesson_{int(time.time())}_{random.randint(1000,9999)}"
+        self.lesson_id = (
+            lesson_id or f"lesson_{int(time.time())}_{random.randint(1000, 9999)}"
+        )
         self.title = title[:200]
         self.topic = topic[:100]
         self.prerequisites = prerequisites or []
@@ -124,7 +127,7 @@ class Lesson:
         child = copy.deepcopy(self)
         child.generation += 1
         child.parent_id = self.lesson_id
-        child.lesson_id = f"lesson_{int(time.time())}_{random.randint(1000,9999)}"
+        child.lesson_id = f"lesson_{int(time.time())}_{random.randint(1000, 9999)}"
         child.n_students = 0
         child.score = 0.5  # reset until assessed
 
@@ -151,6 +154,7 @@ class Lesson:
 
 
 # ── Lesson Store ────────────────────────────────────────────────
+
 
 def _lesson_path(lesson_id: str) -> Path:
     return CULTURE_DIR / "lessons" / f"{lesson_id}.json"
@@ -179,8 +183,9 @@ def delete_lesson(lesson_id: str):
         p.unlink()
 
 
-def list_lessons(topic: str | None = None, project: str | None = None,
-                 min_score: float = 0.0) -> list[Lesson]:
+def list_lessons(
+    topic: str | None = None, project: str | None = None, min_score: float = 0.0
+) -> list[Lesson]:
     lessons_dir = CULTURE_DIR / "lessons"
     if not lessons_dir.exists():
         return []
@@ -202,14 +207,25 @@ def list_lessons(topic: str | None = None, project: str | None = None,
     return result
 
 
-def find_lessons_for_topic(topic: str, top_k: int = 3) -> list[Lesson]:
-    """Find the best-scoring lessons for a given topic."""
-    candidates = list_lessons(topic=topic, min_score=0.2)
-    candidates.sort(key=lambda l: (-l.score, -l.n_students))
-    return candidates[:top_k]
+def find_lessons_for_topic(
+    topic: str, top_k: int = 3, project: str | None = None
+) -> list[Lesson]:
+    """Find the best-scoring lessons whose topic matches or contains the given topic."""
+    candidates = list_lessons(min_score=0.2, project=project)
+    topic_lower = topic.lower()
+    filtered = [
+        l
+        for l in candidates
+        if topic_lower in l.topic.lower() or l.topic.lower() in topic_lower
+    ]
+    if not filtered:
+        filtered = candidates
+    filtered.sort(key=lambda l: (-l.score, -l.n_students))
+    return filtered[:top_k]
 
 
 # ── Teaching Protocol ───────────────────────────────────────────
+
 
 def create_lesson_from_agent(
     teacher_agent: str,
@@ -261,16 +277,26 @@ def record_student_outcome(
 
     outcome_path = CULTURE_DIR / "outcomes.jsonl"
     with open(outcome_path, "a") as f:
-        f.write(json.dumps({
-            "lesson_id": lesson_id,
-            "student_agent": student_agent,
-            "success": success,
-            "outcome": outcome,
-            "score_after": round(lesson.score, 3),
-            "timestamp": time.time(),
-        }, ensure_ascii=False) + "\n")
+        f.write(
+            json.dumps(
+                {
+                    "lesson_id": lesson_id,
+                    "student_agent": student_agent,
+                    "success": success,
+                    "outcome": outcome,
+                    "score_after": round(lesson.score, 3),
+                    "timestamp": time.time(),
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
 
-    return {"lesson_id": lesson_id, "score": lesson.score, "n_students": lesson.n_students}
+    return {
+        "lesson_id": lesson_id,
+        "score": lesson.score,
+        "n_students": lesson.n_students,
+    }
 
 
 def get_student_outcomes(student_agent: str, limit: int = 20) -> list[dict]:
@@ -293,6 +319,7 @@ def get_student_outcomes(student_agent: str, limit: int = 20) -> list[dict]:
 
 
 # ── Cultural Memory (cross-generational accumulation) ───────────
+
 
 class CulturalMemory:
     """Accumulated knowledge across agent generations.
@@ -322,14 +349,26 @@ class CulturalMemory:
                 pass
 
     def save(self):
-        self._path().write_text(json.dumps({
-            "facts": self.facts[-MAX_CULTURAL_MEMORY:],
-            "generation": self.generation,
-            "project": self.project,
-        }, ensure_ascii=False, indent=2))
+        self._path().write_text(
+            json.dumps(
+                {
+                    "facts": self.facts[-MAX_CULTURAL_MEMORY:],
+                    "generation": self.generation,
+                    "project": self.project,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
 
-    def add_fact(self, text: str, source_agent: str = "", source_task: str = "",
-                 topic: str = "", importance: float = 0.5):
+    def add_fact(
+        self,
+        text: str,
+        source_agent: str = "",
+        source_task: str = "",
+        topic: str = "",
+        importance: float = 0.5,
+    ):
         entry = {
             "text": text[:500],
             "source_agent": source_agent[:64],
@@ -371,8 +410,9 @@ class CulturalMemory:
 
     def get_topic_summary(self, topic: str) -> list[str]:
         """Return facts filtered by topic."""
-        return [f["text"] for f in self.facts
-                if f.get("topic", "").lower() == topic.lower()]
+        return [
+            f["text"] for f in self.facts if f.get("topic", "").lower() == topic.lower()
+        ]
 
     def next_generation(self):
         """Advance generation counter (called when a cohort of agents finishes)."""
@@ -381,6 +421,7 @@ class CulturalMemory:
 
 
 # ── Cultural Evolution Engine ───────────────────────────────────
+
 
 class CulturalEvolution:
     """Drives variation and selection on lessons across generations.
@@ -435,7 +476,9 @@ class CulturalEvolution:
                         merged = Lesson(
                             title=f"Merged: {t1} × {t2}",
                             topic=emerged_topic[:100],
-                            facts=list(dict.fromkeys(combined_facts))[:MAX_LESSON_FACTS],
+                            facts=list(dict.fromkeys(combined_facts))[
+                                :MAX_LESSON_FACTS
+                            ],
                             prerequisites=[l.lesson_id for l in cross_lessons[:2]],
                             teacher_agent="evolution",
                             creator_project=self.project,
@@ -463,9 +506,9 @@ class CulturalEvolution:
             "total_lessons": len(lessons),
             "unique_topics": len(topics),
             "topic_distribution": dict(topics.most_common(20)),
-            "avg_score": round(
-                sum(l.score for l in lessons) / len(lessons), 3
-            ) if lessons else 0.0,
+            "avg_score": round(sum(l.score for l in lessons) / len(lessons), 3)
+            if lessons
+            else 0.0,
             "generation_max": max(l.generation for l in lessons) if lessons else 0,
         }
 
@@ -489,6 +532,7 @@ def get_evolution_engine(project: str) -> CulturalEvolution:
 
 
 # ── Consolidation hook (called from memoria's multi-timescale loop) ──
+
 
 def consolidate_cultural_knowledge(project: str):
     """Called periodically to consolidate task outcomes into cultural memory.
@@ -520,7 +564,9 @@ def consolidate_cultural_knowledge(project: str):
         memory.next_generation()
 
     return {
-        "facts_added": sum(1 for ep in engine.hippocampus.episodes if ep.get("reward", 0) >= 0.6),
+        "facts_added": sum(
+            1 for ep in engine.hippocampus.episodes if ep.get("reward", 0) >= 0.6
+        ),
         "variations": result["variations"],
         "pruned": result["pruned"],
         "emerged": result["emerged"],

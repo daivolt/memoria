@@ -1286,6 +1286,45 @@ class HippocampalReplay:
                 )
         return all_updates
 
+    def get_consolidate_candidates(self, min_reward: float = 0.7) -> list[dict]:
+        """Consolidate phase: return top-K high-reward episodes for topic proposal."""
+        return [e for e in self.buffer if e.get("reward", 0) >= min_reward]
+
+    def get_prune_candidates(
+        self, old_days: int = 30, ancient_days: int = 90, low_reward: float = 0.3
+    ) -> tuple[list[dict], list[dict]]:
+        """Prune phase: return (old_low_reward, ancient) episode tuples.
+
+        old_low_reward: episodes older than `old_days` with reward < `low_reward`
+        ancient: episodes older than `ancient_days` (regardless of reward)
+        Both are returned as lists of (index, episode) tuples from self.buffer.
+        """
+        now = time.time()
+        old_cutoff = now - old_days * 86400
+        ancient_cutoff = now - ancient_days * 86400
+        old_low = []
+        ancient = []
+        for i, ep in enumerate(self.buffer):
+            ts = ep.get("timestamp", 0)
+            if ts < ancient_cutoff:
+                if ep.get("meta", {}).get("priority") != "critical":
+                    ancient.append((i, ep))
+            elif ts < old_cutoff and ep.get("reward", 0.5) < low_reward:
+                old_low.append((i, ep))
+        return old_low, ancient
+
+    def prune_episodes(self, indices: list[int]) -> int:
+        """Remove episodes at given indices from the buffer. Returns count removed."""
+        if not indices:
+            return 0
+        to_remove = set(indices)
+        before = len(self.buffer)
+        self.buffer = [ep for i, ep in enumerate(self.buffer) if i not in to_remove]
+        removed = before - len(self.buffer)
+        if removed:
+            self.save()
+        return removed
+
 
 # ── Auction Coordinator (Basal Ganglia gating) ────────────────
 

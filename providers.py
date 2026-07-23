@@ -309,6 +309,29 @@ def set_model_config(model_key: str, config: dict):
     save_data(data)
 
 
+def _normalize_llm_url(url: str) -> str:
+    if not url:
+        return url
+    if url.endswith(
+        (
+            "/chat",
+            "/chat/",
+            "/completions",
+            "/completions/",
+            "/chat/completions",
+            "/chat/completions/",
+        )
+    ):
+        return url
+    if "/chat/completions" in url:
+        return url
+    if "/api/v1/chat" in url:
+        return url
+    if "/v1/" in url or url.endswith("/v1"):
+        return url.rstrip("/") + "/chat/completions"
+    return url.rstrip("/") + "/v1/chat/completions"
+
+
 def sync_enrichment():
     """Sync enrichment.LLM_URL, LLM_MODEL, LLM_API_KEY from providers.json."""
     import enrichment
@@ -320,7 +343,7 @@ def sync_enrichment():
     route_str = routes.get("enrichment") or routes.get("default")
     if route_str:
         url, model, key = _resolve_route_str(route_str, all_providers, lb_url)
-        enrichment.LLM_URL = url
+        enrichment.LLM_URL = _normalize_llm_url(url)
         enrichment.LLM_MODEL = model
         enrichment.LLM_API_KEY = key
     else:
@@ -329,6 +352,7 @@ def sync_enrichment():
         model = cur.get("model", "")
         if pid and pid in all_providers:
             prov = all_providers[pid]
-            enrichment.LLM_URL = prov["base_url"]
+            url = _normalize_llm_url(prov.get("base_url", "").rstrip("/"))
+            enrichment.LLM_URL = url
             enrichment.LLM_MODEL = model
             enrichment.LLM_API_KEY = prov.get("api_key", "")
