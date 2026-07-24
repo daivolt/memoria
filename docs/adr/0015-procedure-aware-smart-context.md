@@ -14,12 +14,17 @@ Accepted
 
 ## Decision
 
-Extend `/api/context/smart` to match the conversation against stored procedures using the existing `search_procedures` function (similarity threshold ≥ 0.7). Include the top 3 matched procedures in the returned context under a dedicated `## PROCEDURES (matched)` section.
+Extend `/api/context/smart` to match the conversation against stored procedures. Include the top 3 matched procedures in the returned context under a dedicated `## PROCEDURES (matched)` section.
 
 Implementation notes:
 
+- Primary matcher is `match_procedures`: deterministic token-overlap scoring
+  (stopword-filtered, plural-normalized). Rationale: pg_trgm similarity between
+  a long conversation (last ~10 messages) and a short task pattern is inherently
+  too low, so similarity thresholds silently excluded relevant procedures.
+- `search_procedures` (pg_trgm) remains as a fallback when token overlap yields
+  no matches.
 - Procedure text is rendered as an ordered step list.
-- If fewer than 3 procedures match, return only those above threshold.
 - The endpoint response shape gains a `procedures` field parallel to `entries`.
 - The plugin renders the procedure section after red ink and before concepts.
 
